@@ -21,11 +21,31 @@ static const uint8_t TCA9548A_ADDR = 0x70;
 static const uint8_t TOF_LEFT_MUX_CH  = 1;
 static const uint8_t TOF_RIGHT_MUX_CH = 2;
 
-static const uint8_t SERVO_CH_START = 10;
-static const uint8_t SERVO_CH_END   = 15;
-static const uint16_t SERVO_MID = 375;
-
 static const uint8_t ESPNOW_CHANNEL = 1;
+
+// Actual servo mapping
+static const uint8_t CH_R_PAN    = 10;
+static const uint8_t CH_R_TILT   = 11;
+static const uint8_t CH_CAM_PAN  = 12;
+static const uint8_t CH_CAM_TILT = 13;
+static const uint8_t CH_L_PAN    = 14;
+static const uint8_t CH_L_TILT   = 15;
+
+// Servo safety range
+static const uint16_t SERVO_MIN_US = 900;
+static const uint16_t SERVO_MAX_US = 2100;
+
+// Servo neutral positions
+static const uint16_t CAM_PAN_CENTER_US  = 1500;
+static const uint16_t CAM_TILT_CENTER_US = 1500;
+
+static const uint16_t L_PAN_CENTER_US    = 1500;
+static const uint16_t L_TILT_CENTER_US   = 1500;
+
+static const uint16_t R_PAN_CENTER_US    = 1500;
+static const uint16_t R_TILT_CENTER_US   = 1500;
+
+static const uint32_t TELEMETRY_PERIOD_MS = 20; // 50 Hz
 
 struct __attribute__((packed)) WristbandPacket {
     uint32_t magic;
@@ -50,12 +70,55 @@ Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(PCA9685_ADDR, ServoBus);
 VL53L1X tof;
 
 volatile bool wristPacketAvailable = false;
+volatile uint32_t lastWristRxMs = 0;
 WristbandPacket latestPacket{};
-uint8_t latestSenderMac[6] = {0};
+
+uint16_t camPanUs  = CAM_PAN_CENTER_US;
+uint16_t camTiltUs = CAM_TILT_CENTER_US;
+
+uint16_t lPanUs    = L_PAN_CENTER_US;
+uint16_t lTiltUs   = L_TILT_CENTER_US;
+
+uint16_t rPanUs    = R_PAN_CENTER_US;
+uint16_t rTiltUs   = R_TILT_CENTER_US;
 
 bool i2cDevicePresent(TwoWire &bus, uint8_t address) {
     bus.beginTransmission(address);
     return (bus.endTransmission() == 0);
+}
+
+uint16_t clampUs(uint16_t us) {
+    if (us < SERVO_MIN_US) return SERVO_MIN_US;
+    if (us > SERVO_MAX_US) return SERVO_MAX_US;
+    return us;
+}
+
+void applyServoUs(uint8_t ch, uint16_t us) {
+    pwm.writeMicroseconds(ch, clampUs(us));
+}
+
+void applyAllServos() {
+    applyServoUs(CH_CAM_PAN,  camPanUs);
+    applyServoUs(CH_CAM_TILT, camTiltUs);
+
+    applyServoUs(CH_L_PAN,    lPanUs);
+    applyServoUs(CH_L_TILT,   lTiltUs);
+
+    applyServoUs(CH_R_PAN,    rPanUs);
+    applyServoUs(CH_R_TILT,   rTiltUs);
+}
+
+void centerAllServos() {
+    camPanUs  = CAM_PAN_CENTER_US;
+    camTiltUs = CAM_TILT_CENTER_US;
+
+    lPanUs    = L_PAN_CENTER_US;
+    lTiltUs   = L_TILT_CENTER_US;
+
+    rPanUs    = R_PAN_CENTER_US;
+    rTiltUs   = R_TILT_CENTER_US;
+
+    applyAllServos();
 }
 
 void tcaSelect(uint8_t channel) {
@@ -63,14 +126,12 @@ void tcaSelect(uint8_t channel) {
     ToFBus.beginTransmission(TCA9548A_ADDR);
     ToFBus.write(1 << channel);
     ToFBus.endTransmission();
-    delay(5);
 }
 
 void tcaDisableAll() {
     ToFBus.beginTransmission(TCA9548A_ADDR);
     ToFBus.write(0x00);
     ToFBus.endTransmission();
-    delay(5);
 }
 
 bool initPCA9685() {
@@ -82,16 +143,13 @@ bool initPCA9685() {
     pwm.begin();
     pwm.setPWMFreq(50);
     delay(10);
-
-    for (uint8_t ch = SERVO_CH_START; ch <= SERVO_CH_END; ch++) {
-        pwm.setPWM(ch, 0, SERVO_MID);
-    }
+    centerAllServos();
 
     Serial.println("[PCA9685] Initialized");
     return true;
 }
 
-bool initToFSensorOnChannel(uint8_t muxChannel, const char *label) {
+bool initToFChannel(uint8_t muxChannel, const char *label) {
     tcaSelect(muxChannel);
 
     tof.setBus(&ToFBus);
@@ -123,6 +181,8 @@ int16_t readToFDistanceMm(uint8_t muxChannel) {
 }
 
 void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
+    (void)mac;
+
     if (len != (int)sizeof(WristbandPacket)) {
         return;
     }
@@ -134,9 +194,9 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
         return;
     }
 
-    memcpy((void *)&latestPacket, &temp, sizeof(temp));
-    memcpy((void *)latestSenderMac, mac, 6);
+    latestPacket = temp;
     wristPacketAvailable = true;
+    lastWristRxMs = millis();
 }
 
 bool setupEspNow() {
@@ -162,69 +222,104 @@ bool setupEspNow() {
     return true;
 }
 
-void printMac(const uint8_t *mac) {
-    Serial.printf("%02X:%02X:%02X:%02X:%02X:%02X",
-                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+void handleSerialCommands() {
+    static char buf[128];
+    static uint8_t n = 0;
+
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+
+        if (c == '\r' || c == '\n') {
+            if (n == 0) continue;
+            buf[n] = 0;
+
+            // SVA,camPan,camTilt,lPan,lTilt,rPan,rTilt
+            if (!strncmp(buf, "SVA,", 4)) {
+                int a, b, c1, d, e, f;
+                if (sscanf(buf, "SVA,%d,%d,%d,%d,%d,%d", &a, &b, &c1, &d, &e, &f) == 6) {
+                    camPanUs  = clampUs((uint16_t)a);
+                    camTiltUs = clampUs((uint16_t)b);
+                    lPanUs    = clampUs((uint16_t)c1);
+                    lTiltUs   = clampUs((uint16_t)d);
+                    rPanUs    = clampUs((uint16_t)e);
+                    rTiltUs   = clampUs((uint16_t)f);
+                    applyAllServos();
+                }
+            } else if (!strcmp(buf, "CENTER")) {
+                centerAllServos();
+            } else if (!strcmp(buf, "PING")) {
+                Serial.println("PONG");
+            }
+
+            n = 0;
+        } else {
+            if (n < sizeof(buf) - 1) {
+                buf[n++] = c;
+            }
+        }
+    }
 }
 
 void setup() {
     Serial.begin(115200);
-    delay(3000);
+    delay(2000);
 
     Serial.println();
-    Serial.println("=== AirTrixx CamDock ESP-NOW Receiver ===");
+    Serial.println("=== AirTrixx CamDock ===");
 
     ServoBus.begin(SERVO_SDA, SERVO_SCL);
     ToFBus.begin(TOF_SDA, TOF_SCL);
-    delay(100);
+    delay(50);
 
     initPCA9685();
-    initToFSensorOnChannel(TOF_LEFT_MUX_CH, "TOF-CH1");
-    initToFSensorOnChannel(TOF_RIGHT_MUX_CH, "TOF-CH2");
+    initToFChannel(TOF_LEFT_MUX_CH, "TOF-L");
+    initToFChannel(TOF_RIGHT_MUX_CH, "TOF-R");
 
     if (!setupEspNow()) {
         Serial.println("ESP-NOW setup failed");
-        while (true) {
-            delay(1000);
-        }
+        while (true) delay(1000);
     }
 
     Serial.print("CamDock STA MAC: ");
     Serial.println(WiFi.macAddress());
-    Serial.println("ESP-NOW receiver ready");
+    Serial.println("Ready");
 }
 
 void loop() {
-    static uint32_t lastPrint = 0;
+    handleSerialCommands();
 
-    if (millis() - lastPrint >= 200) {
+    static uint32_t lastPrint = 0;
+    if (millis() - lastPrint >= TELEMETRY_PERIOD_MS) {
         lastPrint = millis();
 
-        int16_t d1 = readToFDistanceMm(TOF_LEFT_MUX_CH);
-        int16_t d2 = readToFDistanceMm(TOF_RIGHT_MUX_CH);
+        int16_t tofL = readToFDistanceMm(TOF_LEFT_MUX_CH);
+        int16_t tofR = readToFDistanceMm(TOF_RIGHT_MUX_CH);
 
-        Serial.printf("TOF | CH1=%d mm | CH2=%d mm", d1, d2);
+        bool wbValid = wristPacketAvailable && ((millis() - lastWristRxMs) < 250);
 
-        if (wristPacketAvailable) {
-            WristbandPacket p;
-            uint8_t mac[6];
-
+        WristbandPacket p{};
+        if (wbValid) {
             noInterrupts();
             memcpy(&p, &latestPacket, sizeof(p));
-            memcpy(mac, latestSenderMac, 6);
             interrupts();
-
-            Serial.print(" || RX from ");
-            printMac(mac);
-            Serial.printf(" | seq=%u | A:%d,%d,%d | G:%d,%d,%d | M:%d,%d,%d",
-                          p.seq,
-                          p.ax, p.ay, p.az,
-                          p.gx, p.gy, p.gz,
-                          p.mx, p.my, p.mz);
-        } else {
-            Serial.print(" || No wrist packet yet");
         }
 
-        Serial.println();
+        // CD,ms,wb_valid,seq,uptime,ax,ay,az,gx,gy,gz,mx,my,mz,tofL,tofR
+        Serial.printf("CD,%lu,%d,%u,%lu,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                      (unsigned long)millis(),
+                      wbValid ? 1 : 0,
+                      wbValid ? p.seq : 0,
+                      (unsigned long)(wbValid ? p.uptime_ms : 0),
+                      wbValid ? p.ax : 0,
+                      wbValid ? p.ay : 0,
+                      wbValid ? p.az : 0,
+                      wbValid ? p.gx : 0,
+                      wbValid ? p.gy : 0,
+                      wbValid ? p.gz : 0,
+                      wbValid ? p.mx : 0,
+                      wbValid ? p.my : 0,
+                      wbValid ? p.mz : 0,
+                      tofL,
+                      tofR);
     }
 }

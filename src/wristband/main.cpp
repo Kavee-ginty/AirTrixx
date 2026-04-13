@@ -12,7 +12,7 @@ static const uint8_t QMC_ADDR = 0x0D;
 
 static const uint8_t ESPNOW_CHANNEL = 1;
 
-// REPLACE WITH YOUR CAMDOCK STA MAC
+// CamDock STA MAC
 static uint8_t CAMDOCK_MAC[] = {0x10, 0x20, 0xBA, 0x4C, 0x5B, 0xF4};
 
 struct __attribute__((packed)) WristbandPacket {
@@ -36,7 +36,6 @@ struct __attribute__((packed)) WristbandPacket {
 
 static WristbandPacket txPacket{};
 static uint16_t seqCounter = 0;
-static volatile bool sendDone = true;
 static volatile esp_now_send_status_t lastSendStatus = ESP_NOW_SEND_FAIL;
 
 void writeByte(uint8_t dev, uint8_t reg, uint8_t data) {
@@ -65,8 +64,17 @@ bool readBytes(uint8_t dev, uint8_t reg, uint8_t *buffer, size_t len) {
 }
 
 void setupMPU6050() {
+    // Wake
     writeByte(MPU_ADDR, 0x6B, 0x00);
-    delay(100);
+    delay(50);
+
+    // Gyro ±250 dps
+    writeByte(MPU_ADDR, 0x1B, 0x00);
+    delay(10);
+
+    // Accel ±2g
+    writeByte(MPU_ADDR, 0x1C, 0x00);
+    delay(10);
 }
 
 bool readMPU6050(int16_t &ax, int16_t &ay, int16_t &az,
@@ -91,7 +99,7 @@ bool readMPU6050(int16_t &ax, int16_t &ay, int16_t &az,
 void setupQMC5883L() {
     // OSR=512, RNG=8G, ODR=100Hz, MODE=continuous
     writeByte(QMC_ADDR, 0x09, 0x1D);
-    delay(100);
+    delay(50);
 }
 
 bool readQMC5883L(int16_t &mx, int16_t &my, int16_t &mz) {
@@ -109,8 +117,8 @@ bool readQMC5883L(int16_t &mx, int16_t &my, int16_t &mz) {
 }
 
 void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    (void)mac_addr;
     lastSendStatus = status;
-    sendDone = true;
 }
 
 bool setupEspNow() {
@@ -145,33 +153,31 @@ bool setupEspNow() {
 
 void setup() {
     Serial.begin(115200);
-    delay(3000);
+    delay(2000);
 
     Serial.println();
-    Serial.println("=== AirTrixx Wristband ESP-NOW Sender ===");
+    Serial.println("=== AirTrixx Wristband Sender ===");
 
     Wire.begin(I2C_SDA, I2C_SCL);
-    delay(100);
+    delay(50);
 
     setupMPU6050();
     setupQMC5883L();
 
     if (!setupEspNow()) {
         Serial.println("ESP-NOW setup failed");
-        while (true) {
-            delay(1000);
-        }
+        while (true) delay(1000);
     }
 
-    Serial.print("This MAC: ");
+    Serial.print("Wristband MAC: ");
     Serial.println(WiFi.macAddress());
-    Serial.println("ESP-NOW sender ready");
+    Serial.println("Sender ready");
 }
 
 void loop() {
     static uint32_t lastSend = 0;
 
-    if (millis() - lastSend >= 50) {
+    if (millis() - lastSend >= 10) { // 100 Hz
         lastSend = millis();
 
         int16_t ax, ay, az, gx, gy, gz, mx, my, mz;
@@ -180,7 +186,6 @@ void loop() {
         bool qmcOk = readQMC5883L(mx, my, mz);
 
         if (!mpuOk || !qmcOk) {
-            Serial.println("Sensor read failed");
             return;
         }
 
@@ -192,6 +197,7 @@ void loop() {
         txPacket.ax = ax;
         txPacket.ay = ay;
         txPacket.az = az;
+
         txPacket.gx = gx;
         txPacket.gy = gy;
         txPacket.gz = gz;
@@ -200,17 +206,6 @@ void loop() {
         txPacket.my = my;
         txPacket.mz = mz;
 
-        sendDone = false;
-        esp_err_t result = esp_now_send(CAMDOCK_MAC, (uint8_t *)&txPacket, sizeof(txPacket));
-
-        if (result != ESP_OK) {
-            Serial.printf("esp_now_send failed: %d\n", result);
-        } else {
-            Serial.printf("TX seq=%u | A:%d,%d,%d | G:%d,%d,%d | M:%d,%d,%d\n",
-                          txPacket.seq,
-                          txPacket.ax, txPacket.ay, txPacket.az,
-                          txPacket.gx, txPacket.gy, txPacket.gz,
-                          txPacket.mx, txPacket.my, txPacket.mz);
-        }
+        esp_now_send(CAMDOCK_MAC, (uint8_t *)&txPacket, sizeof(txPacket));
     }
 }
