@@ -32,6 +32,8 @@ from typing import Any
 
 import cv2
 
+from face_detection import FaceDetectionEngine
+
 try:
     import serial
     from serial.tools import list_ports
@@ -204,31 +206,34 @@ def send_camera_servo_command(ser: serial.Serial | None, pan_tick: int, tilt_tic
         return False
 
 
-def load_face_detector() -> cv2.CascadeClassifier:
-    """Load OpenCV's built-in frontal-face detector."""
-    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    detector = cv2.CascadeClassifier(cascade_path)
-    if detector.empty():
-        raise SystemExit(f"Could not load face detector: {cascade_path}")
-    return detector
-
-
 def detect_largest_face(
-    detector: cv2.CascadeClassifier,
+    engine: FaceDetectionEngine,
     frame_bgr: Any,
 ) -> dict[str, float | bool]:
-    """Return normalized face coordinates for the largest detected face."""
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    faces = detector.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(60, 60),
-    )
-    if len(faces) == 0:
+    """Return normalized face coordinates for the best detected face."""
+    face_state, selected_rect = engine.update(frame_bgr)
+    if not face_state.get("visible") or selected_rect is None:
+        if face_state.get("visible") and face_state.get("x") is not None:
+            frame_h, frame_w = frame_bgr.shape[:2]
+            width = float(face_state.get("width") or 0.0) * frame_w
+            height = float(face_state.get("height") or 0.0) * frame_h
+            top_y = float(face_state.get("top_y") or 0.0) * frame_h
+            center_x = float(face_state["x"]) * frame_w
+            return {
+                "visible": True,
+                "x": float(face_state["x"]),
+                "y": float(face_state.get("y") or 0.0),
+                "top_y": float(face_state.get("top_y") or 0.0),
+                "width": float(face_state.get("width") or 0.0),
+                "height": float(face_state.get("height") or 0.0),
+                "box_x": center_x - width / 2.0,
+                "box_y": top_y,
+                "box_w": width,
+                "box_h": height,
+            }
         return {"visible": False}
 
-    x, y, w, h = max(faces, key=lambda face: face[2] * face[3])
+    x, y, w, h = selected_rect
     frame_h, frame_w = frame_bgr.shape[:2]
     return {
         "visible": True,
@@ -292,7 +297,9 @@ def main() -> None:
     last_command_s = 0.0
 
     ser = open_serial()
-    detector = load_face_detector()
+    face_engine = FaceDetectionEngine()
+    if not face_engine.detector_ready:
+        raise SystemExit("Could not load OpenCV face detector.")
 
     cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
     if not cap.isOpened():
@@ -312,7 +319,7 @@ def main() -> None:
             time.sleep(0.03)
             continue
 
-        face = detect_largest_face(detector, frame_bgr)
+        face = detect_largest_face(face_engine, frame_bgr)
         now = time.monotonic()
 
         if auto_enabled and face.get("visible") and now - last_command_s >= COMMAND_INTERVAL_S:
