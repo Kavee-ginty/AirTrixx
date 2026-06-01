@@ -56,7 +56,7 @@ CAMERA_INDEX = 1
 # real unmirrored camera frame, so the control direction stays predictable.
 MIRROR_PREVIEW = True
 
-# Servo center values. These are loaded from config/calibration.json if present.
+# Servo center values. These are loaded from the AirTrixx user config if present.
 DEFAULT_CENTER_TICKS = 307
 
 # Where we want the user's head/face to appear in the camera frame.
@@ -89,7 +89,10 @@ SERVO_MAX_TICK = 4095
 
 
 APP_DIR = Path(__file__).resolve().parent
-CALIBRATION_PATH = APP_DIR / "config" / "calibration.json"
+try:
+    from config import CALIBRATION_PATH
+except Exception:
+    CALIBRATION_PATH = APP_DIR / "config" / "calibration.json"
 
 
 def load_centers() -> tuple[int, int]:

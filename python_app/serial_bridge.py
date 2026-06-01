@@ -85,6 +85,12 @@ class SerialBridge:
         self._manual_disconnect = True
         self._stop_event.set()
         self._close_serial()
+        thread = self._reader_thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=0.5)
+        with self._latest_lock:
+            self._latest_state = {}
+        self._current_port = None
         self._log("Serial disconnected.")
 
     @property
@@ -221,4 +227,3 @@ class SerialBridge:
                 self._latest_state = state
             if self.on_state:
                 self.on_state(copy.deepcopy(state))
-

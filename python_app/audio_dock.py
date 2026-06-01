@@ -30,6 +30,8 @@ class AudioDockBridge:
         on_status: Callable[[str], None] | None = None,
         on_transcript: Callable[[str, str], None] | None = None,
         serial_bridge: Any | None = None,
+        deepgram_api_key: str = "",
+        audio_recording_path: Path | None = None,
     ) -> None:
         self.on_log = on_log
         self.on_status = on_status
@@ -41,6 +43,8 @@ class AudioDockBridge:
         self.status = "Disconnected"
         self.expected_audio_size = None
         self.audio_buffer = bytearray()
+        self.deepgram_api_key = deepgram_api_key.strip()
+        self.audio_recording_path = audio_recording_path
 
     def _log(self, message: str) -> None:
         if self.on_log:
@@ -52,10 +56,15 @@ class AudioDockBridge:
             self.on_status(status)
 
     def load_deepgram_key(self) -> str:
+        if self.deepgram_api_key:
+            return self.deepgram_api_key
         env_key = os.environ.get("DEEPGRAM_API_KEY", "").strip()
         if env_key:
             return env_key
-        raise RuntimeError("DEEPGRAM_API_KEY environment variable not found.")
+        raise RuntimeError("Deepgram API key is not set. Add it in Settings or set DEEPGRAM_API_KEY.")
+
+    def set_deepgram_key(self, api_key: str) -> None:
+        self.deepgram_api_key = api_key.strip()
 
     def connect(self, port: str | None = None) -> bool:
         try:
@@ -158,8 +167,9 @@ class AudioDockBridge:
                     # Crop buffer to exactly expected size to guarantee perfect WAV structure
                     audio_data = bytes(self.audio_buffer[:expected])
                     
-                    wav_path = Path(__file__).parent / "last_esp32_recording.wav"
+                    wav_path = self.audio_recording_path or (Path.cwd() / "last_esp32_recording.wav")
                     try:
+                        wav_path.parent.mkdir(parents=True, exist_ok=True)
                         wav_path.write_bytes(audio_data)
                     except Exception:
                         pass

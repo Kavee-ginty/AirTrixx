@@ -3,9 +3,12 @@ from __future__ import annotations
 import importlib
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+
+from app_paths import project_resource_path
 
 try:
     import cv2
@@ -23,6 +26,33 @@ LogCallback = Callable[[str], None]
 FACE_SWITCH_AREA_RATIO = 1.25
 FACE_LOCK_MAX_CENTER_DISTANCE = 0.28
 FACE_SMOOTHING_ALPHA = 0.35
+HAND_LANDMARKER_MODEL_CANDIDATES = (
+    project_resource_path("models", "hand_landmarker.task"),
+    project_resource_path("packaging", "assets", "generated", "hand_landmarker.task"),
+)
+HAND_CONNECTIONS = (
+    (0, 1),
+    (1, 2),
+    (2, 3),
+    (3, 4),
+    (0, 5),
+    (5, 6),
+    (6, 7),
+    (7, 8),
+    (5, 9),
+    (9, 10),
+    (10, 11),
+    (11, 12),
+    (9, 13),
+    (13, 14),
+    (14, 15),
+    (15, 16),
+    (13, 17),
+    (0, 17),
+    (17, 18),
+    (18, 19),
+    (19, 20),
+)
 
 
 def _empty_hand_state() -> dict[str, dict[str, Any]]:
@@ -71,6 +101,36 @@ def _load_mediapipe_solution_modules() -> tuple[Any, Any, Any]:
     if last_error:
         raise last_error
     raise ImportError("MediaPipe Hands solution modules were not found.")
+
+
+def _load_mediapipe_tasks_modules() -> tuple[Any, Any]:
+    base_options_module = importlib.import_module("mediapipe.tasks.python")
+    vision_module = importlib.import_module("mediapipe.tasks.python.vision")
+    return base_options_module.BaseOptions, vision_module
+
+
+def _find_hand_landmarker_model() -> Path | None:
+    for candidate in HAND_LANDMARKER_MODEL_CANDIDATES:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _draw_task_landmarks(frame_bgr: Any, landmarks: list[Any]) -> None:
+    if cv2 is None or not landmarks:
+        return
+    frame_h, frame_w = frame_bgr.shape[:2]
+    points: list[tuple[int, int]] = []
+    for landmark in landmarks:
+        x = int(max(0.0, min(1.0, float(landmark.x))) * frame_w)
+        y = int(max(0.0, min(1.0, float(landmark.y))) * frame_h)
+        points.append((x, y))
+    for start, end in HAND_CONNECTIONS:
+        if start < len(points) and end < len(points):
+            cv2.line(frame_bgr, points[start], points[end], (64, 220, 160), 2)
+    for point in points:
+        cv2.circle(frame_bgr, point, 3, (255, 255, 255), -1)
+        cv2.circle(frame_bgr, point, 4, (15, 118, 110), 1)
 
 
 def _finger_is_extended(landmarks: Any, tip_index: int, pip_index: int) -> bool:
@@ -284,17 +344,38 @@ class HandTracker:
 
     def _run(self) -> None:
         requested_camera_index = self.camera_index
+        mode = "legacy"
+        legacy_error: Exception | None = None
+        mp_hands = None
+        mp_drawing = None
+        mp_styles = None
+        BaseOptions = None
+        vision = None
+        model_path: Path | None = None
         try:
             mp_hands, mp_drawing, mp_styles = _load_mediapipe_solution_modules()
         except Exception as exc:
-            version = getattr(mp, "__version__", "unknown") if mp else "not installed"
-            location = getattr(mp, "__file__", "unknown") if mp else "unknown"
-            self._log(
-                "MediaPipe Hands could not be loaded. "
-                f"Installed mediapipe version={version}, path={location}. "
-                f"Error: {type(exc).__name__}: {exc}"
-            )
-            return
+            legacy_error = exc
+            try:
+                BaseOptions, vision = _load_mediapipe_tasks_modules()
+                model_path = _find_hand_landmarker_model()
+                mode = "tasks"
+            except Exception as task_exc:
+                version = getattr(mp, "__version__", "unknown") if mp else "not installed"
+                location = getattr(mp, "__file__", "unknown") if mp else "unknown"
+                self._log(
+                    "MediaPipe Hands could not be loaded. "
+                    f"Installed mediapipe version={version}, path={location}. "
+                    f"Legacy error: {type(exc).__name__}: {exc}. "
+                    f"Tasks error: {type(task_exc).__name__}: {task_exc}."
+                )
+                return
+            if model_path is None:
+                self._log(
+                    "MediaPipe Tasks is installed, but hand_landmarker.task is missing. "
+                    "Run packaging/download_models.py before packaging or source runs."
+                )
+                return
 
         cap, active_camera_index = self._open_camera_capture(requested_camera_index)
         if cap is None or active_camera_index is None:
@@ -305,15 +386,79 @@ class HandTracker:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         face_cascade = self._load_face_cascade()
 
-        with mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            model_complexity=0,
-            min_detection_confidence=0.55,
-            min_tracking_confidence=0.45,
-        ) as hands:
+        def process_legacy(frame_rgb: Any, frame_bgr: Any, hands: Any) -> dict[str, dict[str, Any]]:
+            state = _empty_hand_state()
+            results = hands.process(frame_rgb)
+            if results.multi_hand_landmarks and results.multi_handedness:
+                for landmarks, handedness in zip(
+                    results.multi_hand_landmarks,
+                    results.multi_handedness,
+                ):
+                    classification = handedness.classification[0]
+                    side = classification.label.lower()
+                    if side == "right":
+                        side = "left"
+                    elif side == "left":
+                        side = "right"
+                    if side not in state:
+                        continue
+                    landmark_list = landmarks.landmark
+                    xs = [lm.x for lm in landmark_list]
+                    ys = [lm.y for lm in landmark_list]
+                    score = float(classification.score)
+                    if score >= state[side]["score"]:
+                        state[side] = {
+                            "visible": True,
+                            "x": float(sum(xs) / len(xs)),
+                            "y": float(sum(ys) / len(ys)),
+                            "score": score,
+                            "gesture": classify_hand_gesture(landmark_list),
+                        }
+                    mp_drawing.draw_landmarks(
+                        frame_bgr,
+                        landmarks,
+                        mp_hands.HAND_CONNECTIONS,
+                        mp_styles.get_default_hand_landmarks_style(),
+                        mp_styles.get_default_hand_connections_style(),
+                    )
+            return state
+
+        def process_tasks(frame_rgb: Any, frame_bgr: Any, landmarker: Any) -> dict[str, dict[str, Any]]:
+            state = _empty_hand_state()
+            mp_image = mp.Image(
+                image_format=mp.ImageFormat.SRGB,
+                data=np.ascontiguousarray(frame_rgb),
+            )
+            results = landmarker.detect(mp_image)
+            if results.hand_landmarks and results.handedness:
+                for landmarks, handedness in zip(results.hand_landmarks, results.handedness):
+                    if not handedness:
+                        continue
+                    classification = handedness[0]
+                    side = str(classification.category_name).lower()
+                    if side == "right":
+                        side = "left"
+                    elif side == "left":
+                        side = "right"
+                    if side not in state:
+                        continue
+                    xs = [lm.x for lm in landmarks]
+                    ys = [lm.y for lm in landmarks]
+                    score = float(classification.score)
+                    if score >= state[side]["score"]:
+                        state[side] = {
+                            "visible": True,
+                            "x": float(sum(xs) / len(xs)),
+                            "y": float(sum(ys) / len(ys)),
+                            "score": score,
+                            "gesture": classify_hand_gesture(landmarks),
+                        }
+                    _draw_task_landmarks(frame_bgr, landmarks)
+            return state
+
+        def run_loop(detector: Any, detector_label: str) -> None:
             self._log(
-                f"MediaPipe hand tracker started on camera index {active_camera_index} "
+                f"{detector_label} hand tracker started on camera index {active_camera_index} "
                 f"(requested {requested_camera_index})."
             )
             while not self._stop_event.is_set():
@@ -323,45 +468,11 @@ class HandTracker:
                     continue
 
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                results = hands.process(frame_rgb)
-                state = _empty_hand_state()
+                if mode == "legacy":
+                    state = process_legacy(frame_rgb, frame_bgr, detector)
+                else:
+                    state = process_tasks(frame_rgb, frame_bgr, detector)
                 face_state = _empty_face_state()
-
-                if results.multi_hand_landmarks and results.multi_handedness:
-                    for landmarks, handedness in zip(
-                        results.multi_hand_landmarks,
-                        results.multi_handedness,
-                    ):
-                        classification = handedness.classification[0]
-                        side = classification.label.lower()
-                        # MediaPipe Hands reports handedness for mirrored selfie
-                        # input. This app tracks an unmirrored camera frame, so
-                        # swap labels before servo control consumes them.
-                        if side == "right":
-                            side = "left"
-                        elif side == "left":
-                            side = "right"
-                        if side not in state:
-                            continue
-                        landmark_list = landmarks.landmark
-                        xs = [lm.x for lm in landmark_list]
-                        ys = [lm.y for lm in landmark_list]
-                        score = float(classification.score)
-                        if score >= state[side]["score"]:
-                            state[side] = {
-                                "visible": True,
-                                "x": float(sum(xs) / len(xs)),
-                                "y": float(sum(ys) / len(ys)),
-                                "score": score,
-                                "gesture": classify_hand_gesture(landmark_list),
-                            }
-                        mp_drawing.draw_landmarks(
-                            frame_bgr,
-                            landmarks,
-                            mp_hands.HAND_CONNECTIONS,
-                            mp_styles.get_default_hand_landmarks_style(),
-                            mp_styles.get_default_hand_connections_style(),
-                        )
 
                 if face_cascade is not None:
                     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
@@ -406,5 +517,29 @@ class HandTracker:
                     self._latest_face = face_state
                     self._latest_frame_rgb = annotated_rgb
 
-        cap.release()
+        try:
+            if mode == "legacy":
+                with mp_hands.Hands(
+                    static_image_mode=False,
+                    max_num_hands=2,
+                    model_complexity=0,
+                    min_detection_confidence=0.55,
+                    min_tracking_confidence=0.45,
+                ) as hands:
+                    run_loop(hands, "MediaPipe Solutions")
+            else:
+                if legacy_error:
+                    self._log(f"MediaPipe Solutions unavailable; using MediaPipe Tasks ({type(legacy_error).__name__}).")
+                options = vision.HandLandmarkerOptions(
+                    base_options=BaseOptions(model_asset_path=str(model_path)),
+                    running_mode=vision.RunningMode.IMAGE,
+                    num_hands=2,
+                    min_hand_detection_confidence=0.55,
+                    min_hand_presence_confidence=0.45,
+                    min_tracking_confidence=0.45,
+                )
+                with vision.HandLandmarker.create_from_options(options) as landmarker:
+                    run_loop(landmarker, "MediaPipe Tasks")
+        finally:
+            cap.release()
         self._log("MediaPipe hand tracker stopped.")

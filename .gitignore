@@ -1,11 +1,14 @@
 # Python runtime artifacts
 python_app/.venv/
+.venv-build-*/
+__pycache__/
 python_app/__pycache__/
 python_app/**/__pycache__/
 python_app/**/*.pyc
 
 # Local user calibration and captured data
 python_app/config/calibration.json
+python_app/config/input_mappings.json
 #python_app/data/
 !python_app/data/.gitkeep
 
@@ -16,6 +19,13 @@ firmware/**/compile_flags.txt
 
 # Local distribution/build outputs
 .dist/
+build/
+dist/
+*.spec~
+packaging/assets/generated/
+packaging/*.dmg
+packaging/*.zip
+packaging/*.exe
 
 # Logs and OS/editor noise
 *.log

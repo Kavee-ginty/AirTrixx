@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import http.server
 import json
+import os
+import platform
 import queue
 import shutil
 import socket
@@ -10,15 +13,27 @@ import subprocess
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, ttk
 from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
-from config import APP_DIR, AppConfig, load_calibration, save_calibration
+from app_paths import project_resource_path
+from config import AppConfig, load_calibration, save_calibration
 from fusion_state import FIELD_ORDER, FusionState
 from gesture_recorder import GestureRecorder
+from input_backend import PynputInputBackend, normalize_key_token, parse_key_combo
+from input_mapper import (
+    COMPARATORS,
+    InputMapper,
+    MappingAction,
+    MappingProfile,
+    MappingRule,
+    SignalCatalog,
+    load_mapping_config,
+    save_mapping_config,
+)
 from mediapipe_tracker import HandTracker
 from serial_bridge import SerialBridge
 from servo_controller import ServoController
@@ -65,12 +80,11 @@ KEYBOARD_DISTANCE_ROWS = 30
 KEYBOARD_DISTANCE_BAND_MM = 10
 SERVO_DEBUG_INTERVAL_S = 0.2
 SERVO_DEBUG_LOG_LIMIT = 600
-SERVO_DEBUG_LOG_PATH = APP_DIR / "data" / "servo_debug.log"
-WRISTBAND_FIRMWARE_DIR = APP_DIR.parent / "firmware" / "wristband_esp32c3"
+WRISTBAND_FIRMWARE_DIR = project_resource_path("firmware", "wristband_esp32c3")
 WRISTBAND_FIRMWARE_BIN = WRISTBAND_FIRMWARE_DIR / ".pio" / "build" / "esp32c3_supermini" / "firmware.bin"
-FANS_FIRMWARE_DIR = APP_DIR.parent / "firmware" / "fan_controller_esp32c3"
+FANS_FIRMWARE_DIR = project_resource_path("firmware", "fan_controller_esp32c3")
 FANS_FIRMWARE_BIN = FANS_FIRMWARE_DIR / ".pio" / "build" / "esp32c3_supermini" / "firmware.bin"
-CAMDOCK_FIRMWARE_DIR = APP_DIR.parent / "firmware" / "camdock_esp32s3"
+CAMDOCK_FIRMWARE_DIR = project_resource_path("firmware", "camdock_esp32s3")
 CAMDOCK_FIRMWARE_BIN = CAMDOCK_FIRMWARE_DIR / ".pio" / "build" / "esp32s3_camdock" / "firmware.bin"
 HAND_CALIBRATION_POINTS = [
     ("top_left", "top left", 0.15, 0.18),
@@ -177,6 +191,19 @@ FLOAT_CALIBRATION_KEYS = {
     "l_tilt_angle_offset_deg",
 }
 
+MAPPING_COMPARATOR_OPTIONS = tuple(sorted(COMPARATORS))
+MAPPING_ACTION_OPTIONS = (
+    "keyboard_tap",
+    "keyboard_hold",
+    "keyboard_repeat",
+    "mouse_click",
+    "mouse_hold",
+    "mouse_scroll",
+    "mouse_move",
+    "mouse_absolute",
+)
+MAPPING_MOUSE_BUTTON_OPTIONS = ("left", "right", "middle")
+
 
 class AirTrixxGUI:
     def __init__(
@@ -208,6 +235,10 @@ class AirTrixxGUI:
         self.pages: dict[str, ttk.Frame] = {}
         self.keyboard_cells: list[list[tk.Label]] = []
         self.keyboard_status_var = tk.StringVar(value="Keyboard: waiting for ToF data.")
+        self.hub_status_var = tk.StringVar(value="Hub: disconnected")
+        self.mapper_chip_var = tk.StringVar(value="Mapper: disabled")
+        self.camera_chip_var = tk.StringVar(value="Camera: starting")
+        self.permissions_status_var = tk.StringVar(value="Permissions: check camera and input access on first launch")
         self.active_page = "Dashboard"
         self.camera_popup: tk.Toplevel | None = None
         self.camera_popup_label: ttk.Label | None = None
@@ -251,6 +282,8 @@ class AirTrixxGUI:
             on_log=self._on_audio_dock_log,
             on_status=self._on_audio_dock_status,
             on_transcript=self._on_audio_dock_transcript,
+            deepgram_api_key=str(self.config.calibration.get("deepgram_api_key", "")),
+            audio_recording_path=self.config.audio_recording_path,
         )
         self.audio_dock_bridge.serial_bridge = self.serial_bridge
         self.serial_bridge.audio_dock_bridge = self.audio_dock_bridge
@@ -263,8 +296,25 @@ class AirTrixxGUI:
             self._snapshot_provider,
             on_status=self.log,
         )
+        self.input_backend = PynputInputBackend()
+        self.mapping_config_path = self.config.mapping_path
+        mapping_config, mapping_error = load_mapping_config(self.mapping_config_path)
+        self.input_mapper = InputMapper(self.input_backend, mapping_config, on_log=self.log)
+        self.mapping_recording_shortcut = False
+        self.mapping_signal_items: dict[str, str] = {}
+        self.mapping_rule_items: dict[str, str] = {}
+        self.mapping_enabled_var = tk.BooleanVar(value=self.input_mapper.enabled)
+        self.mapping_start_enabled_var = tk.BooleanVar(value=mapping_config.enabled_on_start)
+        self.mapping_profile_var = tk.StringVar(value=mapping_config.active_profile)
+        self.mapping_status_var = tk.StringVar(value="Mapper: ready.")
+        if mapping_error:
+            self.log(f"Input mappings reset because config could not be loaded: {mapping_error}")
+        if self.input_backend.error:
+            self.log(self.input_backend.error)
+        for warning in self.config.startup_warnings:
+            self.log(warning)
 
-        self.root.title("AirTrixx Prototype Console")
+        self.root.title("AirTrixx")
         self.root.geometry("1280x860")
         self.root.minsize(1120, 760)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -286,27 +336,45 @@ class AirTrixxGUI:
         if "clam" in style.theme_names():
             style.theme_use("clam")
 
-        self.root.configure(bg="#f5f7fb")
-        style.configure(".", font=("Segoe UI", 9), background="#f5f7fb", foreground="#1f2937")
-        style.configure("TFrame", background="#f5f7fb")
+        self.root.configure(bg="#f6f7f9")
+        style.configure(".", font=("Segoe UI", 10), background="#f6f7f9", foreground="#18212f")
+        style.configure("TFrame", background="#f6f7f9")
         style.configure("Panel.TFrame", background="#ffffff")
-        style.configure("Header.TLabel", font=("Segoe UI Semibold", 18), background="#f5f7fb", foreground="#111827")
-        style.configure("Subtle.TLabel", background="#f5f7fb", foreground="#6b7280")
+        style.configure("Sidebar.TFrame", background="#111827")
+        style.configure("Topbar.TFrame", background="#ffffff")
+        style.configure("Header.TLabel", font=("Segoe UI Semibold", 18), background="#f6f7f9", foreground="#111827")
+        style.configure("Brand.TLabel", font=("Segoe UI Semibold", 20), background="#111827", foreground="#ffffff")
+        style.configure("BrandSubtle.TLabel", font=("Segoe UI", 9), background="#111827", foreground="#9ca3af")
+        style.configure("Subtle.TLabel", background="#f6f7f9", foreground="#667085")
+        style.configure("PanelSubtle.TLabel", background="#ffffff", foreground="#667085")
+        style.configure("Chip.TLabel", font=("Segoe UI Semibold", 9), background="#eef7f4", foreground="#0f766e", padding=(10, 4))
+        style.configure("WarnChip.TLabel", font=("Segoe UI Semibold", 9), background="#fff7ed", foreground="#b45309", padding=(10, 4))
         style.configure("Value.TLabel", font=("Segoe UI Semibold", 10), background="#ffffff", foreground="#111827")
-        style.configure("TLabelframe", background="#ffffff", bordercolor="#d7dce5", relief="solid")
-        style.configure("TLabelframe.Label", font=("Segoe UI Semibold", 10), background="#f5f7fb", foreground="#374151")
-        style.configure("TButton", padding=(10, 6))
-        style.configure("Nav.TButton", padding=(14, 10), anchor="w", background="#f8fafc", foreground="#1f2937")
-        style.configure("NavActive.TButton", padding=(14, 10), anchor="w", background="#dbeafe", foreground="#1d4ed8")
-        style.configure("Accent.TButton", padding=(10, 7), background="#2563eb", foreground="#ffffff")
-        style.map("Accent.TButton", background=[("active", "#1d4ed8"), ("disabled", "#9ca3af")])
-        style.configure("Secondary.TButton", padding=(10, 6), background="#eef2ff", foreground="#1f2937")
-        style.configure("TEntry", padding=(6, 4), fieldbackground="#ffffff")
-        style.configure("TCombobox", padding=(6, 4), fieldbackground="#ffffff")
-        style.configure("Treeview", rowheight=24, background="#ffffff", fieldbackground="#ffffff", foreground="#1f2937")
-        style.configure("Treeview.Heading", font=("Segoe UI Semibold", 9), background="#eef2f7", foreground="#374151")
-        style.configure("TNotebook", background="#f5f7fb", borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(12, 6), font=("Segoe UI", 9))
+        style.configure("TLabelframe", background="#ffffff", bordercolor="#d6dbe3", relief="solid")
+        style.configure("TLabelframe.Label", font=("Segoe UI Semibold", 10), background="#ffffff", foreground="#344054")
+        style.configure("TButton", padding=(10, 6), borderwidth=0)
+        style.configure("Nav.TButton", padding=(14, 10), anchor="w", background="#111827", foreground="#d1d5db", borderwidth=0)
+        style.configure("NavActive.TButton", padding=(14, 10), anchor="w", background="#0f766e", foreground="#ffffff", borderwidth=0)
+        style.map(
+            "Nav.TButton",
+            background=[("active", "#1f2937")],
+            foreground=[("active", "#ffffff")],
+        )
+        style.map(
+            "NavActive.TButton",
+            background=[("active", "#0d9488")],
+            foreground=[("active", "#ffffff")],
+        )
+        style.configure("Accent.TButton", padding=(12, 7), background="#0f766e", foreground="#ffffff")
+        style.map("Accent.TButton", background=[("active", "#0d9488"), ("disabled", "#9ca3af")])
+        style.configure("Secondary.TButton", padding=(10, 6), background="#eef2f7", foreground="#18212f")
+        style.map("Secondary.TButton", background=[("active", "#dfe5ee")])
+        style.configure("TEntry", padding=(7, 5), fieldbackground="#ffffff")
+        style.configure("TCombobox", padding=(7, 5), fieldbackground="#ffffff")
+        style.configure("Treeview", rowheight=27, background="#ffffff", fieldbackground="#ffffff", foreground="#18212f", borderwidth=0)
+        style.configure("Treeview.Heading", font=("Segoe UI Semibold", 9), background="#eef2f7", foreground="#344054")
+        style.configure("TNotebook", background="#f6f7f9", borderwidth=0)
+        style.configure("TNotebook.Tab", padding=(14, 8), font=("Segoe UI", 9))
 
     @staticmethod
     def _style_text_widget(widget: tk.Text, *, dark: bool = False) -> None:
@@ -338,12 +406,12 @@ class AirTrixxGUI:
         self.root.columnconfigure(1, weight=1)
         self.root.rowconfigure(0, weight=1)
 
-        sidebar = ttk.Frame(self.root, padding=(14, 14), style="Panel.TFrame")
+        sidebar = ttk.Frame(self.root, padding=(16, 18), style="Sidebar.TFrame")
         sidebar.grid(row=0, column=0, sticky="ns")
         sidebar.columnconfigure(0, weight=1)
 
-        ttk.Label(sidebar, text="AirTrixx", style="Header.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(sidebar, text="Prototype Console", style="Subtle.TLabel").grid(row=1, column=0, sticky="w")
+        ttk.Label(sidebar, text="AirTrixx", style="Brand.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(sidebar, text="Hardware input console", style="BrandSubtle.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 14))
 
         serial_box = ttk.LabelFrame(sidebar, text="Antenna Serial", padding=8)
         serial_box.grid(row=2, column=0, sticky="ew", pady=(14, 12))
@@ -358,9 +426,9 @@ class AirTrixxGUI:
         self.connect_button = ttk.Button(serial_box, text="Connect", command=self.toggle_serial, style="Accent.TButton")
         self.connect_button.grid(row=1, column=1, sticky="ew", padx=(4, 0))
 
-        nav_frame = ttk.Frame(sidebar, style="Panel.TFrame")
+        nav_frame = ttk.Frame(sidebar, style="Sidebar.TFrame")
         nav_frame.grid(row=3, column=0, sticky="ew")
-        nav_items = ("Dashboard", "Camera", "Keyboard", "Live Data", "Audio Dock", "Servo Control", "Firmware", "Calibration", "Logs / Debug")
+        nav_items = ("Dashboard", "Signals", "Mappings", "Camera & Servo", "Audio Dock", "Firmware", "Settings", "Data / Logs")
         for row, name in enumerate(nav_items):
             button = ttk.Button(nav_frame, text=name, style="Nav.TButton", command=lambda page=name: self.show_page(page))
             button.grid(row=row, column=0, sticky="ew", pady=(0, 4))
@@ -369,25 +437,32 @@ class AirTrixxGUI:
 
         content = ttk.Frame(self.root, padding=(14, 14))
         content.grid(row=0, column=1, sticky="nsew")
-        content.rowconfigure(0, weight=1)
+        content.rowconfigure(1, weight=1)
         content.columnconfigure(0, weight=1)
+
+        topbar = ttk.Frame(content, padding=(12, 10), style="Topbar.TFrame")
+        topbar.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        topbar.columnconfigure(4, weight=1)
+        ttk.Label(topbar, textvariable=self.hub_status_var, style="Chip.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(topbar, textvariable=self.mapper_chip_var, style="WarnChip.TLabel").grid(row=0, column=1, sticky="w", padx=(0, 8))
+        ttk.Label(topbar, textvariable=self.camera_chip_var, style="Chip.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 8))
+        ttk.Label(topbar, textvariable=self.permissions_status_var, style="PanelSubtle.TLabel").grid(row=0, column=3, sticky="w")
 
         for name in nav_items:
             page = ttk.Frame(content)
-            page.grid(row=0, column=0, sticky="nsew")
+            page.grid(row=1, column=0, sticky="nsew")
             page.rowconfigure(1, weight=1)
             page.columnconfigure(0, weight=1)
             self.pages[name] = page
 
         self._build_dashboard_page(self.pages["Dashboard"])
-        self._build_camera_page(self.pages["Camera"])
-        self._build_keyboard_page(self.pages["Keyboard"])
-        self._build_live_data_page(self.pages["Live Data"])
+        self._build_signals_page(self.pages["Signals"])
+        self._build_mappings_page(self.pages["Mappings"])
+        self._build_camera_servo_page(self.pages["Camera & Servo"])
         self._build_audio_dock_page(self.pages["Audio Dock"])
-        self._build_servo_page(self.pages["Servo Control"])
         self._build_firmware_page(self.pages["Firmware"])
-        self._build_calibration_page(self.pages["Calibration"])
-        self._build_logs_page(self.pages["Logs / Debug"])
+        self._build_settings_page(self.pages["Settings"])
+        self._build_data_logs_page(self.pages["Data / Logs"])
 
         self.root.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
         self.root.bind_all("<Button-4>", self._on_mousewheel, add="+")
@@ -406,7 +481,7 @@ class AirTrixxGUI:
         return header
 
     def _scrollable_body(self, parent: ttk.Frame) -> ttk.Frame:
-        canvas = tk.Canvas(parent, highlightthickness=0, bg="#f5f7fb")
+        canvas = tk.Canvas(parent, highlightthickness=0, bg="#f6f7f9")
         canvas.grid(row=1, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
         scrollbar.grid(row=1, column=1, sticky="ns")
@@ -419,6 +494,105 @@ class AirTrixxGUI:
         self._register_scroll_target(canvas, canvas)
         self._register_scroll_target(body, canvas)
         return body
+
+    def _build_signals_page(self, page: ttk.Frame) -> None:
+        self._build_page_header(page, "Signals", "Live device readings, ToF lanes, and fused input state.")
+        notebook = ttk.Notebook(page)
+        notebook.grid(row=1, column=0, sticky="nsew")
+        for title, builder in (
+            ("ToF Keyboard", self._build_keyboard_page),
+            ("Live Inputs", self._build_live_data_page),
+        ):
+            tab = ttk.Frame(notebook)
+            tab.rowconfigure(1, weight=1)
+            tab.columnconfigure(0, weight=1)
+            notebook.add(tab, text=title)
+            builder(tab)
+
+    def _build_camera_servo_page(self, page: ttk.Frame) -> None:
+        self._build_page_header(page, "Camera & Servo", "Camera feed, centering, servo controls, and gesture capture.")
+        notebook = ttk.Notebook(page)
+        notebook.grid(row=1, column=0, sticky="nsew")
+        for title, builder in (
+            ("Camera", self._build_camera_page),
+            ("Servo & Gestures", self._build_servo_page),
+        ):
+            tab = ttk.Frame(notebook)
+            tab.rowconfigure(1, weight=1)
+            tab.columnconfigure(0, weight=1)
+            notebook.add(tab, text=title)
+            builder(tab)
+
+    def _build_data_logs_page(self, page: ttk.Frame) -> None:
+        self._build_logs_page(page)
+
+    def _build_settings_page(self, page: ttk.Frame) -> None:
+        self._build_page_header(page, "Settings", "Runtime preferences, permissions, app data, and calibration.")
+        notebook = ttk.Notebook(page)
+        notebook.grid(row=1, column=0, sticky="nsew")
+
+        runtime_tab = ttk.Frame(notebook)
+        runtime_tab.columnconfigure(0, weight=1)
+        notebook.add(runtime_tab, text="Runtime")
+        self._build_runtime_settings_tab(runtime_tab)
+
+        calibration_tab = ttk.Frame(notebook)
+        calibration_tab.rowconfigure(1, weight=1)
+        calibration_tab.columnconfigure(0, weight=1)
+        notebook.add(calibration_tab, text="Calibration")
+        self._build_calibration_page(calibration_tab)
+
+    def _build_runtime_settings_tab(self, tab: ttk.Frame) -> None:
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
+        body = ttk.Frame(tab)
+        body.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
+        body.columnconfigure(0, weight=1)
+
+        audio_box = ttk.LabelFrame(body, text="Audio Dock", padding=12)
+        audio_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        audio_box.columnconfigure(1, weight=1)
+        self.deepgram_key_var = tk.StringVar(value=str(self.config.calibration.get("deepgram_api_key", "")))
+        self.deepgram_status_var = tk.StringVar(value=self._deepgram_settings_status())
+        ttk.Label(audio_box, text="Deepgram API key").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(audio_box, textvariable=self.deepgram_key_var, show="*").grid(row=0, column=1, sticky="ew")
+        ttk.Button(audio_box, text="Save", command=self.save_app_settings, style="Accent.TButton").grid(
+            row=0, column=2, sticky="e", padx=(8, 0)
+        )
+        ttk.Label(audio_box, textvariable=self.deepgram_status_var, style="PanelSubtle.TLabel").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(8, 0)
+        )
+
+        permission_box = ttk.LabelFrame(body, text="First-run Access", padding=12)
+        permission_box.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        permission_box.columnconfigure(0, weight=1)
+        permission_text = (
+            "Camera access is required for hand tracking. Keyboard and mouse mappings may require Accessibility "
+            "or Input Monitoring permission on macOS before simulated input reaches other apps."
+        )
+        if platform.system() == "Windows":
+            permission_text = "Camera access is required for hand tracking. Some protected apps may ignore simulated keyboard and mouse input."
+        ttk.Label(permission_box, text=permission_text, wraplength=900, style="PanelSubtle.TLabel").grid(row=0, column=0, sticky="ew")
+
+        paths_box = ttk.LabelFrame(body, text="App Data", padding=12)
+        paths_box.grid(row=2, column=0, sticky="ew")
+        paths_box.columnconfigure(1, weight=1)
+        for row, (label, value) in enumerate(
+            (
+                ("User data", self.config.user_data_dir),
+                ("Config", self.config.config_dir),
+                ("Calibration", self.config.calibration_path),
+                ("Mappings", self.config.mapping_path),
+                ("Gesture data", self.config.gesture_data_dir),
+                ("Logs", self.config.logs_dir),
+                ("Audio temp", self.config.audio_recording_path),
+            )
+        ):
+            ttk.Label(paths_box, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=2)
+            ttk.Label(paths_box, text=str(value), style="PanelSubtle.TLabel", wraplength=760).grid(row=row, column=1, sticky="ew", pady=2)
+        ttk.Button(paths_box, text="Open App Data", command=self.open_user_data_dir, style="Secondary.TButton").grid(
+            row=7, column=0, columnspan=2, sticky="w", pady=(10, 0)
+        )
 
     def _build_dashboard_page(self, page: ttk.Frame) -> None:
         self._build_page_header(page, "Dashboard", "Daily controls and current device state.")
@@ -532,6 +706,111 @@ class AirTrixxGUI:
                 cells.append(label)
             self.keyboard_cells.append(cells)
 
+    def _build_mappings_page(self, page: ttk.Frame) -> None:
+        self._build_page_header(page, "Mappings", "Turn live AirTrixx signals into keyboard and mouse input.")
+        body = self._scrollable_body(page)
+        body.columnconfigure(0, weight=1)
+
+        runtime_box = ttk.LabelFrame(body, text="Runtime", padding=10)
+        runtime_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        runtime_box.columnconfigure(2, weight=1)
+        self.mapping_enabled_check = ttk.Checkbutton(
+            runtime_box,
+            text="Armed",
+            variable=self.mapping_enabled_var,
+            command=self.toggle_input_mapper,
+        )
+        self.mapping_enabled_check.grid(row=0, column=0, sticky="w", padx=(0, 14))
+        ttk.Checkbutton(
+            runtime_box,
+            text="Start armed",
+            variable=self.mapping_start_enabled_var,
+            command=self._sync_mapping_start_enabled,
+        ).grid(row=0, column=1, sticky="w", padx=(0, 14))
+        ttk.Label(runtime_box, textvariable=self.mapping_status_var).grid(row=0, column=2, sticky="w")
+
+        profile_box = ttk.LabelFrame(body, text="Profiles", padding=10)
+        profile_box.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        profile_box.columnconfigure(1, weight=1)
+        ttk.Label(profile_box, text="Active profile").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.mapping_profile_combo = ttk.Combobox(
+            profile_box,
+            textvariable=self.mapping_profile_var,
+            state="readonly",
+            width=24,
+        )
+        self.mapping_profile_combo.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        self.mapping_profile_combo.bind("<<ComboboxSelected>>", self.on_mapping_profile_changed)
+        ttk.Button(profile_box, text="New", command=self.new_mapping_profile).grid(row=0, column=2, sticky="ew", padx=(0, 6))
+        ttk.Button(profile_box, text="Save", command=self.save_input_mappings).grid(row=0, column=3, sticky="ew", padx=(0, 6))
+        ttk.Button(profile_box, text="Load", command=self.load_input_mappings).grid(row=0, column=4, sticky="ew", padx=(0, 6))
+        ttk.Button(profile_box, text="Import", command=self.import_input_mappings).grid(row=0, column=5, sticky="ew", padx=(0, 6))
+        ttk.Button(profile_box, text="Export", command=self.export_input_mappings).grid(row=0, column=6, sticky="ew")
+
+        split = ttk.Frame(body)
+        split.grid(row=2, column=0, sticky="nsew")
+        split.columnconfigure(0, weight=1)
+        split.columnconfigure(1, weight=2)
+        split.rowconfigure(0, weight=1)
+
+        signal_box = ttk.LabelFrame(split, text="Live Signals", padding=10)
+        signal_box.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        signal_box.rowconfigure(0, weight=1)
+        signal_box.columnconfigure(0, weight=1)
+        self.mapping_signal_tree = ttk.Treeview(
+            signal_box,
+            columns=("value", "source"),
+            show="tree headings",
+            height=18,
+        )
+        self.mapping_signal_tree.heading("#0", text="Signal")
+        self.mapping_signal_tree.heading("value", text="Current")
+        self.mapping_signal_tree.heading("source", text="Source")
+        self.mapping_signal_tree.column("#0", width=190, stretch=True)
+        self.mapping_signal_tree.column("value", width=110, stretch=False)
+        self.mapping_signal_tree.column("source", width=220, stretch=False)
+        self.mapping_signal_tree.grid(row=0, column=0, sticky="nsew")
+        signal_scroll = ttk.Scrollbar(signal_box, orient="vertical", command=self.mapping_signal_tree.yview)
+        signal_scroll.grid(row=0, column=1, sticky="ns")
+        self.mapping_signal_tree.configure(yscrollcommand=signal_scroll.set)
+        self.mapping_signal_tree.bind("<Double-1>", lambda _event: self.add_mapping_from_selected_signal())
+        self._register_scroll_target(self.mapping_signal_tree, self.mapping_signal_tree)
+
+        mapping_box = ttk.LabelFrame(split, text="Mappings", padding=10)
+        mapping_box.grid(row=0, column=1, sticky="nsew")
+        mapping_box.rowconfigure(1, weight=1)
+        mapping_box.columnconfigure(0, weight=1)
+        toolbar = ttk.Frame(mapping_box)
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Button(toolbar, text="Add", command=self.add_input_mapping).grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Button(toolbar, text="Edit", command=self.edit_selected_input_mapping).grid(row=0, column=1, sticky="w", padx=(0, 6))
+        ttk.Button(toolbar, text="Duplicate", command=self.duplicate_selected_input_mapping).grid(row=0, column=2, sticky="w", padx=(0, 6))
+        ttk.Button(toolbar, text="Delete", command=self.delete_selected_input_mapping).grid(row=0, column=3, sticky="w", padx=(0, 6))
+        ttk.Button(toolbar, text="Test", command=self.test_selected_input_mapping).grid(row=0, column=4, sticky="w")
+
+        columns = ("enabled", "source", "condition", "action", "mode", "state", "last")
+        self.mapping_rule_tree = ttk.Treeview(mapping_box, columns=columns, show="headings", height=18)
+        self.mapping_rule_tree.grid(row=1, column=0, sticky="nsew")
+        for column, text, width in (
+            ("enabled", "On", 48),
+            ("source", "Source", 210),
+            ("condition", "Condition", 120),
+            ("action", "Action", 180),
+            ("mode", "Mode", 80),
+            ("state", "State", 80),
+            ("last", "Last Fired", 90),
+        ):
+            self.mapping_rule_tree.heading(column, text=text)
+            self.mapping_rule_tree.column(column, width=width, stretch=column in {"source", "action"})
+        rule_scroll = ttk.Scrollbar(mapping_box, orient="vertical", command=self.mapping_rule_tree.yview)
+        rule_scroll.grid(row=1, column=1, sticky="ns")
+        self.mapping_rule_tree.configure(yscrollcommand=rule_scroll.set)
+        self.mapping_rule_tree.bind("<Double-1>", lambda _event: self.edit_selected_input_mapping())
+        self._register_scroll_target(self.mapping_rule_tree, self.mapping_rule_tree)
+
+        self._refresh_mapping_profile_combo()
+        self._refresh_mapping_table()
+
     def _build_live_data_page(self, page: ttk.Frame) -> None:
         self._build_page_header(page, "Live Data", "Current and previous input snapshots grouped by device.")
         data_box = ttk.LabelFrame(page, text="Inputs", padding=10)
@@ -638,7 +917,7 @@ class AirTrixxGUI:
         self._gesture_progress_visible = False
 
     def _build_audio_dock_page(self, page: ttk.Frame) -> None:
-        self._build_page_header(page, "Audio Dock", "Real-time Edge Impulse clap detection and Deepgram transcription inputs.")
+        self._build_page_header(page, "Audio Dock", "Clap-triggered audio through the Antenna bridge and Deepgram transcription.")
         body = self._scrollable_body(page)
         body.columnconfigure(0, weight=1)
 
@@ -647,7 +926,7 @@ class AirTrixxGUI:
         controls.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         controls.columnconfigure(1, weight=1)
 
-        ttk.Label(controls, text="COM Port").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(controls, text="Bridge port").grid(row=0, column=0, sticky="w", padx=(0, 8))
         
         self.audio_port_combo = ttk.Combobox(
             controls,
@@ -699,8 +978,7 @@ class AirTrixxGUI:
 
         selected = self.audio_dock_port_var.get().split(" - ", 1)[0].strip() or None
         if not selected:
-            self.log("Please select a COM port for the Audio Dock.")
-            return
+            self.log("Audio Dock will use the active Antenna serial bridge.")
 
         if self.audio_dock_bridge.connect(selected):
             self.audio_connect_button.configure(text="Disconnect")
@@ -728,6 +1006,537 @@ class AirTrixxGUI:
         self.audio_dock_last_trigger_var.set(trigger)
         self.audio_dock_latest_transcript_var.set(text)
         self.log(f"Audio Dock Trigger: {trigger} | Transcript: {text}")
+
+    def _deepgram_settings_status(self) -> str:
+        if str(self.config.calibration.get("deepgram_api_key", "")).strip():
+            return "Deepgram key saved in local user config."
+        if os.environ.get("DEEPGRAM_API_KEY", "").strip():
+            return "Using DEEPGRAM_API_KEY from the environment."
+        return "Audio Dock transcription is disabled until a Deepgram key is saved."
+
+    def save_app_settings(self) -> None:
+        calibration = dict(self.config.calibration)
+        calibration["deepgram_api_key"] = self.deepgram_key_var.get().strip()
+        self.config.calibration = calibration
+        self.audio_dock_bridge.set_deepgram_key(calibration["deepgram_api_key"])
+        save_calibration(calibration, self.config.calibration_path)
+        self.deepgram_status_var.set(self._deepgram_settings_status())
+        self.log(f"Saved app settings to {self.config.calibration_path}.")
+
+    def open_user_data_dir(self) -> None:
+        path = self.config.user_data_dir
+        path.mkdir(parents=True, exist_ok=True)
+        try:
+            if platform.system() == "Darwin":
+                subprocess.run(["open", str(path)], check=False)
+            elif platform.system() == "Windows":
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            else:
+                subprocess.run(["xdg-open", str(path)], check=False)
+        except Exception as exc:
+            self.log(f"Could not open app data folder: {exc}")
+
+    def toggle_input_mapper(self) -> None:
+        self.input_mapper.set_enabled(self.mapping_enabled_var.get())
+        self._update_mapping_status()
+
+    def _sync_mapping_start_enabled(self) -> None:
+        self.input_mapper.config.enabled_on_start = bool(self.mapping_start_enabled_var.get())
+
+    def _update_mapping_status(self) -> None:
+        held = "holding outputs" if self.input_mapper.has_held_outputs else "no held outputs"
+        state = "armed" if self.input_mapper.enabled else "disabled"
+        self.mapping_status_var.set(f"Mapper: {state}; {self.input_mapper.last_status}; {held}.")
+
+    def _refresh_mapping_profile_combo(self) -> None:
+        if not hasattr(self, "mapping_profile_combo"):
+            return
+        names = self.input_mapper.config.profile_names()
+        self.mapping_profile_combo["values"] = names
+        if self.mapping_profile_var.get() not in names:
+            self.mapping_profile_var.set(self.input_mapper.config.active_profile)
+
+    def on_mapping_profile_changed(self, _event: tk.Event | None = None) -> None:
+        if self.input_mapper.set_active_profile(self.mapping_profile_var.get()):
+            self._refresh_mapping_table()
+            self._update_mapping_status()
+            self.log(f"Input mapping profile switched to {self.input_mapper.config.active_profile}.")
+
+    def new_mapping_profile(self) -> None:
+        existing = set(self.input_mapper.config.profile_names())
+        index = len(existing) + 1
+        name = f"Profile {index}"
+        while name in existing:
+            index += 1
+            name = f"Profile {index}"
+        self.input_mapper.release_all()
+        self.input_mapper.config.profiles.append(MappingProfile(name=name))
+        self.input_mapper.config.active_profile = name
+        self.mapping_profile_var.set(name)
+        self._refresh_mapping_profile_combo()
+        self._refresh_mapping_table()
+        self._update_mapping_status()
+
+    def save_input_mappings(self) -> None:
+        self._sync_mapping_start_enabled()
+        save_mapping_config(self.input_mapper.config, self.mapping_config_path)
+        self.log(f"Saved input mappings to {self.mapping_config_path}.")
+
+    def load_input_mappings(self) -> None:
+        config, error = load_mapping_config(self.mapping_config_path)
+        if error:
+            self.log(f"Input mappings reset because config could not be loaded: {error}")
+        self.input_mapper.set_config(config)
+        self.mapping_enabled_var.set(self.input_mapper.enabled)
+        self.mapping_start_enabled_var.set(config.enabled_on_start)
+        self.mapping_profile_var.set(config.active_profile)
+        self._refresh_mapping_profile_combo()
+        self._refresh_mapping_table()
+        self._update_mapping_status()
+        self.log(f"Loaded input mappings from {self.mapping_config_path}.")
+
+    def import_input_mappings(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Import input mappings",
+            initialdir=str(self.mapping_config_path.parent),
+            filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+        )
+        if not selected:
+            return
+        config, error = load_mapping_config(Path(selected))
+        if error:
+            self.log(f"Could not import input mappings: {error}")
+            return
+        self.input_mapper.set_config(config)
+        self.mapping_enabled_var.set(self.input_mapper.enabled)
+        self.mapping_start_enabled_var.set(config.enabled_on_start)
+        self.mapping_profile_var.set(config.active_profile)
+        self._refresh_mapping_profile_combo()
+        self._refresh_mapping_table()
+        self._update_mapping_status()
+        self.log(f"Imported input mappings from {selected}.")
+
+    def export_input_mappings(self) -> None:
+        selected = filedialog.asksaveasfilename(
+            title="Export input mappings",
+            initialdir=str(self.mapping_config_path.parent),
+            initialfile="input_mappings.json",
+            defaultextension=".json",
+            filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+        )
+        if not selected:
+            return
+        self._sync_mapping_start_enabled()
+        save_mapping_config(self.input_mapper.config, Path(selected))
+        self.log(f"Exported input mappings to {selected}.")
+
+    def _selected_signal_id(self) -> str:
+        if not hasattr(self, "mapping_signal_tree"):
+            return ""
+        selection = self.mapping_signal_tree.selection()
+        if not selection:
+            return ""
+        values = self.mapping_signal_tree.item(selection[0], "values")
+        if len(values) >= 2:
+            return str(values[1])
+        return ""
+
+    def add_mapping_from_selected_signal(self) -> None:
+        source = self._selected_signal_id()
+        if source:
+            self.add_input_mapping(source)
+
+    def add_input_mapping(self, source: str | None = None) -> None:
+        default_source = source or self._selected_signal_id()
+        rule = MappingRule(
+            name=default_source or "New mapping",
+            source=default_source,
+            comparator="lt",
+            threshold=100.0,
+            action=MappingAction(type="keyboard_tap", keys=["space"]),
+        )
+        self._open_mapping_dialog(rule, is_new=True)
+
+    def _selected_mapping_rule(self) -> MappingRule | None:
+        if not hasattr(self, "mapping_rule_tree"):
+            return None
+        selection = self.mapping_rule_tree.selection()
+        if not selection:
+            return None
+        rule_id = selection[0]
+        for rule in self.input_mapper.active_rules():
+            if rule.id == rule_id:
+                return rule
+        return None
+
+    def edit_selected_input_mapping(self) -> None:
+        rule = self._selected_mapping_rule()
+        if rule is None:
+            self.log("Select an input mapping to edit.")
+            return
+        self._open_mapping_dialog(rule, is_new=False)
+
+    def duplicate_selected_input_mapping(self) -> None:
+        rule = self._selected_mapping_rule()
+        if rule is None:
+            self.log("Select an input mapping to duplicate.")
+            return
+        duplicate = copy.deepcopy(rule)
+        duplicate.id = MappingRule().id
+        duplicate.name = f"{duplicate.name} copy"
+        self.input_mapper.release_all()
+        self.input_mapper.config.active().mappings.append(duplicate)
+        self._refresh_mapping_table()
+        self._update_mapping_status()
+
+    def delete_selected_input_mapping(self) -> None:
+        rule = self._selected_mapping_rule()
+        if rule is None:
+            self.log("Select an input mapping to delete.")
+            return
+        self.input_mapper.release_rule(rule.id)
+        profile = self.input_mapper.config.active()
+        profile.mappings = [item for item in profile.mappings if item.id != rule.id]
+        self._refresh_mapping_table()
+        self._update_mapping_status()
+
+    def test_selected_input_mapping(self) -> None:
+        rule = self._selected_mapping_rule()
+        if rule is None:
+            self.log("Select an input mapping to test.")
+            return
+        self.input_mapper.test_action(rule.action)
+        self._refresh_mapping_table()
+
+    def _rule_dialog_sources(self, rule: MappingRule) -> list[str]:
+        sources = set(SignalCatalog.flatten(self._latest_snapshot).keys())
+        sources.update(item.source for item in self.input_mapper.active_rules() if item.source)
+        if rule.source:
+            sources.add(rule.source)
+        return sorted(sources)
+
+    def _open_mapping_dialog(self, rule: MappingRule, *, is_new: bool) -> None:
+        working = copy.deepcopy(rule)
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Add Mapping" if is_new else "Edit Mapping")
+        dialog.geometry("760x610")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+
+        frame = ttk.Frame(dialog, padding=14)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(3, weight=1)
+
+        name_var = tk.StringVar(value=working.name)
+        enabled_var = tk.BooleanVar(value=working.enabled)
+        source_var = tk.StringVar(value=working.source)
+        comparator_var = tk.StringVar(value=working.comparator)
+        threshold_var = tk.StringVar(value=str(working.threshold))
+        low_var = tk.StringVar(value=str(working.low))
+        high_var = tk.StringVar(value=str(working.high))
+        hysteresis_var = tk.StringVar(value=str(working.hysteresis))
+        debounce_var = tk.StringVar(value=str(working.debounce_ms))
+        action_type_var = tk.StringVar(value=working.action.type)
+        keys_var = tk.StringVar(value=", ".join(working.action.keys))
+        button_var = tk.StringVar(value=working.action.button)
+        clicks_var = tk.StringVar(value=str(working.action.clicks))
+        interval_var = tk.StringVar(value=str(working.action.interval_ms))
+        scroll_x_var = tk.StringVar(value=str(working.action.scroll_x))
+        scroll_y_var = tk.StringVar(value=str(working.action.scroll_y))
+        speed_x_var = tk.StringVar(value=str(working.action.speed_x))
+        speed_y_var = tk.StringVar(value=str(working.action.speed_y))
+        absolute_x_var = tk.StringVar(value=str(working.action.absolute_x))
+        absolute_y_var = tk.StringVar(value=str(working.action.absolute_y))
+        continuous_var = tk.BooleanVar(value=working.action.continuous)
+        status_var = tk.StringVar(value="")
+
+        def add_label(row: int, text: str, col: int = 0) -> None:
+            ttk.Label(frame, text=text).grid(row=row, column=col, sticky="w", padx=(0, 8), pady=4)
+
+        row = 0
+        add_label(row, "Name")
+        ttk.Entry(frame, textvariable=name_var).grid(row=row, column=1, columnspan=3, sticky="ew", pady=4)
+        row += 1
+        ttk.Checkbutton(frame, text="Enabled", variable=enabled_var).grid(row=row, column=1, sticky="w", pady=4)
+        row += 1
+        add_label(row, "Source")
+        source_combo = ttk.Combobox(frame, textvariable=source_var, values=self._rule_dialog_sources(working))
+        source_combo.grid(row=row, column=1, columnspan=3, sticky="ew", pady=4)
+        row += 1
+        add_label(row, "Comparator")
+        ttk.Combobox(
+            frame,
+            textvariable=comparator_var,
+            values=MAPPING_COMPARATOR_OPTIONS,
+            state="readonly",
+            width=18,
+        ).grid(row=row, column=1, sticky="w", pady=4)
+        add_label(row, "Threshold", 2)
+        ttk.Entry(frame, textvariable=threshold_var, width=18).grid(row=row, column=3, sticky="ew", pady=4)
+        row += 1
+        add_label(row, "Low")
+        ttk.Entry(frame, textvariable=low_var, width=18).grid(row=row, column=1, sticky="ew", pady=4)
+        add_label(row, "High", 2)
+        ttk.Entry(frame, textvariable=high_var, width=18).grid(row=row, column=3, sticky="ew", pady=4)
+        row += 1
+        add_label(row, "Hysteresis")
+        ttk.Entry(frame, textvariable=hysteresis_var, width=18).grid(row=row, column=1, sticky="ew", pady=4)
+        add_label(row, "Debounce ms", 2)
+        ttk.Entry(frame, textvariable=debounce_var, width=18).grid(row=row, column=3, sticky="ew", pady=4)
+        row += 1
+        add_label(row, "Action")
+        ttk.Combobox(
+            frame,
+            textvariable=action_type_var,
+            values=MAPPING_ACTION_OPTIONS,
+            state="readonly",
+            width=22,
+        ).grid(row=row, column=1, sticky="w", pady=4)
+        add_label(row, "Interval ms", 2)
+        ttk.Entry(frame, textvariable=interval_var, width=18).grid(row=row, column=3, sticky="ew", pady=4)
+        row += 1
+        add_label(row, "Keys")
+        ttk.Entry(frame, textvariable=keys_var).grid(row=row, column=1, columnspan=2, sticky="ew", pady=4)
+        record_button = ttk.Button(frame, text="Record", width=16)
+        record_button.grid(row=row, column=3, sticky="ew", pady=4)
+        row += 1
+        add_label(row, "Mouse button")
+        ttk.Combobox(
+            frame,
+            textvariable=button_var,
+            values=MAPPING_MOUSE_BUTTON_OPTIONS,
+            state="readonly",
+            width=18,
+        ).grid(row=row, column=1, sticky="w", pady=4)
+        add_label(row, "Clicks", 2)
+        ttk.Entry(frame, textvariable=clicks_var, width=18).grid(row=row, column=3, sticky="ew", pady=4)
+        row += 1
+        add_label(row, "Scroll X")
+        ttk.Entry(frame, textvariable=scroll_x_var, width=18).grid(row=row, column=1, sticky="ew", pady=4)
+        add_label(row, "Scroll Y", 2)
+        ttk.Entry(frame, textvariable=scroll_y_var, width=18).grid(row=row, column=3, sticky="ew", pady=4)
+        row += 1
+        add_label(row, "Move X px/s")
+        ttk.Entry(frame, textvariable=speed_x_var, width=18).grid(row=row, column=1, sticky="ew", pady=4)
+        add_label(row, "Move Y px/s", 2)
+        ttk.Entry(frame, textvariable=speed_y_var, width=18).grid(row=row, column=3, sticky="ew", pady=4)
+        row += 1
+        add_label(row, "Absolute X")
+        ttk.Entry(frame, textvariable=absolute_x_var, width=18).grid(row=row, column=1, sticky="ew", pady=4)
+        add_label(row, "Absolute Y", 2)
+        ttk.Entry(frame, textvariable=absolute_y_var, width=18).grid(row=row, column=3, sticky="ew", pady=4)
+        row += 1
+        ttk.Checkbutton(frame, text="Continuous absolute move", variable=continuous_var).grid(
+            row=row, column=1, columnspan=3, sticky="w", pady=4
+        )
+        row += 1
+        ttk.Label(frame, textvariable=status_var, foreground="#b45309").grid(
+            row=row, column=0, columnspan=4, sticky="ew", pady=(8, 4)
+        )
+        row += 1
+
+        recorded_tokens: list[str] = []
+        binding_id: str | None = None
+
+        def token_from_event(event: tk.Event) -> str:
+            key_name = str(getattr(event, "keysym", "") or "")
+            special = {
+                "Control_L": "ctrl",
+                "Control_R": "ctrl",
+                "Shift_L": "shift",
+                "Shift_R": "shift",
+                "Alt_L": "alt",
+                "Alt_R": "alt",
+                "Meta_L": "cmd",
+                "Meta_R": "cmd",
+                "Command": "cmd",
+                "Return": "enter",
+                "Escape": "esc",
+                "BackSpace": "backspace",
+                "Delete": "delete",
+                "Tab": "tab",
+                "space": "space",
+                "Left": "left",
+                "Right": "right",
+                "Up": "up",
+                "Down": "down",
+                "Home": "home",
+                "End": "end",
+                "Prior": "page_up",
+                "Next": "page_down",
+            }
+            if key_name in special:
+                return special[key_name]
+            char = str(getattr(event, "char", "") or "")
+            if len(char) == 1 and char.isprintable():
+                return normalize_key_token(char)
+            return normalize_key_token(key_name)
+
+        def stop_recording() -> None:
+            nonlocal binding_id
+            if binding_id is not None:
+                dialog.unbind("<KeyPress>", binding_id)
+                binding_id = None
+            self.mapping_recording_shortcut = False
+            record_button.configure(text="Record")
+            if recorded_tokens:
+                keys_var.set(", ".join(recorded_tokens))
+            status_var.set("")
+
+        def capture_key(event: tk.Event) -> str:
+            token = token_from_event(event)
+            if token and token not in recorded_tokens:
+                recorded_tokens.append(token)
+                keys_var.set(", ".join(recorded_tokens))
+                status_var.set("Recording: " + " + ".join(recorded_tokens))
+            return "break"
+
+        def toggle_recording() -> None:
+            nonlocal binding_id
+            if binding_id is not None:
+                stop_recording()
+                return
+            self.input_mapper.release_all()
+            self.mapping_recording_shortcut = True
+            recorded_tokens.clear()
+            keys_var.set("")
+            status_var.set("Recording keys. Press the combination, then click Stop Recording.")
+            record_button.configure(text="Stop Recording")
+            binding_id = dialog.bind("<KeyPress>", capture_key)
+            dialog.focus_force()
+
+        def build_action() -> MappingAction:
+            return MappingAction.from_dict(
+                {
+                    "type": action_type_var.get(),
+                    "keys": parse_key_combo(keys_var.get()),
+                    "button": button_var.get(),
+                    "clicks": clicks_var.get(),
+                    "interval_ms": interval_var.get(),
+                    "scroll_x": scroll_x_var.get(),
+                    "scroll_y": scroll_y_var.get(),
+                    "speed_x": speed_x_var.get(),
+                    "speed_y": speed_y_var.get(),
+                    "absolute_x": absolute_x_var.get(),
+                    "absolute_y": absolute_y_var.get(),
+                    "continuous": continuous_var.get(),
+                }
+            )
+
+        def build_rule() -> MappingRule | None:
+            try:
+                return MappingRule(
+                    id=working.id,
+                    name=name_var.get().strip() or source_var.get().strip() or "Mapping",
+                    enabled=enabled_var.get(),
+                    source=source_var.get().strip(),
+                    comparator=comparator_var.get(),
+                    threshold=threshold_var.get().strip(),
+                    low=low_var.get().strip(),
+                    high=high_var.get().strip(),
+                    hysteresis=float(hysteresis_var.get() or 0.0),
+                    debounce_ms=int(float(debounce_var.get() or 0)),
+                    action=build_action(),
+                )
+            except Exception as exc:
+                status_var.set(f"Invalid mapping: {exc}")
+                return None
+
+        def test_action() -> None:
+            try:
+                self.input_mapper.test_action(build_action())
+            except Exception as exc:
+                status_var.set(f"Test failed: {exc}")
+
+        def save_rule() -> None:
+            new_rule = build_rule()
+            if new_rule is None:
+                return
+            if not new_rule.source:
+                status_var.set("Select or enter a source signal.")
+                return
+            self.input_mapper.release_all()
+            profile = self.input_mapper.config.active()
+            if is_new:
+                profile.mappings.append(new_rule)
+            else:
+                for index, existing in enumerate(profile.mappings):
+                    if existing.id == working.id:
+                        profile.mappings[index] = new_rule
+                        break
+            self._refresh_mapping_table()
+            self._update_mapping_status()
+            stop_recording()
+            dialog.destroy()
+
+        def close_dialog() -> None:
+            stop_recording()
+            dialog.destroy()
+
+        record_button.configure(command=toggle_recording)
+        actions = ttk.Frame(frame)
+        actions.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        actions.columnconfigure(0, weight=1)
+        ttk.Button(actions, text="Test Action", command=test_action).grid(row=0, column=1, sticky="e", padx=(0, 6))
+        ttk.Button(actions, text="Cancel", command=close_dialog).grid(row=0, column=2, sticky="e", padx=(0, 6))
+        ttk.Button(actions, text="Save", command=save_rule, style="Accent.TButton").grid(row=0, column=3, sticky="e")
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+
+    def _update_mapping_live_views(self) -> None:
+        self._update_mapping_status()
+        self._refresh_mapping_signal_tree()
+        self._refresh_mapping_table()
+
+    def _refresh_mapping_signal_tree(self) -> None:
+        if not hasattr(self, "mapping_signal_tree"):
+            return
+        for item_id in self.mapping_signal_tree.get_children():
+            self.mapping_signal_tree.delete(item_id)
+        self.mapping_signal_items.clear()
+        group_items: dict[str, str] = {}
+        for signal in SignalCatalog.rows(self._latest_snapshot):
+            group_item = group_items.get(signal.group)
+            if group_item is None:
+                group_item = f"group:{signal.group.lower().replace(' ', '_')}"
+                group_items[signal.group] = group_item
+                self.mapping_signal_tree.insert("", "end", iid=group_item, text=signal.group, values=("", ""), open=True)
+            item_id = f"signal:{signal.id}"
+            self.mapping_signal_items[signal.id] = item_id
+            self.mapping_signal_tree.insert(
+                group_item,
+                "end",
+                iid=item_id,
+                text=signal.label,
+                values=(signal.display_value, signal.id),
+            )
+
+    def _refresh_mapping_table(self) -> None:
+        if not hasattr(self, "mapping_rule_tree"):
+            return
+        selected = self.mapping_rule_tree.selection()
+        for item_id in self.mapping_rule_tree.get_children():
+            self.mapping_rule_tree.delete(item_id)
+        self.mapping_rule_items.clear()
+        for rule in self.input_mapper.active_rules():
+            state = self.input_mapper.state_for_rule(rule.id)
+            last = "-" if state.last_fired_s is None else f"{max(0.0, time.monotonic() - state.last_fired_s):.1f}s ago"
+            values = (
+                "yes" if rule.enabled else "no",
+                rule.source or "-",
+                rule.condition_summary(),
+                rule.action.summary(),
+                rule.action.mode,
+                state.status,
+                last,
+            )
+            self.mapping_rule_items[rule.id] = rule.id
+            self.mapping_rule_tree.insert("", "end", iid=rule.id, values=values)
+        for item_id in selected:
+            if item_id in self.mapping_rule_tree.get_children():
+                self.mapping_rule_tree.selection_add(item_id)
 
     def _build_firmware_page(self, page: ttk.Frame) -> None:
         self._build_page_header(page, "Firmware", "Wireless firmware updates through the antenna bridge.")
@@ -779,7 +1588,7 @@ class AirTrixxGUI:
         self._register_scroll_target(inner, canvas)
 
     def _build_logs_page(self, page: ttk.Frame) -> None:
-        self._build_page_header(page, "Logs / Debug", "Serial log, raw antenna state, fused state, and servo diagnostics.")
+        self._build_page_header(page, "Data / Logs", "Serial log, raw antenna state, fused state, and servo diagnostics.")
         page.rowconfigure(1, weight=1)
         page.columnconfigure(0, weight=1)
         notebook = ttk.Notebook(page)
@@ -955,6 +1764,7 @@ class AirTrixxGUI:
 
     def toggle_serial(self) -> None:
         if self.serial_bridge.is_connected:
+            self.input_mapper.release_all()
             self.serial_autoconnect_enabled = False
             self.serial_bridge.disconnect()
             return
@@ -1591,8 +2401,8 @@ class AirTrixxGUI:
         if hasattr(self, "servo_debug_text"):
             self.servo_debug_text.delete("1.0", "end")
         try:
-            SERVO_DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            SERVO_DEBUG_LOG_PATH.write_text("", encoding="utf-8")
+            self.config.servo_debug_log_path.parent.mkdir(parents=True, exist_ok=True)
+            self.config.servo_debug_log_path.write_text("", encoding="utf-8")
         except OSError:
             pass
 
@@ -1638,8 +2448,8 @@ class AirTrixxGUI:
             self.servo_debug_text.insert("end", entry + "\n")
             self.servo_debug_text.see("end")
         try:
-            SERVO_DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with SERVO_DEBUG_LOG_PATH.open("a", encoding="utf-8") as handle:
+            self.config.servo_debug_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.config.servo_debug_log_path.open("a", encoding="utf-8") as handle:
                 handle.write(entry + "\n")
         except OSError:
             pass
@@ -1688,7 +2498,7 @@ class AirTrixxGUI:
 
     def _focus_is_text_input(self) -> bool:
         widget = self.root.focus_get()
-        return isinstance(widget, (tk.Entry, ttk.Entry, ttk.Combobox, ttk.Spinbox))
+        return isinstance(widget, (tk.Entry, tk.Text, ttk.Entry, ttk.Combobox, ttk.Spinbox))
 
     def _sync_calibration_entries(self, calibration: dict[str, Any]) -> None:
         for key, value in calibration.items():
@@ -1977,6 +2787,7 @@ class AirTrixxGUI:
             self._gesture_progress_visible = False
 
     def close(self) -> None:
+        self.input_mapper.release_all()
         self._close_camera_popup()
         self._stop_ota_server()
         self.recorder.stop()
@@ -1998,6 +2809,15 @@ class AirTrixxGUI:
         if self.centering_bracket is None and not camera_centering_claimed_servo and not self.hand_calibration_active:
             self.servo_controller.send_for_hands(hands, serial_state)
         self._latest_snapshot = self.fusion_state.build_snapshot(serial_state, hands)
+        input_dict = self._latest_snapshot.get("input_dict", {})
+        if isinstance(input_dict, dict):
+            input_dict["audiodock_input"] = self.audio_dock_bridge.latest_transcript or "TBD"
+        self._latest_snapshot["face_state"] = self.hand_tracker.get_latest_face()
+        mapper_suppressed = self._focus_is_text_input() or self.mapping_recording_shortcut
+        if self.serial_bridge.is_connected:
+            self.input_mapper.process(self._latest_snapshot, time.monotonic(), suppress_output=mapper_suppressed)
+        else:
+            self.input_mapper.release_all()
         self._update_servo_debug_console()
         self._update_preview()
         if time.monotonic() - self._last_text_update_s >= 0.2:
@@ -2008,7 +2828,22 @@ class AirTrixxGUI:
         self.record_button.configure(text="Recording..." if self.recorder.is_recording else "Record Gesture")
         self._update_gesture_recording_progress()
         self._update_fan_controls()
+        self._update_status_strip()
         self.root.after(33, self._tick)
+
+    def _update_status_strip(self) -> None:
+        if self.serial_bridge.is_connected:
+            port = self.serial_bridge.current_port or "connected"
+            self.hub_status_var.set(f"Hub: {port}")
+        else:
+            self.hub_status_var.set("Hub: disconnected")
+        mapper_state = "armed" if self.input_mapper.enabled else "disabled"
+        if self.input_mapper.has_held_outputs:
+            mapper_state += ", holding"
+        self.mapper_chip_var.set(f"Mapper: {mapper_state}")
+        frame = self.hand_tracker.get_latest_frame_rgb()
+        self.camera_chip_var.set("Camera: live" if frame is not None else "Camera: no frame")
+        self.permissions_status_var.set(f"App data: {self.config.user_data_dir}")
 
     def _home_brackets_on_connect(self) -> None:
         if self.startup_brackets_homed:
@@ -2439,6 +3274,7 @@ class AirTrixxGUI:
         self._update_data_table(serial_state, input_dict)
         self._update_dashboard_text(serial_state)
         self._update_keyboard_grid(serial_state)
+        self._update_mapping_live_views()
         self._set_text(self.json_text, json.dumps(serial_state, indent=2))
         fused = {
             "field_order": FIELD_ORDER,

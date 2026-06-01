@@ -8,7 +8,7 @@ AirTrixx is a multi-sensor laptop control prototype that combines:
 - a Wristband ESP32-C3 with MPU6050 IMU sensing and periodic battery telemetry
 - a Fan Controller ESP32-C3 with DS18B20 temperature telemetry and GUI on/off control
 - a Keyboard ESP32-S3 with three VL53L0X ToF lanes through a TCA9548A mux
-- a Windows Python app using OpenCV, MediaPipe Hands, pyserial, NumPy, Pillow, and Tkinter
+- a packaged Python desktop app using Tkinter, OpenCV, MediaPipe Tasks, pyserial, NumPy, Pillow, and pynput
 
 The current firmware targets are:
 
@@ -43,11 +43,15 @@ python_app/
   servo_controller.py
   gesture_recorder.py
   fusion_state.py
+  input_mapper.py
+  input_backend.py
   gui.py
   status_app.py
   requirements.txt
-  config/calibration.json  # auto-created locally and ignored by git
-  data/gestures/
+packaging/
+  build_macos_dmg.sh
+  build_windows_installer.ps1
+  AirTrixx.spec
 docs/
   setup_windows.md
   protocol.md
@@ -93,7 +97,7 @@ Flash in this order:
 
 If your Arduino IDE cannot resolve the shared headers from `firmware/shared`, copy `AirTrixxConfig.h` and `AirTrixxProtocol.h` into the sketch folder you are compiling, or compile with Arduino CLI from the repo so the relative include paths are preserved.
 
-## Run The Windows Python App
+## Run The Python App From Source
 
 From the repo root:
 
@@ -102,17 +106,18 @@ cd AirTrixx
 py -m venv python_app\.venv
 .\python_app\.venv\Scripts\activate
 pip install -r python_app\requirements.txt
+python packaging\download_models.py
 python python_app\main.py
 ```
 
-Or from inside `python_app`:
+On macOS/Linux, use the same steps with `python3` and `source`:
 
-```powershell
-cd python_app
-py -m venv .venv
-.\.venv\Scripts\activate
-pip install -r requirements.txt
-python main.py
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r python_app/requirements.txt
+python packaging/download_models.py
+python python_app/main.py
 ```
 
 The GUI provides:
@@ -121,11 +126,33 @@ The GUI provides:
 - live MediaPipe camera preview
 - live Antenna JSON/device state display
 - live fused input array display
+- per-signal keyboard and mouse mappings with tap, hold, repeat, scroll, and movement actions
 - fan on/off control, live temperature readings, and wireless fan firmware flash
 - keyboard ToF live data and a 0-300 mm distance grid
 - camera center command
 - servo calibration save/load
-- labeled gesture recording to `python_app/data/gestures/<gesture_name>/`
+- labeled gesture recording under the user's AirTrixx app-data folder
+
+Runtime config, mappings, logs, gesture recordings, and temporary audio files are stored outside the app bundle:
+
+- Windows: `%APPDATA%\AirTrixx`
+- macOS: `~/Library/Application Support/AirTrixx`
+
+## Package The App
+
+macOS Apple Silicon DMG:
+
+```bash
+./packaging/build_macos_dmg.sh
+```
+
+Windows x64 installer or portable zip:
+
+```powershell
+.\packaging\build_windows_installer.ps1
+```
+
+The build scripts install dependencies into an isolated build venv, generate icons, download the MediaPipe hand-landmarker model into generated packaging assets, and run PyInstaller. Windows builds must be produced on Windows; macOS DMGs must be produced on macOS.
 
 To run the smaller connection status checker without camera or MediaPipe:
 
@@ -140,4 +167,5 @@ It shows the USB Antenna link, JSON stream freshness, and the latest device stat
 - Wristband battery telemetry reports voltage and percentage to the Antenna about every 5 minutes.
 - Wristband yaw is not currently reported; the sealed wristband firmware uses the MPU6050 only.
 - VL53L1X code targets the Pololu `VL53L1X` Arduino library. If you use another library, adapt only the isolated ToF init/read helpers in `camdock_esp32s3.ino`.
-- Servo center values are defaults and should be calibrated per build in `python_app/config/calibration.json`.
+- Servo center values are defaults and should be calibrated per build from the app Settings page.
+- Unsigned packaged builds may show Windows SmartScreen or macOS Gatekeeper warnings until code-signing/notarization is added.
