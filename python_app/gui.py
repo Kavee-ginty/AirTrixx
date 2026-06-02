@@ -82,6 +82,16 @@ HAND_CALIBRATION_MIN_SPAN = 0.08
 HAND_CALIBRATION_TARGET_RADIUS = 0.095
 SESSION_CALIBRATION_SETTLED_S = 0.9
 SESSION_CALIBRATION_MIN_SCORE = 0.45
+RADAR_CALIBRATION_SIDE = "left"
+RADAR_SCAN_READY_S = 1.0
+RADAR_SCAN_SETTLE_S = 0.18
+RADAR_SCAN_PAN_RANGE_TICKS = 120
+RADAR_SCAN_PAN_STEP_TICKS = 30
+RADAR_SCAN_UP_DEG = 30.0
+RADAR_SCAN_TILT_STEP_DEG = 10.0
+RADAR_SCAN_MIN_CONTRAST_MM = 45.0
+RADAR_TRACK_CONFIRM_TIMEOUT_S = 4.0
+RADAR_TRACK_CONFIRM_SETTLED_S = 0.35
 CALIBRATION_ENTRY_KEYS = [
     "cam_pan_center",
     "cam_tilt_center",
@@ -219,7 +229,7 @@ class AirTrixxGUI:
         self.ota_in_progress = False
         self.fans_requested_on = False
         self.serial_autoconnect_enabled = True
-        self.camera_centering_active = True
+        self.camera_centering_active = False
         self.camera_centering_started_s: float | None = None
         self.camera_centering_settled_s: float | None = None
         self.camera_centering_last_send_s = 0.0
@@ -241,6 +251,15 @@ class AirTrixxGUI:
         self.hand_calibration_seen_since_s: float | None = None
         self.hand_calibration_auto_capture = True
         self._calibration_last_trackable_hands: dict[str, dict[str, Any]] = {}
+        self.hand_calibration_mode = "radar_left"
+        self.radar_scan_positions: list[dict[str, Any]] = []
+        self.radar_scan_samples: list[dict[str, Any]] = []
+        self.radar_scan_index = -1
+        self.radar_scan_ready_s: float | None = None
+        self.radar_scan_move_s: float | None = None
+        self.radar_scan_best: dict[str, Any] | None = None
+        self.radar_track_confirm_started_s: float | None = None
+        self.radar_track_seen_s: float | None = None
 
         # Initialize Audio Dock variables and instance
         self.audio_dock_status_var = tk.StringVar(value="Disconnected")
@@ -612,7 +631,7 @@ class AirTrixxGUI:
         ttk.Label(hand_calibration_box, textvariable=self.hand_calibration_status_var, wraplength=760).grid(
             row=0, column=0, columnspan=2, sticky="ew"
         )
-        ttk.Button(hand_calibration_box, text="Run Calibration", command=self.start_hand_calibration).grid(
+        ttk.Button(hand_calibration_box, text="Run Left Radar Calibration", command=self.start_hand_calibration).grid(
             row=1, column=0, sticky="ew", pady=(8, 0), padx=(0, 4)
         )
         self.skip_calibration_button = ttk.Button(hand_calibration_box, text="Skip Calibration", command=self.skip_hand_calibration)
@@ -1391,6 +1410,7 @@ class AirTrixxGUI:
         self.hand_calibration_target_inside = False
         self.hand_calibration_seen_since_s = None
         self.hand_calibration_auto_capture = True
+        self._reset_left_radar_calibration_state()
         self.camera_centering_active = True
         self.camera_centering_started_s = None
         self.camera_centering_settled_s = None
@@ -1402,6 +1422,7 @@ class AirTrixxGUI:
         self.camera_search_last_send_s = 0.0
         self.camera_face_position_ok = False
         self.camera_face_align_settled_s = None
+        self.startup_hand_calibration_pending = True
         self._update_bracket_buttons()
         self.camera_centering_status_var.set("Camera centering: started; searching for face.")
         self.hand_calibration_status_var.set("Calibration phase: waiting for camera centering.")
@@ -1418,6 +1439,7 @@ class AirTrixxGUI:
         self.hand_calibration_fist_armed = False
         self.hand_calibration_target_inside = False
         self.hand_calibration_seen_since_s = None
+        self._reset_left_radar_calibration_state()
         stored_position = self.centering_positions.get(bracket, {})
         pan = stored_position.get("pan")
         tilt = stored_position.get("tilt")
@@ -1450,6 +1472,8 @@ class AirTrixxGUI:
 
     def resume_auto_tracking(self) -> None:
         self.centering_bracket = None
+        self.hand_calibration_active = False
+        self._reset_left_radar_calibration_state()
         self.selected_bracket_var.set("Auto hand tracking")
         self.center_pan_var.set("-")
         self.center_tilt_var.set("-")
@@ -1745,13 +1769,16 @@ class AirTrixxGUI:
         self.hand_calibration_seen_since_s = None
         self.hand_calibration_auto_capture = bool(auto)
         self._calibration_last_trackable_hands = {}
+        self.hand_calibration_mode = "radar_left"
+        self._reset_left_radar_calibration_state()
+        self.radar_scan_ready_s = time.monotonic()
         self._lock_camera_bracket_position()
         self._set_hand_calibration_prompt()
         self.serial_autoconnect_enabled = True
         if not self.serial_bridge.is_connected:
             self.auto_connect_serial()
         prefix = "Startup" if auto else "Manual"
-        self.log(f"{prefix} calibration phase started.")
+        self.log(f"{prefix} left-hand radar calibration phase started.")
 
     def capture_hand_calibration_point(self) -> None:
         if not self.hand_calibration_active:
@@ -1779,6 +1806,7 @@ class AirTrixxGUI:
         self.hand_calibration_seen_since_s = None
         self.hand_calibration_auto_capture = True
         self._calibration_last_trackable_hands = {}
+        self._reset_left_radar_calibration_state()
         self.hand_calibration_status_var.set(
             "Calibration phase: skipped; using saved dock geometry values."
         )
@@ -1786,7 +1814,7 @@ class AirTrixxGUI:
 
     def _set_hand_calibration_prompt(self) -> None:
         self.hand_calibration_status_var.set(
-            "Calibration phase: place both hands in neutral start pose."
+            "Calibration phase: place left hand in neutral pose; radar scan will find it with left ToF."
         )
 
     def _best_visible_hand(self, hands: dict[str, dict[str, Any]] | None = None) -> tuple[str, dict[str, Any]] | None:
@@ -1807,6 +1835,10 @@ class AirTrixxGUI:
         hands: dict[str, dict[str, Any]],
         serial_state: dict[str, Any],
     ) -> None:
+        if self.hand_calibration_mode == "radar_left":
+            self._update_left_radar_calibration(hands, serial_state)
+            return
+
         if not self.serial_bridge.is_connected:
             self.hand_calibration_seen_since_s = None
             self.hand_calibration_status_var.set("Calibration phase: waiting for Antenna serial link.")
@@ -1858,6 +1890,325 @@ class AirTrixxGUI:
             return
 
         self._finish_session_calibration(visible_hands, serial_state)
+
+    def _reset_left_radar_calibration_state(self) -> None:
+        self.radar_scan_positions = []
+        self.radar_scan_samples = []
+        self.radar_scan_index = -1
+        self.radar_scan_ready_s = None
+        self.radar_scan_move_s = None
+        self.radar_scan_best = None
+        self.radar_track_confirm_started_s = None
+        self.radar_track_seen_s = None
+
+    def _update_left_radar_calibration(
+        self,
+        hands: dict[str, dict[str, Any]],
+        serial_state: dict[str, Any],
+    ) -> None:
+        if not self.serial_bridge.is_connected:
+            self.radar_scan_move_s = None
+            self.hand_calibration_status_var.set("Calibration phase: waiting for Antenna serial link.")
+            return
+
+        now = time.monotonic()
+        if self.radar_scan_ready_s is None:
+            self.radar_scan_ready_s = now
+            self.hand_calibration_status_var.set(
+                "Calibration phase: place left hand in neutral pose; radar scan starts in 1.0s."
+            )
+            return
+
+        ready_remaining_s = RADAR_SCAN_READY_S - (now - self.radar_scan_ready_s)
+        if ready_remaining_s > 0.0:
+            self.hand_calibration_status_var.set(
+                f"Calibration phase: place left hand in neutral pose; radar scan starts in {ready_remaining_s:.1f}s."
+            )
+            return
+
+        if not self.radar_scan_positions:
+            self.radar_scan_positions = self._build_left_radar_scan_positions()
+            self.radar_scan_index = 0
+            self.radar_scan_samples = []
+            self.radar_scan_move_s = None
+            self.log(
+                f"Left radar scan started with {len(self.radar_scan_positions)} points."
+            )
+
+        if self.radar_scan_best is None:
+            self._advance_left_radar_scan(now, serial_state)
+            return
+
+        self._confirm_left_radar_tracking(now, hands, serial_state)
+
+    def _advance_left_radar_scan(self, now: float, serial_state: dict[str, Any]) -> None:
+        if self.radar_scan_index < 0:
+            self.radar_scan_index = 0
+
+        if self.radar_scan_index >= len(self.radar_scan_positions):
+            best = self._best_left_radar_sample()
+            if best is None:
+                self.hand_calibration_active = False
+                self._reset_left_radar_calibration_state()
+                self.hand_calibration_status_var.set(
+                    "Calibration phase: left radar scan found no valid ToF return."
+                )
+                self.log("Left radar calibration failed: no valid left ToF samples.")
+                return
+
+            self.radar_scan_best = best
+            self.radar_track_confirm_started_s = now
+            self.radar_track_seen_s = None
+            self.servo_controller.send_bracket_position(
+                RADAR_CALIBRATION_SIDE,
+                int(best["pan"]),
+                int(best["tilt"]),
+            )
+            contrast = self._left_radar_contrast_mm()
+            self._append_servo_debug(
+                "RADAR_FOUND"
+                f" side={RADAR_CALIBRATION_SIDE}"
+                f" pan={int(best['pan'])}"
+                f" tilt={int(best['tilt'])}"
+                f" distance_mm={self._fmt(best.get('tof_mm'), 1)}"
+                f" contrast_mm={self._fmt(contrast, 1)}"
+                f" samples={len(self.radar_scan_samples)}"
+            )
+            self.hand_calibration_status_var.set(
+                "Calibration phase: radar found left hand; waiting for MediaPipe left hand lock."
+            )
+            return
+
+        if self.radar_scan_move_s is None:
+            position = self.radar_scan_positions[self.radar_scan_index]
+            self.servo_controller.send_bracket_position(
+                RADAR_CALIBRATION_SIDE,
+                int(position["pan"]),
+                int(position["tilt"]),
+            )
+            self.radar_scan_move_s = now
+            self.hand_calibration_status_var.set(
+                "Calibration phase: radar scanning left hand "
+                f"{self.radar_scan_index + 1}/{len(self.radar_scan_positions)}."
+            )
+            return
+
+        if now - self.radar_scan_move_s < RADAR_SCAN_SETTLE_S:
+            return
+
+        self._record_current_left_radar_sample(serial_state)
+        self.radar_scan_index += 1
+        self.radar_scan_move_s = None
+
+    def _record_current_left_radar_sample(self, serial_state: dict[str, Any]) -> None:
+        if not (0 <= self.radar_scan_index < len(self.radar_scan_positions)):
+            return
+        position = self.radar_scan_positions[self.radar_scan_index]
+        tof_mm = self._valid_calibration_tof_mm(RADAR_CALIBRATION_SIDE, serial_state)
+        if tof_mm is None:
+            self._append_servo_debug(
+                "RADAR_SAMPLE"
+                f" side={RADAR_CALIBRATION_SIDE}"
+                f" index={self.radar_scan_index}"
+                f" pan={int(position['pan'])}"
+                f" tilt={int(position['tilt'])}"
+                " distance_mm=- valid=no"
+            )
+            return
+
+        sample = {
+            "index": self.radar_scan_index,
+            "pan": int(position["pan"]),
+            "tilt": int(position["tilt"]),
+            "tof_mm": float(tof_mm),
+            "pan_offset": int(position.get("pan_offset", 0)),
+            "tilt_offset": int(position.get("tilt_offset", 0)),
+            "time_s": time.time(),
+        }
+        self.radar_scan_samples.append(sample)
+        self._append_servo_debug(
+            "RADAR_SAMPLE"
+            f" side={RADAR_CALIBRATION_SIDE}"
+            f" index={sample['index']}"
+            f" pan={sample['pan']}"
+            f" tilt={sample['tilt']}"
+            f" distance_mm={self._fmt(sample['tof_mm'], 1)}"
+            " valid=yes"
+        )
+
+    def _confirm_left_radar_tracking(
+        self,
+        now: float,
+        hands: dict[str, dict[str, Any]],
+        serial_state: dict[str, Any],
+    ) -> None:
+        if self.radar_scan_best is None:
+            return
+
+        left_hand = self._trackable_left_hand(hands)
+        if left_hand is not None:
+            if self.radar_track_seen_s is None:
+                self.radar_track_seen_s = now
+                self.hand_calibration_status_var.set(
+                    "Calibration phase: MediaPipe sees left hand; holding lock."
+                )
+                return
+            if now - self.radar_track_seen_s >= RADAR_TRACK_CONFIRM_SETTLED_S:
+                self._finish_left_radar_calibration(self.radar_scan_best, left_hand, serial_state)
+                return
+            self.hand_calibration_status_var.set(
+                "Calibration phase: MediaPipe sees left hand; confirming lock."
+            )
+            return
+
+        self.radar_track_seen_s = None
+        elapsed_s = now - (self.radar_track_confirm_started_s or now)
+        if elapsed_s >= RADAR_TRACK_CONFIRM_TIMEOUT_S:
+            self._finish_left_radar_calibration(self.radar_scan_best, None, serial_state)
+            return
+        self.hand_calibration_status_var.set(
+            "Calibration phase: radar hit found; show left hand to camera for XY tracking."
+        )
+
+    def _build_left_radar_scan_positions(self) -> list[dict[str, Any]]:
+        anchor = self.servo_controller.last_sent_bracket_ticks(RADAR_CALIBRATION_SIDE)
+        if anchor:
+            anchor_pan = int(anchor["pan"])
+            anchor_tilt = int(anchor["tilt"])
+        else:
+            anchor_pan, anchor_tilt = self.servo_controller.center_ticks_for_bracket(RADAR_CALIBRATION_SIDE)
+
+        pan_offsets = list(
+            range(
+                -RADAR_SCAN_PAN_RANGE_TICKS,
+                RADAR_SCAN_PAN_RANGE_TICKS + 1,
+                RADAR_SCAN_PAN_STEP_TICKS,
+            )
+        )
+        if 0 not in pan_offsets:
+            pan_offsets.append(0)
+        pan_offsets = sorted(set(pan_offsets))
+
+        tilt_ticks_per_deg = abs(float(self.config.calibration.get("tilt_ticks_per_degree", 2.25)))
+        tilt_step = max(1, int(round(RADAR_SCAN_TILT_STEP_DEG * tilt_ticks_per_deg)))
+        up_ticks = max(tilt_step, int(round(RADAR_SCAN_UP_DEG * tilt_ticks_per_deg)))
+        tilt_offsets = [0]
+        current = -tilt_step
+        while abs(current) <= up_ticks:
+            tilt_offsets.append(current)
+            current -= tilt_step
+        if tilt_offsets[-1] != -up_ticks:
+            tilt_offsets.append(-up_ticks)
+        tilt_offsets = list(dict.fromkeys(tilt_offsets))
+
+        positions: list[dict[str, Any]] = []
+        for row_index, tilt_offset in enumerate(tilt_offsets):
+            row_pan_offsets = pan_offsets if row_index % 2 == 0 else list(reversed(pan_offsets))
+            for pan_offset in row_pan_offsets:
+                positions.append(
+                    {
+                        "pan": self._clamp_servo_tick(anchor_pan + pan_offset),
+                        "tilt": self._clamp_servo_tick(anchor_tilt + tilt_offset),
+                        "pan_offset": pan_offset,
+                        "tilt_offset": tilt_offset,
+                        "row": row_index,
+                    }
+                )
+        return positions
+
+    def _best_left_radar_sample(self) -> dict[str, Any] | None:
+        if not self.radar_scan_samples:
+            return None
+        return dict(min(self.radar_scan_samples, key=lambda sample: float(sample["tof_mm"])))
+
+    def _left_radar_contrast_mm(self) -> float | None:
+        if len(self.radar_scan_samples) < 2:
+            return None
+        distances = sorted(float(sample["tof_mm"]) for sample in self.radar_scan_samples)
+        closest = distances[0]
+        median = distances[len(distances) // 2]
+        return max(0.0, median - closest)
+
+    def _trackable_left_hand(self, hands: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+        values = hands.get(RADAR_CALIBRATION_SIDE, {}) if isinstance(hands, dict) else {}
+        if not values.get("visible") or values.get("x") is None or values.get("y") is None:
+            return None
+        if float(values.get("score") or 0.0) < SESSION_CALIBRATION_MIN_SCORE:
+            return None
+        return dict(values)
+
+    def _left_only_tracking_hands(self, hands: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        values = hands.get(RADAR_CALIBRATION_SIDE, {}) if isinstance(hands, dict) else {}
+        if not values.get("visible") or values.get("x") is None or values.get("y") is None:
+            return {}
+        return {RADAR_CALIBRATION_SIDE: dict(values)}
+
+    def _finish_left_radar_calibration(
+        self,
+        radar_hit: dict[str, Any],
+        left_hand: dict[str, Any] | None,
+        serial_state: dict[str, Any],
+    ) -> None:
+        calibration = dict(self.config.calibration)
+        tof_mm = self._valid_calibration_tof_mm(RADAR_CALIBRATION_SIDE, serial_state)
+        distance_source = "left_tof_live"
+        if tof_mm is None:
+            tof_mm = float(radar_hit["tof_mm"])
+            distance_source = "left_tof_radar"
+        calibration["initial_hand_distance_mm"] = round(float(tof_mm), 1)
+
+        contrast_mm = self._left_radar_contrast_mm()
+        if left_hand is None:
+            left_x = None
+            left_y = None
+            score = 0.0
+        else:
+            left_x = round(float(left_hand["x"]), 4)
+            left_y = round(float(left_hand["y"]), 4)
+            score = round(float(left_hand.get("score") or 0.0), 4)
+
+        calibration["session_calibration"] = {
+            RADAR_CALIBRATION_SIDE: {
+                "x": left_x,
+                "y": left_y,
+                "tof_mm": round(float(tof_mm), 1),
+                "distance_source": distance_source,
+                "score": score,
+                "radar_pan_tick": int(radar_hit["pan"]),
+                "radar_tilt_tick": int(radar_hit["tilt"]),
+                "radar_sample_count": len(self.radar_scan_samples),
+                "radar_contrast_mm": round(float(contrast_mm), 1) if contrast_mm is not None else None,
+            }
+        }
+        self.config.calibration = calibration
+        self._sync_calibration_entries(calibration)
+        self.servo_controller.update_calibration(calibration)
+        save_calibration(calibration, self.config.calibration_path)
+
+        weak_signal_note = ""
+        if contrast_mm is not None and contrast_mm < RADAR_SCAN_MIN_CONTRAST_MM:
+            weak_signal_note = " Low radar contrast; nearest point was still used."
+            self.log(
+                "Left radar calibration used nearest ToF point with weak contrast "
+                f"({contrast_mm:.1f} mm)."
+            )
+
+        self.hand_calibration_active = False
+        self.hand_calibration_fist_armed = False
+        self.hand_calibration_fist_side = None
+        self.hand_calibration_target_inside = False
+        self.hand_calibration_seen_since_s = None
+        self._calibration_last_trackable_hands = {}
+        self.hand_calibration_status_var.set(
+            "Calibration phase: saved left radar neutral point; left MediaPipe XY tracking active."
+            + weak_signal_note
+        )
+        self.log(
+            "Saved left radar session calibration "
+            f"pan={int(radar_hit['pan'])} tilt={int(radar_hit['tilt'])} "
+            f"distance={float(tof_mm):.1f} mm to {self.config.calibration_path}."
+        )
+        self._reset_left_radar_calibration_state()
 
     def _display_hand_position(self, values: dict[str, Any]) -> tuple[float, float]:
         x = float(values["x"])
@@ -1990,13 +2341,14 @@ class AirTrixxGUI:
 
         hands = self.hand_tracker.get_latest_hands()
         serial_state = self.serial_bridge.get_latest_state()
+        tracking_hands = self._left_only_tracking_hands(hands)
         camera_centering_claimed_servo = False
         if self.centering_bracket is None and self.camera_centering_active:
             camera_centering_claimed_servo = self._update_camera_centering()
         if self.hand_calibration_active:
             self._update_hand_calibration(hands, serial_state)
         if self.centering_bracket is None and not camera_centering_claimed_servo and not self.hand_calibration_active:
-            self.servo_controller.send_for_hands(hands, serial_state)
+            self.servo_controller.send_for_hands(tracking_hands, serial_state)
         self._latest_snapshot = self.fusion_state.build_snapshot(serial_state, hands)
         self._update_servo_debug_console()
         self._update_preview()
@@ -2024,6 +2376,10 @@ class AirTrixxGUI:
             self.log("Bracket homing command failed; serial may not be ready.")
 
     def _update_camera_centering(self) -> bool:
+        if not self.hand_tracker.latest_frame_is_visible():
+            self.camera_centering_status_var.set("Camera centering: waiting for visible USB camera feed.")
+            return True
+
         if not self.serial_bridge.is_connected:
             self.camera_centering_status_var.set("Camera centering: waiting for Antenna serial link.")
             return True
@@ -2387,7 +2743,7 @@ class AirTrixxGUI:
 
         camera_status = self.camera_centering_status_var.get()
         calibration_status = self.hand_calibration_status_var.get()
-        if self.camera_centering_active:
+        if self.camera_centering_active or "usb camera" in camera_status.lower():
             add(camera_status)
         if self.hand_calibration_active or self.startup_hand_calibration_pending:
             add(calibration_status)
