@@ -1949,7 +1949,7 @@ class AirTrixxGUI:
         working = copy.deepcopy(rule)
         dialog = tk.Toplevel(self.root)
         dialog.title("Add Mapping" if is_new else "Edit Mapping")
-        dialog.geometry("980x780")
+        dialog.geometry("980x840")
         dialog.transient(self.root)
         dialog.grab_set()
         dialog.columnconfigure(0, weight=1)
@@ -1982,6 +1982,10 @@ class AirTrixxGUI:
         absolute_y_var = tk.StringVar(value=str(working.action.absolute_y))
         absolute_x_source_var = tk.StringVar(value=working.action.absolute_x_source)
         absolute_y_source_var = tk.StringVar(value=working.action.absolute_y_source)
+        absolute_x_invert_var = tk.BooleanVar(value=working.action.absolute_x_invert)
+        absolute_y_invert_var = tk.BooleanVar(value=working.action.absolute_y_invert)
+        absolute_deadband_var = tk.StringVar(value=str(working.action.absolute_deadband))
+        absolute_smoothing_alpha_var = tk.StringVar(value=str(working.action.absolute_smoothing_alpha))
         continuous_var = tk.BooleanVar(value=working.action.continuous)
         status_var = tk.StringVar(value="")
         source_options = self._rule_dialog_sources(working)
@@ -2156,6 +2160,18 @@ class AirTrixxGUI:
             row=row, column=3, sticky="ew", pady=4
         )
         row += 1
+        ttk.Checkbutton(frame, text="Invert absolute X", variable=absolute_x_invert_var).grid(
+            row=row, column=1, sticky="w", pady=4
+        )
+        ttk.Checkbutton(frame, text="Invert absolute Y", variable=absolute_y_invert_var).grid(
+            row=row, column=3, sticky="w", pady=4
+        )
+        row += 1
+        add_label(row, "Absolute deadband")
+        ttk.Entry(frame, textvariable=absolute_deadband_var, width=18).grid(row=row, column=1, sticky="ew", pady=4)
+        add_label(row, "Smoothing alpha", 2)
+        ttk.Entry(frame, textvariable=absolute_smoothing_alpha_var, width=18).grid(row=row, column=3, sticky="ew", pady=4)
+        row += 1
         ttk.Checkbutton(frame, text="Continuous absolute move", variable=continuous_var).grid(
             row=row, column=1, columnspan=3, sticky="w", pady=4
         )
@@ -2268,6 +2284,10 @@ class AirTrixxGUI:
                     "absolute_y": absolute_y_var.get(),
                     "absolute_x_source": absolute_x_source_var.get().strip(),
                     "absolute_y_source": absolute_y_source_var.get().strip(),
+                    "absolute_x_invert": absolute_x_invert_var.get(),
+                    "absolute_y_invert": absolute_y_invert_var.get(),
+                    "absolute_deadband": absolute_deadband_var.get(),
+                    "absolute_smoothing_alpha": absolute_smoothing_alpha_var.get(),
                     "continuous": continuous_var.get(),
                 }
             )
