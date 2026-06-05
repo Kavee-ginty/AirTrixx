@@ -13,6 +13,7 @@ from input_backend import InputBackend, normalize_mouse_button, parse_key_combo
 
 MAPPING_SCHEMA_VERSION = 1
 DEFAULT_PROFILE_NAME = "Default"
+THREEDVIEWER_PROFILE_NAME = "3dviewer.net"
 DEFAULT_MAPPING_PATH = MAPPING_PATH
 
 ACTION_TYPES = {
@@ -481,6 +482,7 @@ class MappingConfig:
         if not profiles:
             profiles = [MappingProfile()]
         _upgrade_wrist_pitch_rules(profiles)
+        _ensure_builtin_profiles(profiles)
         active_profile = str(data.get("active_profile") or profiles[0].name)
         if active_profile not in {profile.name for profile in profiles}:
             active_profile = profiles[0].name
@@ -511,7 +513,132 @@ class MappingConfig:
 
 
 def default_mapping_config() -> MappingConfig:
-    return MappingConfig()
+    profiles = [MappingProfile(), create_3dviewer_net_profile()]
+    return MappingConfig(profiles=profiles)
+
+
+def create_3dviewer_net_profile() -> MappingProfile:
+    """Create a profile for Online 3D Viewer mouse navigation.
+
+    3dviewer.net uses left-drag for orbit, right/middle-drag or Shift+left-drag
+    for pan, and the mouse wheel for zoom.
+    """
+    return MappingProfile(
+        name=THREEDVIEWER_PROFILE_NAME,
+        mappings=[
+            MappingRule(
+                id="3dviewer_orbit_hold",
+                name="3dviewer orbit: right open palm holds left drag",
+                source="hands.right.gesture",
+                comparator="eq",
+                threshold="open_palm",
+                action=MappingAction(type="mouse_hold", button="left"),
+            ),
+            MappingRule(
+                id="3dviewer_orbit_follow",
+                name="3dviewer orbit: right open palm moves cursor",
+                source="hands.right.gesture",
+                comparator="eq",
+                threshold="open_palm",
+                action=MappingAction(
+                    type="mouse_absolute",
+                    continuous=True,
+                    absolute_x_source="hands.right.x",
+                    absolute_y_source="hands.right.y",
+                ),
+            ),
+            MappingRule(
+                id="3dviewer_pan_hold",
+                name="3dviewer pan: right fist holds right drag",
+                source="hands.right.gesture",
+                comparator="eq",
+                threshold="closed_fist",
+                action=MappingAction(type="mouse_hold", button="right"),
+            ),
+            MappingRule(
+                id="3dviewer_pan_follow",
+                name="3dviewer pan: right fist moves cursor",
+                source="hands.right.gesture",
+                comparator="eq",
+                threshold="closed_fist",
+                action=MappingAction(
+                    type="mouse_absolute",
+                    continuous=True,
+                    absolute_x_source="hands.right.x",
+                    absolute_y_source="hands.right.y",
+                ),
+            ),
+            MappingRule(
+                id="3dviewer_pointer_follow",
+                name="3dviewer point/select: index finger moves cursor",
+                source="hands.right.gesture",
+                comparator="eq",
+                threshold="index_finger_up",
+                action=MappingAction(
+                    type="mouse_absolute",
+                    continuous=True,
+                    absolute_x_source="hands.right.x",
+                    absolute_y_source="hands.right.y",
+                ),
+            ),
+            MappingRule(
+                id="3dviewer_pointer_click",
+                name="3dviewer point/select: index finger clicks",
+                source="hands.right.gesture",
+                comparator="eq",
+                threshold="index_finger_up",
+                debounce_ms=350,
+                recognition_label="3dviewer select",
+                action=MappingAction(type="mouse_click", button="left"),
+            ),
+            MappingRule(
+                id="3dviewer_zoom_in_depth",
+                name="3dviewer zoom in: pointing hand moves closer",
+                source="hands.right.z_mm",
+                comparator="delta_decrease",
+                threshold=80,
+                gate_source="hands.right.gesture",
+                gate_comparator="eq",
+                gate_threshold="index_finger_up",
+                recognition_label="3dviewer zoom in",
+                action=MappingAction(type="mouse_scroll", scroll_y=1, interval_ms=120),
+            ),
+            MappingRule(
+                id="3dviewer_zoom_out_depth",
+                name="3dviewer zoom out: pointing hand moves away",
+                source="hands.right.z_mm",
+                comparator="delta_increase",
+                threshold=80,
+                gate_source="hands.right.gesture",
+                gate_comparator="eq",
+                gate_threshold="index_finger_up",
+                recognition_label="3dviewer zoom out",
+                action=MappingAction(type="mouse_scroll", scroll_y=-1, interval_ms=120),
+            ),
+            MappingRule(
+                id="3dviewer_zoom_in_wrist",
+                name="3dviewer zoom in: wrist pitch up",
+                source="fused.wrist_pitch_up_detected",
+                comparator="truthy",
+                recognition_label="3dviewer zoom in",
+                action=MappingAction(type="mouse_scroll", scroll_y=1),
+            ),
+            MappingRule(
+                id="3dviewer_zoom_out_wrist",
+                name="3dviewer zoom out: wrist pitch down",
+                source="fused.wrist_pitch_down_detected",
+                comparator="truthy",
+                recognition_label="3dviewer zoom out",
+                action=MappingAction(type="mouse_scroll", scroll_y=-1),
+            ),
+        ],
+    )
+
+
+def _ensure_builtin_profiles(profiles: list[MappingProfile]) -> None:
+    names = {profile.name for profile in profiles}
+    if THREEDVIEWER_PROFILE_NAME not in names:
+        profiles.append(create_3dviewer_net_profile())
 
 
 def _upgrade_wrist_pitch_rules(profiles: list[MappingProfile]) -> None:

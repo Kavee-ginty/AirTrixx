@@ -17,7 +17,9 @@ from input_mapper import (
     MappingCondition,
     MappingConfig,
     MappingRule,
+    THREEDVIEWER_PROFILE_NAME,
     SignalCatalog,
+    default_mapping_config,
     evaluate_condition,
     load_mapping_config,
     save_mapping_config,
@@ -405,6 +407,31 @@ class InputMapperRuntimeTests(unittest.TestCase):
 
 
 class MappingConfigTests(unittest.TestCase):
+    def test_default_config_includes_3dviewer_profile(self) -> None:
+        config = default_mapping_config()
+        self.assertIn(THREEDVIEWER_PROFILE_NAME, config.profile_names())
+        profile = next(profile for profile in config.profiles if profile.name == THREEDVIEWER_PROFILE_NAME)
+        self.assertGreaterEqual(len(profile.mappings), 8)
+
+    def test_loaded_legacy_config_gets_3dviewer_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "input_mappings.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "enabled_on_start": False,
+                        "active_profile": "Default",
+                        "profiles": [{"name": "Default", "mappings": []}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded, error = load_mapping_config(path)
+            self.assertIsNone(error)
+            self.assertIn(THREEDVIEWER_PROFILE_NAME, loaded.profile_names())
+            self.assertEqual(loaded.active_profile, "Default")
+
     def test_save_and_load_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "input_mappings.json"
@@ -422,6 +449,101 @@ class MappingConfigTests(unittest.TestCase):
             self.assertEqual(loaded.active().mappings[0].source, "fused.a")
             self.assertEqual(loaded.active().mappings[0].conditions[0].source, "fused.b")
             self.assertEqual(loaded.active().mappings[0].conditions[0].output_keys, ["alt"])
+
+    def test_3dviewer_profile_orbits_with_right_open_palm(self) -> None:
+        backend = FakeInputBackend()
+        config = default_mapping_config()
+        config.active_profile = THREEDVIEWER_PROFILE_NAME
+        mapper = InputMapper(backend, config)
+        mapper.set_enabled(True)
+        mapper.process(hand_snapshot({}, right_visible=True), 0.0)
+        self.assertEqual(
+            backend.events,
+            [
+                ("mouse_down", "left"),
+                ("move_absolute", 959, 539),
+            ],
+        )
+
+    def test_3dviewer_profile_pans_with_right_fist(self) -> None:
+        backend = FakeInputBackend()
+        config = default_mapping_config()
+        config.active_profile = THREEDVIEWER_PROFILE_NAME
+        mapper = InputMapper(backend, config)
+        mapper.set_enabled(True)
+        mapper.process(
+            {
+                "input_dict": {},
+                "hand_state": {
+                    "right": {
+                        "visible": True,
+                        "x": 0.25,
+                        "y": 0.75,
+                        "score": 1.0,
+                        "gesture": "closed_fist",
+                    }
+                },
+            },
+            0.0,
+        )
+        self.assertEqual(
+            backend.events,
+            [
+                ("mouse_down", "right"),
+                ("move_absolute", 479, 809),
+            ],
+        )
+
+    def test_3dviewer_profile_zooms_with_pointing_depth_change(self) -> None:
+        backend = FakeInputBackend()
+        config = default_mapping_config()
+        config.active_profile = THREEDVIEWER_PROFILE_NAME
+        mapper = InputMapper(backend, config)
+        mapper.set_enabled(True)
+        mapper.process(hand_snapshot({"right_hand_z_mm": 700}, right_visible=True), 0.0)
+        mapper.process(hand_snapshot({"right_hand_z_mm": 600}, right_visible=True), 0.1)
+        self.assertNotIn(("scroll", 0, 1), backend.events)
+
+        pointing_snapshot = {
+            "input_dict": {"right_hand_z_mm": 600},
+            "hand_state": {
+                "right": {
+                    "visible": True,
+                    "x": 0.5,
+                    "y": 0.5,
+                    "score": 1.0,
+                    "gesture": "index_finger_up",
+                }
+            },
+        }
+        mapper.process(pointing_snapshot, 0.2)
+        pointing_snapshot["input_dict"] = {"right_hand_z_mm": 500}
+        mapper.process(pointing_snapshot, 0.3)
+        self.assertIn(("scroll", 0, 1), backend.events)
+
+    def test_3dviewer_profile_delays_pointer_click(self) -> None:
+        backend = FakeInputBackend()
+        config = default_mapping_config()
+        config.active_profile = THREEDVIEWER_PROFILE_NAME
+        mapper = InputMapper(backend, config)
+        mapper.set_enabled(True)
+        pointing_snapshot = {
+            "input_dict": {},
+            "hand_state": {
+                "right": {
+                    "visible": True,
+                    "x": 0.5,
+                    "y": 0.5,
+                    "score": 1.0,
+                    "gesture": "index_finger_up",
+                }
+            },
+        }
+        mapper.process(pointing_snapshot, 0.0)
+        mapper.process(pointing_snapshot, 0.1)
+        self.assertNotIn(("mouse_click", "left", 1), backend.events)
+        mapper.process(pointing_snapshot, 0.4)
+        self.assertIn(("mouse_click", "left", 1), backend.events)
 
     def test_invalid_config_falls_back_to_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -127,6 +127,7 @@ The GUI provides:
 - live Antenna JSON/device state display
 - live fused input array display
 - per-signal keyboard and mouse mappings with tap, hold, repeat, scroll, and movement actions
+- a built-in `3dviewer.net` mapping profile for Online 3D Viewer: right open palm orbits, right fist pans, right index finger points/selects, and pointing-depth or wrist pitch zooms (see [docs/3d_viewer.md](docs/3d_viewer.md))
 - fan on/off control, live temperature readings, and wireless fan firmware flash
 - keyboard ToF live data and a 0-300 mm distance grid
 - camera center command

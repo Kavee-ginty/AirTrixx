@@ -13,6 +13,7 @@ import socket
 import subprocess
 import threading
 import time
+import webbrowser
 import tkinter as tk
 from tkinter import filedialog, ttk
 from pathlib import Path
@@ -34,6 +35,7 @@ from input_mapper import (
     MappingProfile,
     MappingRule,
     SignalCatalog,
+    THREEDVIEWER_PROFILE_NAME,
     load_mapping_config,
     save_mapping_config,
 )
@@ -338,6 +340,7 @@ class AirTrixxGUI:
         self.mapping_start_enabled_var = tk.BooleanVar(value=mapping_config.enabled_on_start)
         self.mapping_profile_var = tk.StringVar(value=mapping_config.active_profile)
         self.mapping_status_var = tk.StringVar(value="Mapper: ready.")
+        self._3d_viewer_mode_hint_until_s = 0.0
         self.testing_mode_var = tk.StringVar(value="selected")
         self.testing_output_suppressed_var = tk.BooleanVar(value=True)
         self.testing_status_var = tk.StringVar(value="Select a gesture to arm an individual test.")
@@ -977,6 +980,11 @@ class AirTrixxGUI:
         ttk.Button(profile_box, text="Load", command=self.load_input_mappings).grid(row=0, column=4, sticky="ew", padx=(0, 6))
         ttk.Button(profile_box, text="Import", command=self.import_input_mappings).grid(row=0, column=5, sticky="ew", padx=(0, 6))
         ttk.Button(profile_box, text="Export", command=self.export_input_mappings).grid(row=0, column=6, sticky="ew")
+        ttk.Button(
+            profile_box,
+            text="3D Viewer Mode",
+            command=self.activate_3d_viewer_mode,
+        ).grid(row=1, column=0, columnspan=7, sticky="ew", pady=(8, 0))
 
         split = ttk.Frame(body)
         split.grid(row=2, column=0, sticky="nsew")
@@ -1771,6 +1779,26 @@ class AirTrixxGUI:
             self._schedule_mapping_views_refresh()
             self._update_mapping_status()
             self.log(f"Input mapping profile switched to {self.input_mapper.config.active_profile}.")
+
+    def activate_3d_viewer_mode(self) -> None:
+        if THREEDVIEWER_PROFILE_NAME not in self.input_mapper.config.profile_names():
+            self.log(f"3D Viewer profile missing; reload mappings to restore {THREEDVIEWER_PROFILE_NAME}.")
+            return
+        self.input_mapper.set_active_profile(THREEDVIEWER_PROFILE_NAME)
+        self.mapping_profile_var.set(THREEDVIEWER_PROFILE_NAME)
+        self._refresh_mapping_profile_combo()
+        self._schedule_mapping_views_refresh()
+        if not self.mapping_enabled_var.get():
+            self.mapping_enabled_var.set(True)
+            self.input_mapper.set_enabled(True)
+        self._update_mapping_status()
+        self._3d_viewer_mode_hint_until_s = time.monotonic() + 60.0
+        webbrowser.open("https://3dviewer.net")
+        self.log(
+            "3D Viewer Mode: profile armed, browser opened. "
+            "Open palm orbits, fist pans, index finger points/selects, wrist pitch or hand depth zooms. "
+            "Click the browser canvas once so it has focus."
+        )
 
     def _schedule_mapping_views_refresh(self) -> None:
         if self._mapping_refresh_after_id is not None:
@@ -4411,6 +4439,8 @@ class AirTrixxGUI:
         recognition_status = self.input_mapper.last_recognition()
         if recognition_status:
             add(recognition_status)
+        if time.monotonic() < self._3d_viewer_mode_hint_until_s:
+            add("3D Viewer: open palm orbit, fist pan, point zoom/select")
         if self.camera_centering_active:
             add(camera_status)
         if self.hand_calibration_active or self.startup_hand_calibration_pending:
