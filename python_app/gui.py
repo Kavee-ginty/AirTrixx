@@ -1796,8 +1796,8 @@ class AirTrixxGUI:
         webbrowser.open("https://3dviewer.net")
         self.log(
             "3D Viewer Mode: profile armed, browser opened. "
-            "Open palm orbits, fist pans, index finger points/selects, wrist pitch or hand depth zooms. "
-            "Click the browser canvas once so it has focus."
+            "Left fist + right hand movement orbits, right fist pans, index finger points/selects, "
+            "wrist pitch or hand depth zooms. Click the browser canvas once so it has focus."
         )
 
     def _schedule_mapping_views_refresh(self) -> None:
@@ -4440,7 +4440,7 @@ class AirTrixxGUI:
         if recognition_status:
             add(recognition_status)
         if time.monotonic() < self._3d_viewer_mode_hint_until_s:
-            add("3D Viewer: open palm orbit, fist pan, point zoom/select")
+            add("3D Viewer: left fist + right hand orbit, right fist pan, point zoom/select")
         if self.camera_centering_active:
             add(camera_status)
         if self.hand_calibration_active or self.startup_hand_calibration_pending:

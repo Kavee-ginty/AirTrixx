@@ -450,13 +450,13 @@ class MappingConfigTests(unittest.TestCase):
             self.assertEqual(loaded.active().mappings[0].conditions[0].source, "fused.b")
             self.assertEqual(loaded.active().mappings[0].conditions[0].output_keys, ["alt"])
 
-    def test_3dviewer_profile_orbits_with_right_open_palm(self) -> None:
+    def test_3dviewer_profile_orbits_with_left_fist_and_right_hand(self) -> None:
         backend = FakeInputBackend()
         config = default_mapping_config()
         config.active_profile = THREEDVIEWER_PROFILE_NAME
         mapper = InputMapper(backend, config)
         mapper.set_enabled(True)
-        mapper.process(hand_snapshot({}, right_visible=True), 0.0)
+        mapper.process(hand_snapshot({}, left_gesture="closed_fist", right_visible=True), 0.0)
         self.assertEqual(
             backend.events,
             [
@@ -464,6 +464,15 @@ class MappingConfigTests(unittest.TestCase):
                 ("move_absolute", 959, 539),
             ],
         )
+
+    def test_3dviewer_profile_does_not_orbit_without_left_fist(self) -> None:
+        backend = FakeInputBackend()
+        config = default_mapping_config()
+        config.active_profile = THREEDVIEWER_PROFILE_NAME
+        mapper = InputMapper(backend, config)
+        mapper.set_enabled(True)
+        mapper.process(hand_snapshot({}, right_visible=True), 0.0)
+        self.assertEqual(backend.events, [])
 
     def test_3dviewer_profile_pans_with_right_fist(self) -> None:
         backend = FakeInputBackend()
@@ -517,7 +526,7 @@ class MappingConfigTests(unittest.TestCase):
             },
         }
         mapper.process(pointing_snapshot, 0.2)
-        pointing_snapshot["input_dict"] = {"right_hand_z_mm": 500}
+        pointing_snapshot["input_dict"] = {"right_hand_z_mm": 570}
         mapper.process(pointing_snapshot, 0.3)
         self.assertIn(("scroll", 0, 1), backend.events)
 

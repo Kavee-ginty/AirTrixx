@@ -37,12 +37,12 @@ https://3dviewer.net/#model=https://raw.githubusercontent.com/kovacsv/Online3DVi
 
 | Action | Gesture / signal | Viewer behavior |
 |--------|------------------|-----------------|
-| Orbit | Right hand open palm | Left-drag orbit |
+| Orbit | Left hand closed fist + move right hand | Left-drag orbit |
 | Pan | Right hand closed fist | Right-drag pan |
 | Point / move cursor | Right hand index finger up | Move cursor over canvas |
 | Select | Hold index finger up ~350 ms | Left click |
-| Zoom in | Index finger up + hand moves closer (Cam Dock depth), or wrist pitch up | Scroll up |
-| Zoom out | Index finger up + hand moves away, or wrist pitch down | Scroll down |
+| Zoom in | Index finger up + hand ~25 mm closer (Cam Dock depth), or wrist pitch up | Scroll up |
+| Zoom out | Index finger up + hand ~25 mm farther, or wrist pitch down | Scroll down |
 
 Recognition labels (`3dviewer zoom in`, `3dviewer select`, etc.) appear briefly on the camera preview overlay when those actions fire.
 
@@ -64,7 +64,7 @@ Use this checklist after enabling **3D Viewer Mode**:
 - [ ] Browser opens to 3dviewer.net and a model loads
 - [ ] Browser canvas has focus (click it once)
 - [ ] Mappings status shows **armed**
-- [ ] Right open palm: model orbits while hand moves
+- [ ] Left closed fist + right hand moving: model orbits
 - [ ] Right closed fist: model pans while hand moves
 - [ ] Right index finger: cursor follows hand; click selects after brief hold
 - [ ] Wrist pitch up/down: zoom in/out

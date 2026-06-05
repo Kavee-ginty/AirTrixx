@@ -14,6 +14,7 @@ from input_backend import InputBackend, normalize_mouse_button, parse_key_combo
 MAPPING_SCHEMA_VERSION = 1
 DEFAULT_PROFILE_NAME = "Default"
 THREEDVIEWER_PROFILE_NAME = "3dviewer.net"
+THREEDVIEWER_ZOOM_DEPTH_DELTA_MM = 25
 DEFAULT_MAPPING_PATH = MAPPING_PATH
 
 ACTION_TYPES = {
@@ -483,6 +484,7 @@ class MappingConfig:
             profiles = [MappingProfile()]
         _upgrade_wrist_pitch_rules(profiles)
         _ensure_builtin_profiles(profiles)
+        _sync_builtin_3dviewer_profile(profiles)
         active_profile = str(data.get("active_profile") or profiles[0].name)
         if active_profile not in {profile.name for profile in profiles}:
             active_profile = profiles[0].name
@@ -528,18 +530,36 @@ def create_3dviewer_net_profile() -> MappingProfile:
         mappings=[
             MappingRule(
                 id="3dviewer_orbit_hold",
-                name="3dviewer orbit: right open palm holds left drag",
-                source="hands.right.gesture",
-                comparator="eq",
-                threshold="open_palm",
+                name="3dviewer orbit: left fist closed holds left drag while right hand moves",
+                source="hands.right.visible",
+                comparator="truthy",
+                gate_source="hands.left.gesture",
+                gate_comparator="eq",
+                gate_threshold="closed_fist",
+                conditions=[
+                    MappingCondition(
+                        source="hands.right.gesture",
+                        comparator="neq",
+                        threshold="closed_fist",
+                    )
+                ],
                 action=MappingAction(type="mouse_hold", button="left"),
             ),
             MappingRule(
                 id="3dviewer_orbit_follow",
-                name="3dviewer orbit: right open palm moves cursor",
-                source="hands.right.gesture",
-                comparator="eq",
-                threshold="open_palm",
+                name="3dviewer orbit: left fist closed follows right hand movement",
+                source="hands.right.visible",
+                comparator="truthy",
+                gate_source="hands.left.gesture",
+                gate_comparator="eq",
+                gate_threshold="closed_fist",
+                conditions=[
+                    MappingCondition(
+                        source="hands.right.gesture",
+                        comparator="neq",
+                        threshold="closed_fist",
+                    )
+                ],
                 action=MappingAction(
                     type="mouse_absolute",
                     continuous=True,
@@ -596,7 +616,7 @@ def create_3dviewer_net_profile() -> MappingProfile:
                 name="3dviewer zoom in: pointing hand moves closer",
                 source="hands.right.z_mm",
                 comparator="delta_decrease",
-                threshold=80,
+                threshold=THREEDVIEWER_ZOOM_DEPTH_DELTA_MM,
                 gate_source="hands.right.gesture",
                 gate_comparator="eq",
                 gate_threshold="index_finger_up",
@@ -608,7 +628,7 @@ def create_3dviewer_net_profile() -> MappingProfile:
                 name="3dviewer zoom out: pointing hand moves away",
                 source="hands.right.z_mm",
                 comparator="delta_increase",
-                threshold=80,
+                threshold=THREEDVIEWER_ZOOM_DEPTH_DELTA_MM,
                 gate_source="hands.right.gesture",
                 gate_comparator="eq",
                 gate_threshold="index_finger_up",
@@ -639,6 +659,14 @@ def _ensure_builtin_profiles(profiles: list[MappingProfile]) -> None:
     names = {profile.name for profile in profiles}
     if THREEDVIEWER_PROFILE_NAME not in names:
         profiles.append(create_3dviewer_net_profile())
+
+
+def _sync_builtin_3dviewer_profile(profiles: list[MappingProfile]) -> None:
+    latest = create_3dviewer_net_profile()
+    for profile in profiles:
+        if profile.name == THREEDVIEWER_PROFILE_NAME:
+            profile.mappings = latest.mappings
+            return
 
 
 def _upgrade_wrist_pitch_rules(profiles: list[MappingProfile]) -> None:
