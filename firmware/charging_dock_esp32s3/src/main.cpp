@@ -323,7 +323,7 @@ static void drawOverview() {
     } else {
       display.print(" ");
     }
-    display.print("CH-");
+    display.print("");
     display.print(CHANNEL_NAMES[i]);
     display.print(": ");
     printChannelStatus(i);
