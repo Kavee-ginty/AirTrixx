@@ -27,6 +27,36 @@ def serial_with_wrist(*, pitch: float, roll: float) -> dict[str, object]:
 
 
 class FusionStateTests(unittest.TestCase):
+    def test_both_hand_distance_uses_visible_normalized_hand_positions(self) -> None:
+        fusion = FusionState()
+        values = fusion.build_input_dict(
+            serial_with_wrist(pitch=0, roll=0),
+            {
+                "right": {"visible": True, "x": 0.2, "y": 0.4},
+                "left": {"visible": True, "x": 0.7, "y": 0.4},
+            },
+            now_s=0.0,
+        )
+
+        self.assertAlmostEqual(values["both_hands_x_distance"], 0.5)
+        self.assertAlmostEqual(values["both_hands_y_distance"], 0.0)
+        self.assertAlmostEqual(values["both_hands_distance"], 0.5)
+
+    def test_both_hand_distance_is_missing_when_one_hand_is_hidden(self) -> None:
+        fusion = FusionState()
+        values = fusion.build_input_dict(
+            serial_with_wrist(pitch=0, roll=0),
+            {
+                "right": {"visible": True, "x": 0.2, "y": 0.4},
+                "left": {"visible": False, "x": 0.7, "y": 0.4},
+            },
+            now_s=0.0,
+        )
+
+        self.assertIsNone(values["both_hands_distance"])
+        self.assertIsNone(values["both_hands_x_distance"])
+        self.assertIsNone(values["both_hands_y_distance"])
+
     def test_wrist_roll_dominates_pitch_when_roll_delta_is_larger(self) -> None:
         fusion = FusionState()
         fusion.build_input_dict(serial_with_wrist(pitch=0, roll=0), {}, now_s=0.0)

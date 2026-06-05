@@ -36,6 +36,8 @@ from input_mapper import (
     MappingRule,
     SignalCatalog,
     THREEDVIEWER_PROFILE_NAME,
+    THREEDVIEWER_ZOOM_HAND_DISTANCE_DELTA,
+    WINDOWS_3D_VIEWER_PROFILE_NAME,
     load_mapping_config,
     save_mapping_config,
 )
@@ -982,9 +984,14 @@ class AirTrixxGUI:
         ttk.Button(profile_box, text="Export", command=self.export_input_mappings).grid(row=0, column=6, sticky="ew")
         ttk.Button(
             profile_box,
-            text="3D Viewer Mode",
+            text="3dviewer.net Mode",
             command=self.activate_3d_viewer_mode,
-        ).grid(row=1, column=0, columnspan=7, sticky="ew", pady=(8, 0))
+        ).grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0), padx=(0, 6))
+        ttk.Button(
+            profile_box,
+            text="Windows 3D Viewer Mode",
+            command=self.activate_windows_3d_viewer_mode,
+        ).grid(row=1, column=4, columnspan=3, sticky="ew", pady=(8, 0))
 
         split = ttk.Frame(body)
         split.grid(row=2, column=0, sticky="nsew")
@@ -1334,6 +1341,32 @@ class AirTrixxGUI:
                 conditions=[MappingCondition(source="hands.right.gesture", comparator="eq", threshold="closed_fist")],
             ),
             self._testing_raw_rule(
+                "raw:zoom_in",
+                "zoom_in",
+                "Two-hand zoom",
+                "fused.both_hands_distance",
+                "delta_increase",
+                THREEDVIEWER_ZOOM_HAND_DISTANCE_DELTA,
+                debounce_ms=0,
+                conditions=[
+                    MappingCondition(source="hands.left.gesture", comparator="eq", threshold="open_palm"),
+                    MappingCondition(source="hands.right.gesture", comparator="eq", threshold="open_palm"),
+                ],
+            ),
+            self._testing_raw_rule(
+                "raw:zoom_out",
+                "zoom_out",
+                "Two-hand zoom",
+                "fused.both_hands_distance",
+                "delta_decrease",
+                THREEDVIEWER_ZOOM_HAND_DISTANCE_DELTA,
+                debounce_ms=0,
+                conditions=[
+                    MappingCondition(source="hands.left.gesture", comparator="eq", threshold="open_palm"),
+                    MappingCondition(source="hands.right.gesture", comparator="eq", threshold="open_palm"),
+                ],
+            ),
+            self._testing_raw_rule(
                 "raw:wrist_roll_right",
                 "Wrist roll right",
                 "Wristband",
@@ -1592,6 +1625,7 @@ class AirTrixxGUI:
         parts = [
             f"L gesture {value('hands.left.gesture')}",
             f"R gesture {value('hands.right.gesture')}",
+            f"two-hand distance {value('fused.both_hands_distance')}",
             f"L z {value('hands.left.z_mm')} mm",
             f"R z {value('hands.right.z_mm')} mm",
             f"pitch {value('fused.wrist_pitch')}",
@@ -1781,11 +1815,34 @@ class AirTrixxGUI:
             self.log(f"Input mapping profile switched to {self.input_mapper.config.active_profile}.")
 
     def activate_3d_viewer_mode(self) -> None:
-        if THREEDVIEWER_PROFILE_NAME not in self.input_mapper.config.profile_names():
-            self.log(f"3D Viewer profile missing; reload mappings to restore {THREEDVIEWER_PROFILE_NAME}.")
+        self._activate_viewer_mode(
+            THREEDVIEWER_PROFILE_NAME,
+            label="3dviewer.net",
+            open_target="https://3dviewer.net",
+            focus_hint="Click the browser canvas once so it has focus.",
+        )
+
+    def activate_windows_3d_viewer_mode(self) -> None:
+        self._activate_viewer_mode(
+            WINDOWS_3D_VIEWER_PROFILE_NAME,
+            label="Windows 3D Viewer",
+            open_target="com.microsoft.3dviewer:",
+            focus_hint="Open a model in Windows 3D Viewer, then click the viewer canvas once so it has focus.",
+        )
+
+    def _activate_viewer_mode(
+        self,
+        profile_name: str,
+        *,
+        label: str,
+        open_target: str | None,
+        focus_hint: str,
+    ) -> None:
+        if profile_name not in self.input_mapper.config.profile_names():
+            self.log(f"{label} profile missing; reload mappings to restore {profile_name}.")
             return
-        self.input_mapper.set_active_profile(THREEDVIEWER_PROFILE_NAME)
-        self.mapping_profile_var.set(THREEDVIEWER_PROFILE_NAME)
+        self.input_mapper.set_active_profile(profile_name)
+        self.mapping_profile_var.set(profile_name)
         self._refresh_mapping_profile_combo()
         self._schedule_mapping_views_refresh()
         if not self.mapping_enabled_var.get():
@@ -1793,11 +1850,17 @@ class AirTrixxGUI:
             self.input_mapper.set_enabled(True)
         self._update_mapping_status()
         self._3d_viewer_mode_hint_until_s = time.monotonic() + 60.0
-        webbrowser.open("https://3dviewer.net")
+        opened_target = False
+        if open_target:
+            try:
+                opened_target = bool(webbrowser.open(open_target))
+            except Exception as exc:
+                self.log(f"Could not open {label}: {exc}")
+        status = ", viewer opened. " if opened_target else ". "
         self.log(
-            "3D Viewer Mode: profile armed, browser opened. "
-            "Left fist + right hand movement orbits, right fist pans, index finger points/selects, "
-            "wrist pitch or hand depth zooms. Click the browser canvas once so it has focus."
+            f"{label} Mode: profile armed{status}"
+            f"Left fist + right hand movement orbits, wrist roll rotates, right fist pans, index finger points, "
+            f"and open hands apart/together zooms. {focus_hint}"
         )
 
     def _schedule_mapping_views_refresh(self) -> None:
@@ -1971,6 +2034,10 @@ class AirTrixxGUI:
             sources.add(rule.action.absolute_x_source)
         if rule.action.absolute_y_source:
             sources.add(rule.action.absolute_y_source)
+        if rule.action.delta_x_source:
+            sources.add(rule.action.delta_x_source)
+        if rule.action.delta_y_source:
+            sources.add(rule.action.delta_y_source)
         return sorted(sources)
 
     def _open_mapping_dialog(self, rule: MappingRule, *, is_new: bool) -> None:
@@ -2010,6 +2077,7 @@ class AirTrixxGUI:
         absolute_y_var = tk.StringVar(value=str(working.action.absolute_y))
         absolute_x_source_var = tk.StringVar(value=working.action.absolute_x_source)
         absolute_y_source_var = tk.StringVar(value=working.action.absolute_y_source)
+        center_before_var = tk.BooleanVar(value=working.action.center_before)
         continuous_var = tk.BooleanVar(value=working.action.continuous)
         status_var = tk.StringVar(value="")
         source_options = self._rule_dialog_sources(working)
@@ -2188,6 +2256,10 @@ class AirTrixxGUI:
             row=row, column=1, columnspan=3, sticky="w", pady=4
         )
         row += 1
+        ttk.Checkbutton(frame, text="Move cursor to screen center before action", variable=center_before_var).grid(
+            row=row, column=1, columnspan=3, sticky="w", pady=4
+        )
+        row += 1
         ttk.Label(frame, textvariable=status_var, foreground="#b45309").grid(
             row=row, column=0, columnspan=4, sticky="ew", pady=(8, 4)
         )
@@ -2296,6 +2368,14 @@ class AirTrixxGUI:
                     "absolute_y": absolute_y_var.get(),
                     "absolute_x_source": absolute_x_source_var.get().strip(),
                     "absolute_y_source": absolute_y_source_var.get().strip(),
+                    "delta_x_source": working.action.delta_x_source,
+                    "delta_y_source": working.action.delta_y_source,
+                    "delta_x_scale": working.action.delta_x_scale,
+                    "delta_y_scale": working.action.delta_y_scale,
+                    "delta_x_angle": working.action.delta_x_angle,
+                    "delta_y_angle": working.action.delta_y_angle,
+                    "delta_max_step": working.action.delta_max_step,
+                    "center_before": center_before_var.get(),
                     "continuous": continuous_var.get(),
                 }
             )
@@ -4440,7 +4520,7 @@ class AirTrixxGUI:
         if recognition_status:
             add(recognition_status)
         if time.monotonic() < self._3d_viewer_mode_hint_until_s:
-            add("3D Viewer: left fist + right hand orbit, right fist pan, point zoom/select")
+            add("3D Viewer: left fist orbit, wrist roll rotate, right fist pan, open hands zoom")
         if self.camera_centering_active:
             add(camera_status)
         if self.hand_calibration_active or self.startup_hand_calibration_pending:

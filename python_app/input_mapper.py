@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import time
 import uuid
@@ -14,7 +15,13 @@ from input_backend import InputBackend, normalize_mouse_button, parse_key_combo
 MAPPING_SCHEMA_VERSION = 1
 DEFAULT_PROFILE_NAME = "Default"
 THREEDVIEWER_PROFILE_NAME = "3dviewer.net"
+WINDOWS_3D_VIEWER_PROFILE_NAME = "Windows 3D Viewer"
 THREEDVIEWER_ZOOM_DEPTH_DELTA_MM = 25
+THREEDVIEWER_ZOOM_HAND_DISTANCE_DELTA = 0.06
+THREEDVIEWER_ZOOM_SCROLL_STEPS = 8
+THREEDVIEWER_WRIST_ROLL_DELTA_DEG = 10
+THREEDVIEWER_WRIST_ORBIT_PX_PER_DEG = 4.0
+THREEDVIEWER_WRIST_ORBIT_MAX_STEP_PX = 160.0
 DEFAULT_MAPPING_PATH = MAPPING_PATH
 
 ACTION_TYPES = {
@@ -211,6 +218,14 @@ class MappingAction:
     absolute_y: float = 0.5
     absolute_x_source: str = ""
     absolute_y_source: str = ""
+    delta_x_source: str = ""
+    delta_y_source: str = ""
+    delta_x_scale: float = 1.0
+    delta_y_scale: float = 1.0
+    delta_x_angle: bool = False
+    delta_y_angle: bool = False
+    delta_max_step: float = 160.0
+    center_before: bool = False
     continuous: bool = False
 
     @classmethod
@@ -234,6 +249,14 @@ class MappingAction:
             absolute_y=max(0.0, min(1.0, float(data.get("absolute_y", 0.5) or 0.0))),
             absolute_x_source=str(data.get("absolute_x_source") or ""),
             absolute_y_source=str(data.get("absolute_y_source") or ""),
+            delta_x_source=str(data.get("delta_x_source") or ""),
+            delta_y_source=str(data.get("delta_y_source") or ""),
+            delta_x_scale=float(data.get("delta_x_scale", 1.0) or 0.0),
+            delta_y_scale=float(data.get("delta_y_scale", 1.0) or 0.0),
+            delta_x_angle=bool(data.get("delta_x_angle", False)),
+            delta_y_angle=bool(data.get("delta_y_angle", False)),
+            delta_max_step=max(1.0, float(data.get("delta_max_step", 160.0) or 160.0)),
+            center_before=bool(data.get("center_before", False)),
             continuous=bool(data.get("continuous", False)),
         )
 
@@ -252,6 +275,14 @@ class MappingAction:
             "absolute_y": self.absolute_y,
             "absolute_x_source": self.absolute_x_source,
             "absolute_y_source": self.absolute_y_source,
+            "delta_x_source": self.delta_x_source,
+            "delta_y_source": self.delta_y_source,
+            "delta_x_scale": self.delta_x_scale,
+            "delta_y_scale": self.delta_y_scale,
+            "delta_x_angle": self.delta_x_angle,
+            "delta_y_angle": self.delta_y_angle,
+            "delta_max_step": self.delta_max_step,
+            "center_before": self.center_before,
             "continuous": self.continuous,
         }
 
@@ -266,28 +297,36 @@ class MappingAction:
         return "tap"
 
     def summary(self) -> str:
+        prefix = "center + " if self.center_before else ""
         if self.type.startswith("keyboard"):
             combo = "+".join(self.keys) if self.keys else "(no keys)"
             if self.type == "keyboard_repeat":
-                return f"repeat {combo}"
+                return f"{prefix}repeat {combo}"
             if self.type == "keyboard_hold":
-                return f"hold {combo}"
-            return f"tap {combo}"
+                return f"{prefix}hold {combo}"
+            return f"{prefix}tap {combo}"
         if self.type == "mouse_click":
-            return f"click {self.button}"
+            return f"{prefix}click {self.button}"
         if self.type == "mouse_hold":
-            return f"hold mouse {self.button}"
+            return f"{prefix}hold mouse {self.button}"
         if self.type == "mouse_scroll":
-            return f"scroll x={self.scroll_x} y={self.scroll_y}"
+            return f"{prefix}scroll x={self.scroll_x} y={self.scroll_y}"
         if self.type == "mouse_move":
-            return f"move x={self.speed_x:g}/s y={self.speed_y:g}/s"
+            if self.delta_x_source or self.delta_y_source:
+                parts = []
+                if self.delta_x_source:
+                    parts.append(f"x=d({self.delta_x_source})*{self.delta_x_scale:g}")
+                if self.delta_y_source:
+                    parts.append(f"y=d({self.delta_y_source})*{self.delta_y_scale:g}")
+                return prefix + "move " + " ".join(parts)
+            return f"{prefix}move x={self.speed_x:g}/s y={self.speed_y:g}/s"
         if self.type == "mouse_absolute":
             if self.absolute_x_source or self.absolute_y_source:
                 x_source = self.absolute_x_source or f"{self.absolute_x:.2f}"
                 y_source = self.absolute_y_source or f"{self.absolute_y:.2f}"
-                return f"follow {x_source},{y_source}"
-            return f"move absolute {self.absolute_x:.2f},{self.absolute_y:.2f}"
-        return self.type
+                return f"{prefix}follow {x_source},{y_source}"
+            return f"{prefix}move absolute {self.absolute_x:.2f},{self.absolute_y:.2f}"
+        return prefix + self.type
 
 
 @dataclass
@@ -515,7 +554,7 @@ class MappingConfig:
 
 
 def default_mapping_config() -> MappingConfig:
-    profiles = [MappingProfile(), create_3dviewer_net_profile()]
+    profiles = [MappingProfile(), create_3dviewer_net_profile(), create_windows_3d_viewer_profile()]
     return MappingConfig(profiles=profiles)
 
 
@@ -533,6 +572,7 @@ def create_3dviewer_net_profile() -> MappingProfile:
                 name="3dviewer orbit: left fist closed holds left drag while right hand moves",
                 source="hands.right.visible",
                 comparator="truthy",
+                debounce_ms=120,
                 gate_source="hands.left.gesture",
                 gate_comparator="eq",
                 gate_threshold="closed_fist",
@@ -543,13 +583,14 @@ def create_3dviewer_net_profile() -> MappingProfile:
                         threshold="closed_fist",
                     )
                 ],
-                action=MappingAction(type="mouse_hold", button="left"),
+                action=MappingAction(type="mouse_hold", button="left", center_before=True),
             ),
             MappingRule(
                 id="3dviewer_orbit_follow",
                 name="3dviewer orbit: left fist closed follows right hand movement",
                 source="hands.right.visible",
                 comparator="truthy",
+                debounce_ms=120,
                 gate_source="hands.left.gesture",
                 gate_comparator="eq",
                 gate_threshold="closed_fist",
@@ -569,11 +610,12 @@ def create_3dviewer_net_profile() -> MappingProfile:
             ),
             MappingRule(
                 id="3dviewer_pan_hold",
-                name="3dviewer pan: right fist holds right drag",
+                name="3dviewer pan: right fist holds middle drag",
                 source="hands.right.gesture",
                 comparator="eq",
                 threshold="closed_fist",
-                action=MappingAction(type="mouse_hold", button="right"),
+                debounce_ms=120,
+                action=MappingAction(type="mouse_hold", button="middle", center_before=True),
             ),
             MappingRule(
                 id="3dviewer_pan_follow",
@@ -581,6 +623,7 @@ def create_3dviewer_net_profile() -> MappingProfile:
                 source="hands.right.gesture",
                 comparator="eq",
                 threshold="closed_fist",
+                debounce_ms=120,
                 action=MappingAction(
                     type="mouse_absolute",
                     continuous=True,
@@ -590,7 +633,7 @@ def create_3dviewer_net_profile() -> MappingProfile:
             ),
             MappingRule(
                 id="3dviewer_pointer_follow",
-                name="3dviewer point/select: index finger moves cursor",
+                name="3dviewer pointer: index finger moves cursor",
                 source="hands.right.gesture",
                 comparator="eq",
                 threshold="index_finger_up",
@@ -602,14 +645,72 @@ def create_3dviewer_net_profile() -> MappingProfile:
                 ),
             ),
             MappingRule(
-                id="3dviewer_pointer_click",
-                name="3dviewer point/select: index finger clicks",
-                source="hands.right.gesture",
-                comparator="eq",
-                threshold="index_finger_up",
-                debounce_ms=350,
-                recognition_label="3dviewer select",
-                action=MappingAction(type="mouse_click", button="left"),
+                id="3dviewer_wrist_roll_orbit_hold",
+                name="3dviewer orbit: wrist roll holds left drag",
+                source="fused.wrist_roll_abs_delta",
+                comparator="gt",
+                threshold=THREEDVIEWER_WRIST_ROLL_DELTA_DEG,
+                debounce_ms=60,
+                conditions=[
+                    MappingCondition(source="fused.wrist_roll_dominant", comparator="truthy"),
+                ],
+                action=MappingAction(type="mouse_hold", button="left", center_before=True),
+            ),
+            MappingRule(
+                id="3dviewer_wrist_roll_orbit_follow",
+                name="3dviewer orbit: wrist roll amount rotates model",
+                source="fused.wrist_roll_abs_delta",
+                comparator="gt",
+                threshold=THREEDVIEWER_WRIST_ROLL_DELTA_DEG,
+                debounce_ms=0,
+                conditions=[
+                    MappingCondition(source="fused.wrist_roll_dominant", comparator="truthy"),
+                ],
+                recognition_label="3dviewer wrist orbit",
+                action=MappingAction(
+                    type="mouse_move",
+                    delta_x_source="fused.wrist_roll",
+                    delta_x_scale=-THREEDVIEWER_WRIST_ORBIT_PX_PER_DEG,
+                    delta_x_angle=True,
+                    delta_max_step=THREEDVIEWER_WRIST_ORBIT_MAX_STEP_PX,
+                    center_before=True,
+                ),
+            ),
+            MappingRule(
+                id="3dviewer_zoom_in_two_hands",
+                name="zoom_in: both open hands move apart",
+                source="fused.both_hands_distance",
+                comparator="delta_increase",
+                threshold=THREEDVIEWER_ZOOM_HAND_DISTANCE_DELTA,
+                conditions=[
+                    MappingCondition(source="hands.left.gesture", comparator="eq", threshold="open_palm"),
+                    MappingCondition(source="hands.right.gesture", comparator="eq", threshold="open_palm"),
+                ],
+                recognition_label="zoom_in",
+                action=MappingAction(
+                    type="mouse_scroll",
+                    scroll_y=THREEDVIEWER_ZOOM_SCROLL_STEPS,
+                    interval_ms=120,
+                    center_before=True,
+                ),
+            ),
+            MappingRule(
+                id="3dviewer_zoom_out_two_hands",
+                name="zoom_out: both open hands move closer",
+                source="fused.both_hands_distance",
+                comparator="delta_decrease",
+                threshold=THREEDVIEWER_ZOOM_HAND_DISTANCE_DELTA,
+                conditions=[
+                    MappingCondition(source="hands.left.gesture", comparator="eq", threshold="open_palm"),
+                    MappingCondition(source="hands.right.gesture", comparator="eq", threshold="open_palm"),
+                ],
+                recognition_label="zoom_out",
+                action=MappingAction(
+                    type="mouse_scroll",
+                    scroll_y=-THREEDVIEWER_ZOOM_SCROLL_STEPS,
+                    interval_ms=120,
+                    center_before=True,
+                ),
             ),
             MappingRule(
                 id="3dviewer_zoom_in_depth",
@@ -621,7 +722,12 @@ def create_3dviewer_net_profile() -> MappingProfile:
                 gate_comparator="eq",
                 gate_threshold="index_finger_up",
                 recognition_label="3dviewer zoom in",
-                action=MappingAction(type="mouse_scroll", scroll_y=1, interval_ms=120),
+                action=MappingAction(
+                    type="mouse_scroll",
+                    scroll_y=THREEDVIEWER_ZOOM_SCROLL_STEPS,
+                    interval_ms=120,
+                    center_before=True,
+                ),
             ),
             MappingRule(
                 id="3dviewer_zoom_out_depth",
@@ -633,7 +739,12 @@ def create_3dviewer_net_profile() -> MappingProfile:
                 gate_comparator="eq",
                 gate_threshold="index_finger_up",
                 recognition_label="3dviewer zoom out",
-                action=MappingAction(type="mouse_scroll", scroll_y=-1, interval_ms=120),
+                action=MappingAction(
+                    type="mouse_scroll",
+                    scroll_y=-THREEDVIEWER_ZOOM_SCROLL_STEPS,
+                    interval_ms=120,
+                    center_before=True,
+                ),
             ),
             MappingRule(
                 id="3dviewer_zoom_in_wrist",
@@ -641,7 +752,11 @@ def create_3dviewer_net_profile() -> MappingProfile:
                 source="fused.wrist_pitch_up_detected",
                 comparator="truthy",
                 recognition_label="3dviewer zoom in",
-                action=MappingAction(type="mouse_scroll", scroll_y=1),
+                action=MappingAction(
+                    type="mouse_scroll",
+                    scroll_y=THREEDVIEWER_ZOOM_SCROLL_STEPS,
+                    center_before=True,
+                ),
             ),
             MappingRule(
                 id="3dviewer_zoom_out_wrist",
@@ -649,24 +764,63 @@ def create_3dviewer_net_profile() -> MappingProfile:
                 source="fused.wrist_pitch_down_detected",
                 comparator="truthy",
                 recognition_label="3dviewer zoom out",
-                action=MappingAction(type="mouse_scroll", scroll_y=-1),
+                action=MappingAction(
+                    type="mouse_scroll",
+                    scroll_y=-THREEDVIEWER_ZOOM_SCROLL_STEPS,
+                    center_before=True,
+                ),
             ),
         ],
     )
 
 
+def create_windows_3d_viewer_profile() -> MappingProfile:
+    """Create a profile for the native Windows 3D Viewer app."""
+    return MappingProfile(
+        name=WINDOWS_3D_VIEWER_PROFILE_NAME,
+        mappings=_clone_viewer_mappings(
+            create_3dviewer_net_profile().mappings,
+            id_prefix="windows3dviewer",
+            label="Windows 3D Viewer",
+        ),
+    )
+
+
+def _clone_viewer_mappings(
+    mappings: list[MappingRule],
+    *,
+    id_prefix: str,
+    label: str,
+) -> list[MappingRule]:
+    cloned: list[MappingRule] = []
+    for rule in mappings:
+        copied = copy.deepcopy(rule)
+        copied.id = copied.id.replace("3dviewer", id_prefix, 1)
+        copied.name = copied.name.replace("3dviewer", label, 1)
+        if copied.recognition_label:
+            copied.recognition_label = copied.recognition_label.replace("3dviewer", label, 1)
+        cloned.append(copied)
+    return cloned
+
+
+def _builtin_viewer_profiles() -> list[MappingProfile]:
+    return [create_3dviewer_net_profile(), create_windows_3d_viewer_profile()]
+
+
 def _ensure_builtin_profiles(profiles: list[MappingProfile]) -> None:
     names = {profile.name for profile in profiles}
-    if THREEDVIEWER_PROFILE_NAME not in names:
-        profiles.append(create_3dviewer_net_profile())
+    for profile in _builtin_viewer_profiles():
+        if profile.name not in names:
+            profiles.append(profile)
+            names.add(profile.name)
 
 
 def _sync_builtin_3dviewer_profile(profiles: list[MappingProfile]) -> None:
-    latest = create_3dviewer_net_profile()
+    latest_by_name = {profile.name: profile for profile in _builtin_viewer_profiles()}
     for profile in profiles:
-        if profile.name == THREEDVIEWER_PROFILE_NAME:
+        latest = latest_by_name.get(profile.name)
+        if latest is not None:
             profile.mappings = latest.mappings
-            return
 
 
 def _upgrade_wrist_pitch_rules(profiles: list[MappingProfile]) -> None:
@@ -719,6 +873,7 @@ class _RuntimeState:
     last_process_s: float | None = None
     residual_x: float = 0.0
     residual_y: float = 0.0
+    delta_source_values: dict[str, float] = field(default_factory=dict)
     status: str = "idle"
 
 
@@ -894,12 +1049,15 @@ class InputMapper:
             state.active = False
             state.pending_desired = None
             state.enter_blocked = False
+            state.delta_source_values.clear()
             state.status = "idle"
 
     def test_action(self, action: MappingAction) -> None:
         if not self.backend.available:
             self._log(self.backend.error or "Input backend unavailable.")
             return
+        if action.center_before:
+            self._move_cursor_to_center()
         if action.type == "keyboard_hold":
             self.backend.tap_keys(action.keys)
             return
@@ -943,6 +1101,7 @@ class InputMapper:
             state.last_process_s = now_s
             state.residual_x = 0.0
             state.residual_y = 0.0
+            state.delta_source_values.clear()
             state.enter_blocked = bool(gesture_name and not self._can_fire_gesture(gesture_name, now_s))
             if state.enter_blocked:
                 state.status = "gesture cooldown"
@@ -952,6 +1111,7 @@ class InputMapper:
             state.active = False
             state.last_process_s = None
             state.enter_blocked = False
+            state.delta_source_values.clear()
             self.release_rule(rule.id, include_modifiers=False)
             return
 
@@ -977,6 +1137,8 @@ class InputMapper:
 
     def _execute_enter(self, rule: MappingRule, action: MappingAction, now_s: float) -> None:
         rule_id = rule.id
+        if action.center_before:
+            self._move_cursor_to_center()
         if action.type == "keyboard_tap":
             self.backend.tap_keys(action.keys)
         elif action.type == "keyboard_hold":
@@ -1128,7 +1290,7 @@ class InputMapper:
             last = state.last_process_s if state.last_process_s is not None else now_s
             dt = max(0.0, min(0.2, now_s - last))
             state.last_process_s = now_s
-            self._move_relative(action, state, dt, now_s)
+            self._move_relative(action, state, dt, now_s, signals)
         elif action.type == "mouse_absolute" and action.continuous:
             self._move_absolute(action, signals)
             state.last_fired_s = now_s
@@ -1151,9 +1313,33 @@ class InputMapper:
         holders.add(rule_id)
         self._rule_buttons.setdefault(rule_id, set()).add(button)
 
-    def _move_relative(self, action: MappingAction, state: _RuntimeState, dt: float, now_s: float) -> None:
+    def _move_relative(
+        self,
+        action: MappingAction,
+        state: _RuntimeState,
+        dt: float,
+        now_s: float,
+        signals: dict[str, SignalValue] | None = None,
+    ) -> None:
         move_x = (action.speed_x * dt) + state.residual_x
         move_y = (action.speed_y * dt) + state.residual_y
+        if signals:
+            move_x += self._source_delta_move(
+                action.delta_x_source,
+                action.delta_x_scale,
+                action.delta_x_angle,
+                action.delta_max_step,
+                state,
+                signals,
+            )
+            move_y += self._source_delta_move(
+                action.delta_y_source,
+                action.delta_y_scale,
+                action.delta_y_angle,
+                action.delta_max_step,
+                state,
+                signals,
+            )
         step_x = int(move_x)
         step_y = int(move_y)
         state.residual_x = move_x - step_x
@@ -1162,11 +1348,53 @@ class InputMapper:
             self.backend.move(step_x, step_y)
             state.last_fired_s = now_s
 
+    @staticmethod
+    def _angle_delta(current: float, previous: float) -> float:
+        return (current - previous + 180.0) % 360.0 - 180.0
+
+    def _source_delta_move(
+        self,
+        source: str,
+        scale: float,
+        is_angle: bool,
+        max_step: float,
+        state: _RuntimeState,
+        signals: dict[str, SignalValue],
+    ) -> float:
+        if not source:
+            return 0.0
+        signal = signals.get(source)
+        value = _to_number(signal.value) if signal is not None else None
+        if value is None:
+            state.delta_source_values.pop(source, None)
+            return 0.0
+        previous = state.delta_source_values.get(source)
+        state.delta_source_values[source] = value
+        if previous is None:
+            return 0.0
+        delta = self._angle_delta(value, previous) if is_angle else value - previous
+        move = delta * scale
+        limit = max(1.0, float(max_step or 1.0))
+        return max(-limit, min(limit, move))
+
     def _move_absolute(
         self,
         action: MappingAction,
         signals: dict[str, SignalValue] | None = None,
     ) -> None:
+        width, height = self._screen_size()
+        absolute_x = self._absolute_axis_value(action.absolute_x, action.absolute_x_source, signals)
+        absolute_y = self._absolute_axis_value(action.absolute_y, action.absolute_y_source, signals)
+        x = int(max(0.0, min(1.0, absolute_x)) * max(1, width - 1))
+        y = int(max(0.0, min(1.0, absolute_y)) * max(1, height - 1))
+        self.backend.move_absolute(x, y)
+
+    def _move_cursor_to_center(self) -> None:
+        width, height = self._screen_size()
+        self.backend.move_absolute(int(max(1, width - 1) * 0.5), int(max(1, height - 1) * 0.5))
+
+    @staticmethod
+    def _screen_size() -> tuple[int, int]:
         try:
             import tkinter as tk
 
@@ -1175,11 +1403,7 @@ class InputMapper:
             height = root.winfo_screenheight() if root is not None else 1080
         except Exception:
             width, height = 1920, 1080
-        absolute_x = self._absolute_axis_value(action.absolute_x, action.absolute_x_source, signals)
-        absolute_y = self._absolute_axis_value(action.absolute_y, action.absolute_y_source, signals)
-        x = int(max(0.0, min(1.0, absolute_x)) * max(1, width - 1))
-        y = int(max(0.0, min(1.0, absolute_y)) * max(1, height - 1))
-        self.backend.move_absolute(x, y)
+        return max(1, int(width)), max(1, int(height))
 
     @staticmethod
     def _absolute_axis_value(

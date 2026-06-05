@@ -56,6 +56,9 @@ FIELD_ORDER = [
     "left_hand_y",
     "left_hand_z_mm",
     "left_hand_gesture",
+    "both_hands_distance",
+    "both_hands_x_distance",
+    "both_hands_y_distance",
     "wrist_accel_x",
     "wrist_accel_y",
     "wrist_accel_z",
@@ -137,6 +140,30 @@ class FusionState:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    @classmethod
+    def _hand_distance_features(
+        cls,
+        right: dict[str, Any],
+        left: dict[str, Any],
+    ) -> dict[str, float | None]:
+        right_x = cls._number(right.get("x")) if right.get("visible") else None
+        right_y = cls._camera_y_up(right)
+        left_x = cls._number(left.get("x")) if left.get("visible") else None
+        left_y = cls._camera_y_up(left)
+        if right_x is None or right_y is None or left_x is None or left_y is None:
+            return {
+                "both_hands_distance": None,
+                "both_hands_x_distance": None,
+                "both_hands_y_distance": None,
+            }
+        x_distance = abs(left_x - right_x)
+        y_distance = abs(left_y - right_y)
+        return {
+            "both_hands_distance": (x_distance * x_distance + y_distance * y_distance) ** 0.5,
+            "both_hands_x_distance": x_distance,
+            "both_hands_y_distance": y_distance,
+        }
 
     @staticmethod
     def _angle_delta(current: float, anchor: float) -> float:
@@ -815,6 +842,7 @@ class FusionState:
             "left_hand_y": self._camera_y_up(left),
             "left_hand_z_mm": tof.get("left_mm"),
             "left_hand_gesture": left.get("gesture") if left.get("visible") else None,
+            **self._hand_distance_features(right, left),
             "wrist_accel_x": accel.get("x"),
             "wrist_accel_y": accel.get("y"),
             "wrist_accel_z": accel.get("z"),
