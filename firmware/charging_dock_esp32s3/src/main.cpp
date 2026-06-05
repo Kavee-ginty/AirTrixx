@@ -22,6 +22,7 @@ static const uint8_t CHANNEL_COUNT = 4;
 
 // Pins
 static const uint8_t GATE_PINS[CHANNEL_COUNT] = {11, 4, 5, 6};
+static const char *CHANNEL_NAMES[CHANNEL_COUNT] = {"FN", "AD", "KB", "WB"};
 static const uint8_t ENC_CLK = 7;
 static const uint8_t ENC_DT = 1;
 static const uint8_t ENC_SW = 2;
@@ -281,8 +282,7 @@ static void handleEncoder() {
       now - lastButtonMs >= BUTTON_DEBOUNCE_MS) {
     lastButtonMs = now;
     if (activeTab > 0) {
-      int selected = activeTab - 1;
-      priorityCH = priorityCH == selected ? -1 : selected;
+      activeTab = 0;
     } else {
       priorityCH = -1;
     }
@@ -323,8 +323,8 @@ static void drawOverview() {
     } else {
       display.print(" ");
     }
-    display.print("CH");
-    display.print(i + 1);
+    display.print("CH-");
+    display.print(CHANNEL_NAMES[i]);
     display.print(": ");
     printChannelStatus(i);
   }
@@ -333,8 +333,8 @@ static void drawOverview() {
 static void drawChannelDetail(uint8_t ch) {
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.print("CHANNEL ");
-  display.print(ch + 1);
+  display.print("CHANNEL: ");
+  display.print(CHANNEL_NAMES[ch]);
   if (priorityCH == static_cast<int>(ch)) {
     display.print(" [PRI]");
   } else if (gateEnabled[ch]) {
@@ -380,7 +380,7 @@ static void drawChannelDetail(uint8_t ch) {
   }
 
   display.setCursor(0, 56);
-  display.print("BTN: SET PRIORITY");
+  display.print("PUSH BTN TO HOME");
 }
 
 static void updateDisplay() {
