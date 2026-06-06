@@ -56,6 +56,9 @@ WRIST_SAMPLE_ROTATE_CENTER_TRACK_ALPHA = 0.08
 WRIST_SAMPLE_ROTATE_INTEGRATION_GAIN = 1.25
 WRIST_SAMPLE_ROTATE_MAX_STEP_DEG = 2.0
 WRIST_SAMPLE_ROTATE_RELEASE_GRACE_S = 0.24
+WRIST_ROLL_ROTATE_HISTORY_S = 0.35
+WRIST_ROLL_ROTATE_DEADZONE_DPS = 2.5
+WRIST_ROLL_ROTATE_RELEASE_GRACE_S = 0.4
 
 
 FIELD_ORDER = [
@@ -80,6 +83,10 @@ FIELD_ORDER = [
     "wrist_gyro_z",
     "wrist_pitch",
     "wrist_roll",
+    "wrist_roll_rotate_velocity_dps",
+    "wrist_roll_rotate_velocity_abs_dps",
+    "wrist_roll_rotate_direction",
+    "wrist_roll_rotate_active",
     "wrist_sample_rotate_position",
     "wrist_sample_rotate_velocity_dps",
     "wrist_sample_rotate_direction",
@@ -141,6 +148,8 @@ class FusionState:
         self._wrist_sample_rotate_last_motion_s: float | None = None
         self._wrist_sample_rotate_center_y: float | None = None
         self._wrist_sample_rotate_output_position = 0.0
+        self._wrist_roll_rotate_history: list[tuple[float, float]] = []
+        self._wrist_roll_rotate_last_motion_s: float | None = None
         self._two_hand_zoom_history: list[tuple[float, float]] = []
         self._two_hand_zoom_candidate = "none"
         self._two_hand_zoom_candidate_since_s = 0.0
@@ -309,6 +318,53 @@ class FusionState:
             "wrist_sample_rotate_velocity_dps": velocity,
             "wrist_sample_rotate_direction": direction,
             "wrist_sample_rotate_active": active,
+        }
+
+    def _wrist_roll_rotate_features(self, wrist_roll: Any, now_s: float) -> dict[str, Any]:
+        roll_number = self._number(wrist_roll)
+        if roll_number is None:
+            self._wrist_roll_rotate_history.clear()
+            self._wrist_roll_rotate_last_motion_s = None
+            return {
+                "wrist_roll_rotate_velocity_dps": 0.0,
+                "wrist_roll_rotate_velocity_abs_dps": 0.0,
+                "wrist_roll_rotate_direction": "none",
+                "wrist_roll_rotate_active": False,
+            }
+
+        self._wrist_roll_rotate_history.append((now_s, roll_number))
+        cutoff_s = now_s - WRIST_ROLL_ROTATE_HISTORY_S
+        self._wrist_roll_rotate_history = [
+            item for item in self._wrist_roll_rotate_history if item[0] >= cutoff_s
+        ]
+        unwrapped = self._unwrap_angle_samples(self._wrist_roll_rotate_history)
+        velocities: list[float] = []
+        for previous, current in zip(unwrapped, unwrapped[1:]):
+            dt_s = current[0] - previous[0]
+            if dt_s <= 0.0 or dt_s > 0.25:
+                continue
+            velocities.append(self._angle_delta(current[1], previous[1]) / dt_s)
+        velocity = self._median(velocities) or 0.0
+        if abs(velocity) < WRIST_ROLL_ROTATE_DEADZONE_DPS:
+            velocity = 0.0
+
+        if velocity > 0.0:
+            direction = "right"
+        elif velocity < 0.0:
+            direction = "left"
+        else:
+            direction = "none"
+        if direction != "none":
+            self._wrist_roll_rotate_last_motion_s = now_s
+        active = (
+            self._wrist_roll_rotate_last_motion_s is not None
+            and now_s - self._wrist_roll_rotate_last_motion_s <= WRIST_ROLL_ROTATE_RELEASE_GRACE_S
+        )
+        return {
+            "wrist_roll_rotate_velocity_dps": velocity,
+            "wrist_roll_rotate_velocity_abs_dps": abs(velocity),
+            "wrist_roll_rotate_direction": direction,
+            "wrist_roll_rotate_active": active,
         }
 
     @staticmethod
@@ -1004,6 +1060,7 @@ class FusionState:
             "wrist_gyro_z": gyro.get("z"),
             "wrist_pitch": wrist_pitch,
             "wrist_roll": wrist_roll,
+            **self._wrist_roll_rotate_features(wrist_roll, now_s),
             **self._wrist_sample_rotate_features(gyro.get("y"), now_s),
             "camdock_battery_level": camdock.get("battery_level"),
             "wristband_battery_level": wrist.get("battery_level"),

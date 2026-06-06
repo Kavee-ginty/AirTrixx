@@ -61,7 +61,7 @@ The Windows profile uses **wrist roll angle velocity** (`wrist_roll`), not forea
 - Roll wristband **right** (roll angle increasing) → model rotates **right**
 - Roll wristband **left** (roll angle decreasing) → model rotates **left**
 
-Rotation stays active while roll speed stays above the threshold, with hysteresis so brief neutral gaps do not drop the drag. The rule locates `3DViewer.exe`, sends synthetic touch drag directly to the Viewer (never moving the system cursor), and stops if the Viewer loses focus. Per-frame movement is capped to prevent jumps.
+Rotation stays active while roll speed stays above the threshold, with a short grace period so brief neutral gaps do not drop the drag. The rule locates `3DViewer.exe` or `View3D.exe`, sends synthetic touch drag directly to the Viewer (never moving the system cursor), and keeps working while the Viewer window is open even when AirTrixx has focus. Per-frame movement is capped to prevent jumps.
 
 Both viewer profiles include the recorded `zoom_in` and `zoom_out` open-palm distance gestures. Each zoom action sends one mouse-wheel notch.
 
@@ -104,7 +104,7 @@ Use this checklist after enabling either viewer mode:
 | Unwanted clicks while viewing | The viewer profile disables automatic select clicks and uses middle-drag for pan; reload mappings if an older profile is still active |
 | Mappings stop when typing | Expected: mappings suppress while a text field in AirTrixx has focus |
 | Profile missing in dropdown | Click **Load** on the Mappings page; built-in profiles merge automatically on load |
-| Windows 3D Viewer rotation stops mid-gesture | Keep rolling steadily; rotation needs roll speed above ~6 deg/s. Reload mappings to pick up the roll-velocity profile |
+| Windows 3D Viewer rotation stops mid-gesture | Keep rolling steadily; rotation needs roll speed above ~2.5 deg/s with a 0.4 s grace window. Reload mappings to pick up the roll-velocity profile |
 | Windows rotation direction feels inverted | Report it; `WINDOWS_3D_VIEWER_ROLL_SIGN` in `input_mapper.py` can flip drag direction |
 
 ## Technical notes

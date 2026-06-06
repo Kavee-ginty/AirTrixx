@@ -125,6 +125,35 @@ class FusionStateTests(unittest.TestCase):
         self.assertAlmostEqual(values["wrist_roll_delta"], 30)
         self.assertTrue(values["wrist_roll_dominant"])
 
+    def test_wrist_roll_rotate_features_track_continuous_roll_right(self) -> None:
+        fusion = FusionState()
+        velocities: list[float] = []
+        active_flags: list[bool] = []
+        for index in range(8):
+            values = fusion.build_input_dict(
+                serial_with_wrist(pitch=0, roll=index * 6.0),
+                {},
+                now_s=index * 0.1,
+            )
+            velocities.append(values["wrist_roll_rotate_velocity_dps"])
+            active_flags.append(values["wrist_roll_rotate_active"])
+
+        self.assertTrue(any(velocity > 0 for velocity in velocities[2:]))
+        self.assertTrue(any(active_flags[2:]))
+
+    def test_wrist_roll_rotate_features_track_continuous_roll_left(self) -> None:
+        fusion = FusionState()
+        velocities: list[float] = []
+        for index in range(8):
+            values = fusion.build_input_dict(
+                serial_with_wrist(pitch=0, roll=-index * 6.0),
+                {},
+                now_s=index * 0.1,
+            )
+            velocities.append(values["wrist_roll_rotate_velocity_dps"])
+
+        self.assertTrue(any(velocity < 0 for velocity in velocities[2:]))
+
     def test_recorded_wristband_forearm_rotation_directly_uses_positive_gyro_y(self) -> None:
         fusion = FusionState()
         directions = []

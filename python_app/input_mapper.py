@@ -20,9 +20,8 @@ THREEDVIEWER_ZOOM_SCROLL_INTERVAL_MS = 140
 THREEDVIEWER_WRIST_ORBIT_PX_PER_DEG = 4.0
 THREEDVIEWER_WRIST_ORBIT_MAX_STEP_PX = 18.0
 WINDOWS_3D_VIEWER_ROLL_SIGN = 1
-WINDOWS_3D_VIEWER_ROLL_VELOCITY_THRESHOLD_DPS = 6.0
-WINDOWS_3D_VIEWER_ROLL_VELOCITY_HYSTERESIS_DPS = 4.0
-WINDOWS_3D_VIEWER_POINTER_WARMUP_MS = 80
+WINDOWS_3D_VIEWER_PROCESS_CANDIDATES = "3DViewer.exe|View3D.exe"
+WINDOWS_3D_VIEWER_POINTER_WARMUP_MS = 40
 DEFAULT_MAPPING_PATH = MAPPING_PATH
 
 ACTION_TYPES = {
@@ -747,18 +746,16 @@ def create_windows_3d_viewer_wrist_roll_rotate_rule() -> MappingRule:
     return MappingRule(
         id="windows3dviewer_wrist_roll_rotate",
         name="Windows 3D Viewer wrist roll rotate",
-        source="fused.wrist_roll_velocity_abs_dps",
-        comparator="gt",
-        threshold=WINDOWS_3D_VIEWER_ROLL_VELOCITY_THRESHOLD_DPS,
-        hysteresis=WINDOWS_3D_VIEWER_ROLL_VELOCITY_HYSTERESIS_DPS,
+        source="fused.wrist_roll_rotate_active",
+        comparator="truthy",
         recognition_label="Windows 3D Viewer wrist roll",
         action=MappingAction(
             type="mouse_move",
             drag_button="left",
-            speed_x_source="fused.wrist_roll_velocity_dps",
+            speed_x_source="fused.wrist_roll_rotate_velocity_dps",
             speed_x_scale=THREEDVIEWER_WRIST_ORBIT_PX_PER_DEG * WINDOWS_3D_VIEWER_ROLL_SIGN,
             delta_max_step=THREEDVIEWER_WRIST_ORBIT_MAX_STEP_PX,
-            foreground_process="3DViewer.exe",
+            foreground_process=WINDOWS_3D_VIEWER_PROCESS_CANDIDATES,
             hide_cursor_during_action=False,
             restore_cursor_after_action=False,
             pointer_session_warmup_ms=WINDOWS_3D_VIEWER_POINTER_WARMUP_MS,

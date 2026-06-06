@@ -211,9 +211,10 @@ class PynputInputBackend:
         if session_id in self._pointer_sessions:
             return self.pointer_session_active(session_id)
         target = str(foreground_process).strip().lower()
-        target_window = self._target_process_window(target) if target else self._foreground_window()
+        target_window = self._target_process_window(foreground_process) if target else self._foreground_window()
         if not target_window:
             return False
+        matched_process = self._window_process_name(target_window) if target else ""
         if target:
             self._activate_window(target_window)
         mode = str(pointer_mode).strip().lower()
@@ -223,7 +224,7 @@ class PynputInputBackend:
             if center is None or bounds is None or not self._initialize_touch_injection():
                 return False
             self._pointer_sessions[session_id] = {
-                "foreground_process": target,
+                "foreground_process": matched_process or target,
                 "target_window": target_window,
                 "pointer_mode": "touch",
                 "touch_active": False,
@@ -241,7 +242,7 @@ class PynputInputBackend:
                 return False
             self.move_absolute(*center)
         self._pointer_sessions[session_id] = {
-            "foreground_process": target,
+            "foreground_process": matched_process or target,
             "target_window": target_window,
             "pointer_mode": "mouse",
             "hidden": hidden,
@@ -256,6 +257,8 @@ class PynputInputBackend:
         target_window = session.get("target_window")
         if target_window and not self._window_is_available(target_window):
             return False
+        if session.get("pointer_mode") == "touch":
+            return True
         target = str(session.get("foreground_process") or "")
         foreground = self._foreground_window()
         if not foreground:
@@ -366,7 +369,21 @@ class PynputInputBackend:
             return ""
 
     @classmethod
+    def _process_candidates(cls, expected: str) -> list[str]:
+        return [name.strip() for name in str(expected).split("|") if name.strip()]
+
+    @classmethod
     def _target_process_window(cls, expected: str) -> Any:
+        if sys.platform != "win32" or not expected:
+            return None
+        for candidate in cls._process_candidates(expected):
+            window = cls._find_process_window(candidate)
+            if window:
+                return window
+        return None
+
+    @classmethod
+    def _find_process_window(cls, expected: str) -> Any:
         if sys.platform != "win32" or not expected:
             return None
         try:
@@ -603,8 +620,8 @@ class FakeInputBackend:
         self._available = True
         self._error: str | None = None
         self.active_foreground_process = "3DViewer.exe"
-        self.available_target_processes = {"3DViewer.exe"}
-        self._pointer_sessions: dict[str, str] = {}
+        self.available_target_processes = {"3dviewer.exe", "view3d.exe"}
+        self._pointer_sessions: dict[str, dict[str, Any]] = {}
 
     @property
     def available(self) -> bool:
@@ -652,18 +669,26 @@ class FakeInputBackend:
         restore_cursor: bool = False,
         pointer_mode: str = "",
     ) -> bool:
+        candidates = {
+            candidate.lower()
+            for candidate in PynputInputBackend._process_candidates(foreground_process)
+        }
         available_targets = {target.lower() for target in self.available_target_processes}
-        if foreground_process and foreground_process.lower() not in available_targets:
+        if candidates and candidates.isdisjoint(available_targets):
             return False
-        if foreground_process:
-            self.active_foreground_process = foreground_process
+        matched = next(iter(candidates & available_targets), foreground_process.split("|", 1)[0].strip())
+        if matched:
+            self.active_foreground_process = matched
         if session_id not in self._pointer_sessions:
-            self._pointer_sessions[session_id] = foreground_process
+            self._pointer_sessions[session_id] = {
+                "foreground_process": matched,
+                "pointer_mode": str(pointer_mode).strip().lower(),
+            }
             self.events.append(
                 (
                     "pointer_session_begin",
                     session_id,
-                    foreground_process,
+                    matched,
                     bool(center_in_foreground),
                     bool(hide_cursor),
                     bool(restore_cursor),
@@ -673,10 +698,18 @@ class FakeInputBackend:
         return True
 
     def pointer_session_active(self, session_id: str) -> bool:
-        target = self._pointer_sessions.get(session_id)
-        if target is None:
+        session = self._pointer_sessions.get(session_id)
+        if session is None:
             return False
-        return not target or target.lower() == self.active_foreground_process.lower()
+        if session.get("pointer_mode") == "touch":
+            target = str(session.get("foreground_process") or "")
+            if not target:
+                return True
+            return target.lower() in {name.lower() for name in self.available_target_processes}
+        target = str(session.get("foreground_process") or "")
+        if not target:
+            return True
+        return target.lower() == self.active_foreground_process.lower()
 
     def move_pointer_session(self, session_id: str, dx: int = 0, dy: int = 0) -> bool:
         if session_id not in self._pointer_sessions:

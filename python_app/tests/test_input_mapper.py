@@ -491,14 +491,14 @@ class MappingConfigTests(unittest.TestCase):
         windows_wrist_rule = next(
             rule
             for rule in windows_profile.mappings
-            if rule.source == "fused.wrist_roll_velocity_abs_dps"
+            if rule.id == "windows3dviewer_wrist_roll_rotate"
         )
-        self.assertEqual(windows_wrist_rule.id, "windows3dviewer_wrist_roll_rotate")
-        self.assertEqual(windows_wrist_rule.action.speed_x_source, "fused.wrist_roll_velocity_dps")
-        self.assertEqual(windows_wrist_rule.action.foreground_process, "3DViewer.exe")
+        self.assertEqual(windows_wrist_rule.source, "fused.wrist_roll_rotate_active")
+        self.assertEqual(windows_wrist_rule.action.speed_x_source, "fused.wrist_roll_rotate_velocity_dps")
+        self.assertEqual(windows_wrist_rule.action.foreground_process, "3DViewer.exe|View3D.exe")
         self.assertFalse(windows_wrist_rule.action.hide_cursor_during_action)
         self.assertFalse(windows_wrist_rule.action.restore_cursor_after_action)
-        self.assertEqual(windows_wrist_rule.action.pointer_session_warmup_ms, 80)
+        self.assertEqual(windows_wrist_rule.action.pointer_session_warmup_ms, 40)
         self.assertEqual(windows_wrist_rule.action.pointer_mode, "touch")
 
     def test_loaded_legacy_config_gets_3dviewer_profile(self) -> None:
@@ -763,8 +763,8 @@ class MappingConfigTests(unittest.TestCase):
         mapper.set_enabled(True)
 
         roll_snapshot = {
-            "wrist_roll_velocity_dps": 25.0,
-            "wrist_roll_velocity_abs_dps": 25.0,
+            "wrist_roll_rotate_active": True,
+            "wrist_roll_rotate_velocity_dps": 25.0,
         }
         mapper.process(snapshot(**roll_snapshot), 0.0)
         mapper.process(snapshot(**roll_snapshot), 0.1)
@@ -783,8 +783,8 @@ class MappingConfigTests(unittest.TestCase):
         mapper.set_enabled(True)
 
         roll_snapshot = {
-            "wrist_roll_velocity_dps": -25.0,
-            "wrist_roll_velocity_abs_dps": 25.0,
+            "wrist_roll_rotate_active": True,
+            "wrist_roll_rotate_velocity_dps": -25.0,
         }
         mapper.process(snapshot(**roll_snapshot), 0.0)
         mapper.process(snapshot(**roll_snapshot), 0.1)
@@ -804,8 +804,8 @@ class MappingConfigTests(unittest.TestCase):
         mapper.set_enabled(True)
 
         roll_snapshot = {
-            "wrist_roll_velocity_dps": 25.0,
-            "wrist_roll_velocity_abs_dps": 25.0,
+            "wrist_roll_rotate_active": True,
+            "wrist_roll_rotate_velocity_dps": 25.0,
         }
         mapper.process(snapshot(**roll_snapshot), 0.0)
         mapper.process(snapshot(**roll_snapshot), 0.1)
@@ -828,8 +828,14 @@ class MappingConfigTests(unittest.TestCase):
 
         backend.active_foreground_process = "Codex.exe"
         mapper.process(snapshot(**roll_snapshot), 0.6)
+        mapper.process(snapshot(**roll_snapshot), 0.7)
         self.assertNotIn(("mouse_up", "left"), backend.events)
-        self.assertTrue(any(event[0] == "pointer_session_end" for event in backend.events))
+        self.assertFalse(any(event[0] == "pointer_session_end" for event in backend.events))
+        self.assertTrue(any(event[0] == "pointer_session_move" for event in backend.events))
+
+        backend.available_target_processes.clear()
+        mapper.process(snapshot(**roll_snapshot), 0.8)
+        self.assertIn(("pointer_session_end", "windows3dviewer_wrist_roll_rotate"), backend.events)
 
     def test_invalid_config_falls_back_to_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
