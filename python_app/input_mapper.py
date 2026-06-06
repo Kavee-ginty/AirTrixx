@@ -19,6 +19,10 @@ WINDOWS_3D_VIEWER_PROFILE_NAME = "Windows 3D Viewer"
 THREEDVIEWER_ZOOM_SCROLL_INTERVAL_MS = 140
 THREEDVIEWER_WRIST_ORBIT_PX_PER_DEG = 4.0
 THREEDVIEWER_WRIST_ORBIT_MAX_STEP_PX = 18.0
+WINDOWS_3D_VIEWER_ROLL_SIGN = 1
+WINDOWS_3D_VIEWER_ROLL_VELOCITY_THRESHOLD_DPS = 6.0
+WINDOWS_3D_VIEWER_ROLL_VELOCITY_HYSTERESIS_DPS = 4.0
+WINDOWS_3D_VIEWER_POINTER_WARMUP_MS = 80
 DEFAULT_MAPPING_PATH = MAPPING_PATH
 
 ACTION_TYPES = {
@@ -212,6 +216,10 @@ class MappingAction:
     scroll_y: int = 1
     speed_x: float = 0.0
     speed_y: float = 0.0
+    speed_x_source: str = ""
+    speed_y_source: str = ""
+    speed_x_scale: float = 1.0
+    speed_y_scale: float = 1.0
     absolute_x: float = 0.5
     absolute_y: float = 0.5
     absolute_x_source: str = ""
@@ -253,6 +261,10 @@ class MappingAction:
             scroll_y=int(float(data.get("scroll_y", 1) or 0)),
             speed_x=float(data.get("speed_x", 0.0) or 0.0),
             speed_y=float(data.get("speed_y", 0.0) or 0.0),
+            speed_x_source=str(data.get("speed_x_source") or ""),
+            speed_y_source=str(data.get("speed_y_source") or ""),
+            speed_x_scale=float(data.get("speed_x_scale", 1.0) or 0.0),
+            speed_y_scale=float(data.get("speed_y_scale", 1.0) or 0.0),
             absolute_x=max(0.0, min(1.0, float(data.get("absolute_x", 0.5) or 0.0))),
             absolute_y=max(0.0, min(1.0, float(data.get("absolute_y", 0.5) or 0.0))),
             absolute_x_source=str(data.get("absolute_x_source") or ""),
@@ -285,6 +297,10 @@ class MappingAction:
             "scroll_y": self.scroll_y,
             "speed_x": self.speed_x,
             "speed_y": self.speed_y,
+            "speed_x_source": self.speed_x_source,
+            "speed_y_source": self.speed_y_source,
+            "speed_x_scale": self.speed_x_scale,
+            "speed_y_scale": self.speed_y_scale,
             "absolute_x": self.absolute_x,
             "absolute_y": self.absolute_y,
             "absolute_x_source": self.absolute_x_source,
@@ -338,6 +354,13 @@ class MappingAction:
                     parts.append(f"x=d({self.delta_x_source})*{self.delta_x_scale:g}")
                 if self.delta_y_source:
                     parts.append(f"y=d({self.delta_y_source})*{self.delta_y_scale:g}")
+                return prefix + drag_prefix + "move " + " ".join(parts)
+            if self.speed_x_source or self.speed_y_source:
+                parts = []
+                if self.speed_x_source:
+                    parts.append(f"x=v({self.speed_x_source})*{self.speed_x_scale:g}")
+                if self.speed_y_source:
+                    parts.append(f"y=v({self.speed_y_source})*{self.speed_y_scale:g}")
                 return prefix + drag_prefix + "move " + " ".join(parts)
             return f"{prefix}{drag_prefix}move x={self.speed_x:g}/s y={self.speed_y:g}/s"
         if self.type == "mouse_absolute":
@@ -719,28 +742,45 @@ def create_3dviewer_net_profile() -> MappingProfile:
     )
 
 
+def create_windows_3d_viewer_wrist_roll_rotate_rule() -> MappingRule:
+    """Continuous wrist-roll drag for native Windows 3D Viewer."""
+    return MappingRule(
+        id="windows3dviewer_wrist_roll_rotate",
+        name="Windows 3D Viewer wrist roll rotate",
+        source="fused.wrist_roll_velocity_abs_dps",
+        comparator="gt",
+        threshold=WINDOWS_3D_VIEWER_ROLL_VELOCITY_THRESHOLD_DPS,
+        hysteresis=WINDOWS_3D_VIEWER_ROLL_VELOCITY_HYSTERESIS_DPS,
+        recognition_label="Windows 3D Viewer wrist roll",
+        action=MappingAction(
+            type="mouse_move",
+            drag_button="left",
+            speed_x_source="fused.wrist_roll_velocity_dps",
+            speed_x_scale=THREEDVIEWER_WRIST_ORBIT_PX_PER_DEG * WINDOWS_3D_VIEWER_ROLL_SIGN,
+            delta_max_step=THREEDVIEWER_WRIST_ORBIT_MAX_STEP_PX,
+            foreground_process="3DViewer.exe",
+            hide_cursor_during_action=False,
+            restore_cursor_after_action=False,
+            pointer_session_warmup_ms=WINDOWS_3D_VIEWER_POINTER_WARMUP_MS,
+            pointer_mode="touch",
+        ),
+    )
+
+
 def create_windows_3d_viewer_profile() -> MappingProfile:
     """Create a profile for the native Windows 3D Viewer app."""
-    mappings = [
+    zoom_mappings = [
         rule
         for rule in _clone_viewer_mappings(
             create_3dviewer_net_profile().mappings,
             id_prefix="windows3dviewer",
             label="Windows 3D Viewer",
         )
-        if rule.source in {"fused.wrist_sample_rotate_active", "fused.two_hand_zoom_direction"}
+        if rule.source == "fused.two_hand_zoom_direction"
     ]
-    for rule in mappings:
-        if rule.source != "fused.wrist_sample_rotate_active":
-            continue
-        rule.action.foreground_process = "3DViewer.exe"
-        rule.action.hide_cursor_during_action = False
-        rule.action.restore_cursor_after_action = False
-        rule.action.pointer_session_warmup_ms = 160
-        rule.action.pointer_mode = "touch"
     return MappingProfile(
         name=WINDOWS_3D_VIEWER_PROFILE_NAME,
-        mappings=mappings,
+        mappings=[create_windows_3d_viewer_wrist_roll_rotate_rule(), *zoom_mappings],
     )
 
 
@@ -1356,6 +1396,20 @@ class InputMapper:
         move_x = (action.speed_x * dt) + state.residual_x
         move_y = (action.speed_y * dt) + state.residual_y
         if signals:
+            move_x += self._source_speed_move(
+                action.speed_x_source,
+                action.speed_x_scale,
+                dt,
+                action.delta_max_step,
+                signals,
+            )
+            move_y += self._source_speed_move(
+                action.speed_y_source,
+                action.speed_y_scale,
+                dt,
+                action.delta_max_step,
+                signals,
+            )
             move_x += self._source_delta_move(
                 action.delta_x_source,
                 action.delta_x_scale,
@@ -1387,6 +1441,24 @@ class InputMapper:
     @staticmethod
     def _angle_delta(current: float, previous: float) -> float:
         return (current - previous + 180.0) % 360.0 - 180.0
+
+    @staticmethod
+    def _source_speed_move(
+        source: str,
+        scale: float,
+        dt: float,
+        max_step: float,
+        signals: dict[str, SignalValue],
+    ) -> float:
+        if not source:
+            return 0.0
+        signal = signals.get(source)
+        value = _to_number(signal.value) if signal is not None else None
+        if value is None:
+            return 0.0
+        move = value * scale * dt
+        limit = max(1.0, float(max_step or 1.0))
+        return max(-limit, min(limit, move))
 
     def _source_delta_move(
         self,

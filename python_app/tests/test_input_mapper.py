@@ -478,24 +478,27 @@ class MappingConfigTests(unittest.TestCase):
             self.assertTrue(all(rule.action.interval_ms == THREEDVIEWER_ZOOM_SCROLL_INTERVAL_MS for rule in zoom_rules))
             self.assertTrue(all(rule.source == "fused.two_hand_zoom_direction" for rule in zoom_rules))
             self.assertEqual({rule.threshold for rule in zoom_rules}, {"in", "out"})
-            wrist_drag_rules = [
-                rule
-                for rule in viewer_profile.mappings
-                if rule.source == "fused.wrist_sample_rotate_active"
-            ]
-            self.assertEqual(len(wrist_drag_rules), 1)
-            self.assertEqual(wrist_drag_rules[0].action.type, "mouse_move")
-            self.assertEqual(wrist_drag_rules[0].action.drag_button, "left")
-            self.assertTrue(wrist_drag_rules[0].action.center_before)
+            if viewer_profile.name == THREEDVIEWER_PROFILE_NAME:
+                wrist_drag_rules = [
+                    rule
+                    for rule in viewer_profile.mappings
+                    if rule.source == "fused.wrist_sample_rotate_active"
+                ]
+                self.assertEqual(len(wrist_drag_rules), 1)
+                self.assertEqual(wrist_drag_rules[0].action.type, "mouse_move")
+                self.assertEqual(wrist_drag_rules[0].action.drag_button, "left")
+                self.assertTrue(wrist_drag_rules[0].action.center_before)
         windows_wrist_rule = next(
             rule
             for rule in windows_profile.mappings
-            if rule.source == "fused.wrist_sample_rotate_active"
+            if rule.source == "fused.wrist_roll_velocity_abs_dps"
         )
+        self.assertEqual(windows_wrist_rule.id, "windows3dviewer_wrist_roll_rotate")
+        self.assertEqual(windows_wrist_rule.action.speed_x_source, "fused.wrist_roll_velocity_dps")
         self.assertEqual(windows_wrist_rule.action.foreground_process, "3DViewer.exe")
         self.assertFalse(windows_wrist_rule.action.hide_cursor_during_action)
         self.assertFalse(windows_wrist_rule.action.restore_cursor_after_action)
-        self.assertEqual(windows_wrist_rule.action.pointer_session_warmup_ms, 160)
+        self.assertEqual(windows_wrist_rule.action.pointer_session_warmup_ms, 80)
         self.assertEqual(windows_wrist_rule.action.pointer_mode, "touch")
 
     def test_loaded_legacy_config_gets_3dviewer_profile(self) -> None:
@@ -751,6 +754,46 @@ class MappingConfigTests(unittest.TestCase):
         mapper.process(hand_snapshot({}, left_gesture="closed_fist", right_visible=True), 0.13)
         self.assertEqual(backend.events, [])
 
+    def test_windows_3d_viewer_wrist_roll_right_moves_positive_x(self) -> None:
+        backend = FakeInputBackend()
+        backend.available_target_processes.add("3DViewer.exe")
+        config = default_mapping_config()
+        config.active_profile = WINDOWS_3D_VIEWER_PROFILE_NAME
+        mapper = InputMapper(backend, config)
+        mapper.set_enabled(True)
+
+        roll_snapshot = {
+            "wrist_roll_velocity_dps": 25.0,
+            "wrist_roll_velocity_abs_dps": 25.0,
+        }
+        mapper.process(snapshot(**roll_snapshot), 0.0)
+        mapper.process(snapshot(**roll_snapshot), 0.1)
+        mapper.process(snapshot(**roll_snapshot), 0.2)
+
+        moves = [event for event in backend.events if event[0] == "pointer_session_move"]
+        self.assertTrue(moves)
+        self.assertTrue(all(event[2] > 0 for event in moves))
+
+    def test_windows_3d_viewer_wrist_roll_left_moves_negative_x(self) -> None:
+        backend = FakeInputBackend()
+        backend.available_target_processes.add("3DViewer.exe")
+        config = default_mapping_config()
+        config.active_profile = WINDOWS_3D_VIEWER_PROFILE_NAME
+        mapper = InputMapper(backend, config)
+        mapper.set_enabled(True)
+
+        roll_snapshot = {
+            "wrist_roll_velocity_dps": -25.0,
+            "wrist_roll_velocity_abs_dps": 25.0,
+        }
+        mapper.process(snapshot(**roll_snapshot), 0.0)
+        mapper.process(snapshot(**roll_snapshot), 0.1)
+        mapper.process(snapshot(**roll_snapshot), 0.2)
+
+        moves = [event for event in backend.events if event[0] == "pointer_session_move"]
+        self.assertTrue(moves)
+        self.assertTrue(all(event[2] < 0 for event in moves))
+
     def test_windows_3d_viewer_wrist_rotation_only_runs_while_viewer_window_exists(self) -> None:
         backend = FakeInputBackend()
         backend.active_foreground_process = "Codex.exe"
@@ -760,78 +803,31 @@ class MappingConfigTests(unittest.TestCase):
         mapper = InputMapper(backend, config)
         mapper.set_enabled(True)
 
-        mapper.process(
-            snapshot(
-                wrist_sample_rotate_active=True,
-                wrist_sample_rotate_direction="right",
-                wrist_sample_rotate_position=0,
-            ),
-            0.0,
-        )
-        mapper.process(
-            snapshot(
-                wrist_sample_rotate_active=True,
-                wrist_sample_rotate_direction="right",
-                wrist_sample_rotate_position=3,
-            ),
-            0.1,
-        )
+        roll_snapshot = {
+            "wrist_roll_velocity_dps": 25.0,
+            "wrist_roll_velocity_abs_dps": 25.0,
+        }
+        mapper.process(snapshot(**roll_snapshot), 0.0)
+        mapper.process(snapshot(**roll_snapshot), 0.1)
         self.assertNotIn(("mouse_down", "left"), backend.events)
-        self.assertFalse(any(event[0] == "move" for event in backend.events))
+        self.assertFalse(any(event[0] == "pointer_session_move" for event in backend.events))
 
         backend.available_target_processes.add("3DViewer.exe")
-        mapper.process(
-            snapshot(
-                wrist_sample_rotate_active=True,
-                wrist_sample_rotate_direction="right",
-                wrist_sample_rotate_position=6,
-            ),
-            0.2,
-        )
-        mapper.process(
-            snapshot(
-                wrist_sample_rotate_active=True,
-                wrist_sample_rotate_direction="right",
-                wrist_sample_rotate_position=9,
-            ),
-            0.3,
-        )
+        mapper.process(snapshot(**roll_snapshot), 0.2)
+        mapper.process(snapshot(**roll_snapshot), 0.3)
         self.assertTrue(any(event[0] == "pointer_session_begin" for event in backend.events))
         self.assertNotIn(("mouse_down", "left"), backend.events)
 
-        mapper.process(
-            snapshot(
-                wrist_sample_rotate_active=True,
-                wrist_sample_rotate_direction="right",
-                wrist_sample_rotate_position=12,
-            ),
-            0.4,
-        )
-        self.assertNotIn(("mouse_down", "left"), backend.events)
-
-        mapper.process(
-            snapshot(
-                wrist_sample_rotate_active=True,
-                wrist_sample_rotate_direction="right",
-                wrist_sample_rotate_position=15,
-            ),
-            0.5,
-        )
+        mapper.process(snapshot(**roll_snapshot), 0.4)
+        mapper.process(snapshot(**roll_snapshot), 0.5)
         self.assertIn(
-            ("pointer_session_move", "windows3dviewer_wrist_forearm_orbit_follow", 12, 0),
+            ("pointer_session_move", "windows3dviewer_wrist_roll_rotate", 10, 0),
             backend.events,
         )
         self.assertFalse(any(event[0] in {"move", "move_absolute"} for event in backend.events))
 
         backend.active_foreground_process = "Codex.exe"
-        mapper.process(
-            snapshot(
-                wrist_sample_rotate_active=True,
-                wrist_sample_rotate_direction="right",
-                wrist_sample_rotate_position=18,
-            ),
-            0.6,
-        )
+        mapper.process(snapshot(**roll_snapshot), 0.6)
         self.assertNotIn(("mouse_up", "left"), backend.events)
         self.assertTrue(any(event[0] == "pointer_session_end" for event in backend.events))
 
