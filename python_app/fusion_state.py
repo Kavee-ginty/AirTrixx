@@ -45,6 +45,17 @@ WRIST_VELOCITY_PEAK_SETTLE_S = 0.08
 GESTURE_COOLDOWN_SEC = 0.6
 GESTURE_SUSTAINED_MIN_MS = 120
 GESTURE_PEAK_MULTIPLIER = 1.3
+TWO_HAND_ZOOM_WINDOW_S = 0.36
+TWO_HAND_ZOOM_HALF_WINDOW_S = TWO_HAND_ZOOM_WINDOW_S / 2.0
+TWO_HAND_ZOOM_MIN_DELTA = 0.006
+TWO_HAND_ZOOM_DIRECTION_SUSTAIN_S = 0.32
+WRIST_SAMPLE_ROTATE_FILTER_S = 0.12
+WRIST_SAMPLE_ROTATE_GYRO_Y_DEADZONE = 9.0
+WRIST_SAMPLE_ROTATE_CENTER_TRACK_BAND = 12.0
+WRIST_SAMPLE_ROTATE_CENTER_TRACK_ALPHA = 0.08
+WRIST_SAMPLE_ROTATE_INTEGRATION_GAIN = 1.25
+WRIST_SAMPLE_ROTATE_MAX_STEP_DEG = 2.0
+WRIST_SAMPLE_ROTATE_RELEASE_GRACE_S = 0.24
 
 
 FIELD_ORDER = [
@@ -59,6 +70,8 @@ FIELD_ORDER = [
     "both_hands_distance",
     "both_hands_x_distance",
     "both_hands_y_distance",
+    "two_hand_zoom_delta",
+    "two_hand_zoom_direction",
     "wrist_accel_x",
     "wrist_accel_y",
     "wrist_accel_z",
@@ -67,6 +80,10 @@ FIELD_ORDER = [
     "wrist_gyro_z",
     "wrist_pitch",
     "wrist_roll",
+    "wrist_sample_rotate_position",
+    "wrist_sample_rotate_velocity_dps",
+    "wrist_sample_rotate_direction",
+    "wrist_sample_rotate_active",
     "camdock_battery_level",
     "wristband_battery_level",
     "fans_battery_level",
@@ -119,6 +136,14 @@ class FusionState:
     def __init__(self) -> None:
         self._wrist_axis_history: list[tuple[float, float, float]] = []
         self._wrist_motion_history: list[tuple[float, float, float]] = []
+        self._wrist_sample_rotate_history: list[tuple[float, float]] = []
+        self._wrist_sample_rotate_last_s: float | None = None
+        self._wrist_sample_rotate_last_motion_s: float | None = None
+        self._wrist_sample_rotate_center_y: float | None = None
+        self._wrist_sample_rotate_output_position = 0.0
+        self._two_hand_zoom_history: list[tuple[float, float]] = []
+        self._two_hand_zoom_candidate = "none"
+        self._two_hand_zoom_candidate_since_s = 0.0
         self._gesture_peak_states: dict[str, dict[str, Any]] = {}
 
     @staticmethod
@@ -163,6 +188,127 @@ class FusionState:
             "both_hands_distance": (x_distance * x_distance + y_distance * y_distance) ** 0.5,
             "both_hands_x_distance": x_distance,
             "both_hands_y_distance": y_distance,
+        }
+
+    def _two_hand_zoom_features(
+        self,
+        distance: Any,
+        right_gesture: Any,
+        left_gesture: Any,
+        now_s: float,
+    ) -> dict[str, Any]:
+        distance_number = self._number(distance)
+        both_open = right_gesture == "open_palm" and left_gesture == "open_palm"
+        if distance_number is None or not both_open:
+            self._two_hand_zoom_history.clear()
+            self._two_hand_zoom_candidate = "none"
+            self._two_hand_zoom_candidate_since_s = now_s
+            return {
+                "two_hand_zoom_delta": None,
+                "two_hand_zoom_direction": "none",
+            }
+
+        self._two_hand_zoom_history.append((now_s, distance_number))
+        cutoff_s = now_s - TWO_HAND_ZOOM_WINDOW_S
+        self._two_hand_zoom_history = [item for item in self._two_hand_zoom_history if item[0] >= cutoff_s]
+        split_s = now_s - TWO_HAND_ZOOM_HALF_WINDOW_S
+        previous_values = [value for sample_s, value in self._two_hand_zoom_history if sample_s < split_s]
+        current_values = [value for sample_s, value in self._two_hand_zoom_history if sample_s >= split_s]
+        previous_distance = self._median(previous_values)
+        current_distance = self._median(current_values)
+        if previous_distance is None or current_distance is None:
+            return {
+                "two_hand_zoom_delta": 0.0,
+                "two_hand_zoom_direction": "none",
+            }
+
+        delta = current_distance - previous_distance
+        if delta >= TWO_HAND_ZOOM_MIN_DELTA:
+            candidate = "in"
+        elif delta <= -TWO_HAND_ZOOM_MIN_DELTA:
+            candidate = "out"
+        else:
+            candidate = "none"
+
+        if candidate == "none":
+            self._two_hand_zoom_candidate = "none"
+            self._two_hand_zoom_candidate_since_s = now_s
+            direction = "none"
+        elif candidate != self._two_hand_zoom_candidate:
+            self._two_hand_zoom_candidate = candidate
+            self._two_hand_zoom_candidate_since_s = now_s
+            direction = "none"
+        elif now_s - self._two_hand_zoom_candidate_since_s >= TWO_HAND_ZOOM_DIRECTION_SUSTAIN_S:
+            direction = candidate
+        else:
+            direction = "none"
+        return {
+            "two_hand_zoom_delta": delta,
+            "two_hand_zoom_direction": direction,
+        }
+
+    def _wrist_sample_rotate_features(self, gyro_y: Any, now_s: float) -> dict[str, Any]:
+        gyro_number = self._number(gyro_y)
+        if gyro_number is None:
+            self._wrist_sample_rotate_history.clear()
+            self._wrist_sample_rotate_last_s = None
+            self._wrist_sample_rotate_last_motion_s = None
+            self._wrist_sample_rotate_center_y = None
+            return {
+                "wrist_sample_rotate_position": None,
+                "wrist_sample_rotate_velocity_dps": 0.0,
+                "wrist_sample_rotate_direction": "none",
+                "wrist_sample_rotate_active": False,
+            }
+
+        self._wrist_sample_rotate_history.append((now_s, gyro_number))
+        cutoff_s = now_s - WRIST_SAMPLE_ROTATE_FILTER_S
+        self._wrist_sample_rotate_history = [
+            item for item in self._wrist_sample_rotate_history if item[0] >= cutoff_s
+        ]
+        filtered_gyro = self._median([item[1] for item in self._wrist_sample_rotate_history]) or gyro_number
+        if self._wrist_sample_rotate_center_y is None:
+            self._wrist_sample_rotate_center_y = filtered_gyro
+        velocity = filtered_gyro - self._wrist_sample_rotate_center_y
+        if (
+            abs(velocity) <= WRIST_SAMPLE_ROTATE_CENTER_TRACK_BAND
+            and (
+                self._wrist_sample_rotate_last_motion_s is None
+                or now_s - self._wrist_sample_rotate_last_motion_s > WRIST_SAMPLE_ROTATE_RELEASE_GRACE_S
+            )
+        ):
+            self._wrist_sample_rotate_center_y += velocity * WRIST_SAMPLE_ROTATE_CENTER_TRACK_ALPHA
+            velocity = filtered_gyro - self._wrist_sample_rotate_center_y
+        if abs(velocity) < WRIST_SAMPLE_ROTATE_GYRO_Y_DEADZONE:
+            velocity = 0.0
+
+        if velocity > 0.0:
+            direction = "right"
+        elif velocity < 0.0:
+            direction = "left"
+        else:
+            direction = "none"
+        if direction != "none":
+            self._wrist_sample_rotate_last_motion_s = now_s
+        active = (
+            self._wrist_sample_rotate_last_motion_s is not None
+            and now_s - self._wrist_sample_rotate_last_motion_s <= WRIST_SAMPLE_ROTATE_RELEASE_GRACE_S
+        )
+
+        previous_s = self._wrist_sample_rotate_last_s
+        self._wrist_sample_rotate_last_s = now_s
+        dt_s = 0.0 if previous_s is None else max(0.0, min(0.1, now_s - previous_s))
+        output_step = velocity * dt_s * WRIST_SAMPLE_ROTATE_INTEGRATION_GAIN
+        output_step = max(
+            -WRIST_SAMPLE_ROTATE_MAX_STEP_DEG,
+            min(WRIST_SAMPLE_ROTATE_MAX_STEP_DEG, output_step),
+        )
+        self._wrist_sample_rotate_output_position += output_step
+        return {
+            "wrist_sample_rotate_position": self._wrist_sample_rotate_output_position,
+            "wrist_sample_rotate_velocity_dps": velocity,
+            "wrist_sample_rotate_direction": direction,
+            "wrist_sample_rotate_active": active,
         }
 
     @staticmethod
@@ -833,6 +979,7 @@ class FusionState:
         wrist_pitch = wrist.get("pitch")
         wrist_roll = wrist.get("roll")
 
+        hand_distance_features = self._hand_distance_features(right, left)
         input_dict = {
             "right_hand_x": right.get("x") if right.get("visible") else None,
             "right_hand_y": self._camera_y_up(right),
@@ -842,7 +989,13 @@ class FusionState:
             "left_hand_y": self._camera_y_up(left),
             "left_hand_z_mm": tof.get("left_mm"),
             "left_hand_gesture": left.get("gesture") if left.get("visible") else None,
-            **self._hand_distance_features(right, left),
+            **hand_distance_features,
+            **self._two_hand_zoom_features(
+                hand_distance_features["both_hands_distance"],
+                right.get("gesture") if right.get("visible") else None,
+                left.get("gesture") if left.get("visible") else None,
+                now_s,
+            ),
             "wrist_accel_x": accel.get("x"),
             "wrist_accel_y": accel.get("y"),
             "wrist_accel_z": accel.get("z"),
@@ -851,6 +1004,7 @@ class FusionState:
             "wrist_gyro_z": gyro.get("z"),
             "wrist_pitch": wrist_pitch,
             "wrist_roll": wrist_roll,
+            **self._wrist_sample_rotate_features(gyro.get("y"), now_s),
             "camdock_battery_level": camdock.get("battery_level"),
             "wristband_battery_level": wrist.get("battery_level"),
             "fans_battery_level": fans.get("battery_level") if isinstance(fans, dict) else None,

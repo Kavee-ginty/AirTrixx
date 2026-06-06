@@ -16,12 +16,9 @@ MAPPING_SCHEMA_VERSION = 1
 DEFAULT_PROFILE_NAME = "Default"
 THREEDVIEWER_PROFILE_NAME = "3dviewer.net"
 WINDOWS_3D_VIEWER_PROFILE_NAME = "Windows 3D Viewer"
-THREEDVIEWER_ZOOM_DEPTH_DELTA_MM = 25
-THREEDVIEWER_ZOOM_HAND_DISTANCE_DELTA = 0.06
-THREEDVIEWER_ZOOM_SCROLL_STEPS = 8
-THREEDVIEWER_WRIST_ROLL_DELTA_DEG = 10
+THREEDVIEWER_ZOOM_SCROLL_INTERVAL_MS = 140
 THREEDVIEWER_WRIST_ORBIT_PX_PER_DEG = 4.0
-THREEDVIEWER_WRIST_ORBIT_MAX_STEP_PX = 160.0
+THREEDVIEWER_WRIST_ORBIT_MAX_STEP_PX = 18.0
 DEFAULT_MAPPING_PATH = MAPPING_PATH
 
 ACTION_TYPES = {
@@ -208,6 +205,7 @@ class MappingAction:
     type: str = "keyboard_tap"
     keys: list[str] = field(default_factory=list)
     button: str = "left"
+    drag_button: str = ""
     clicks: int = 1
     interval_ms: int = 250
     scroll_x: int = 0
@@ -226,6 +224,11 @@ class MappingAction:
     delta_y_angle: bool = False
     delta_max_step: float = 160.0
     center_before: bool = False
+    foreground_process: str = ""
+    hide_cursor_during_action: bool = False
+    restore_cursor_after_action: bool = False
+    pointer_session_warmup_ms: int = 0
+    pointer_mode: str = ""
     continuous: bool = False
 
     @classmethod
@@ -239,6 +242,11 @@ class MappingAction:
             type=action_type,
             keys=parse_key_combo(data.get("keys", [])),
             button=normalize_mouse_button(str(data.get("button", "left"))),
+            drag_button=(
+                normalize_mouse_button(str(data.get("drag_button")))
+                if data.get("drag_button")
+                else ""
+            ),
             clicks=max(1, int(float(data.get("clicks", 1) or 1))),
             interval_ms=max(20, int(float(data.get("interval_ms", 250) or 250))),
             scroll_x=int(float(data.get("scroll_x", 0) or 0)),
@@ -257,6 +265,11 @@ class MappingAction:
             delta_y_angle=bool(data.get("delta_y_angle", False)),
             delta_max_step=max(1.0, float(data.get("delta_max_step", 160.0) or 160.0)),
             center_before=bool(data.get("center_before", False)),
+            foreground_process=str(data.get("foreground_process") or ""),
+            hide_cursor_during_action=bool(data.get("hide_cursor_during_action", False)),
+            restore_cursor_after_action=bool(data.get("restore_cursor_after_action", False)),
+            pointer_session_warmup_ms=max(0, int(float(data.get("pointer_session_warmup_ms", 0) or 0))),
+            pointer_mode=str(data.get("pointer_mode") or "").strip().lower(),
             continuous=bool(data.get("continuous", False)),
         )
 
@@ -265,6 +278,7 @@ class MappingAction:
             "type": self.type,
             "keys": list(self.keys),
             "button": self.button,
+            "drag_button": self.drag_button,
             "clicks": self.clicks,
             "interval_ms": self.interval_ms,
             "scroll_x": self.scroll_x,
@@ -283,6 +297,11 @@ class MappingAction:
             "delta_y_angle": self.delta_y_angle,
             "delta_max_step": self.delta_max_step,
             "center_before": self.center_before,
+            "foreground_process": self.foreground_process,
+            "hide_cursor_during_action": self.hide_cursor_during_action,
+            "restore_cursor_after_action": self.restore_cursor_after_action,
+            "pointer_session_warmup_ms": self.pointer_session_warmup_ms,
+            "pointer_mode": self.pointer_mode,
             "continuous": self.continuous,
         }
 
@@ -312,14 +331,15 @@ class MappingAction:
         if self.type == "mouse_scroll":
             return f"{prefix}scroll x={self.scroll_x} y={self.scroll_y}"
         if self.type == "mouse_move":
+            drag_prefix = f"drag {self.drag_button} + " if self.drag_button else ""
             if self.delta_x_source or self.delta_y_source:
                 parts = []
                 if self.delta_x_source:
                     parts.append(f"x=d({self.delta_x_source})*{self.delta_x_scale:g}")
                 if self.delta_y_source:
                     parts.append(f"y=d({self.delta_y_source})*{self.delta_y_scale:g}")
-                return prefix + "move " + " ".join(parts)
-            return f"{prefix}move x={self.speed_x:g}/s y={self.speed_y:g}/s"
+                return prefix + drag_prefix + "move " + " ".join(parts)
+            return f"{prefix}{drag_prefix}move x={self.speed_x:g}/s y={self.speed_y:g}/s"
         if self.type == "mouse_absolute":
             if self.absolute_x_source or self.absolute_y_source:
                 x_source = self.absolute_x_source or f"{self.absolute_x:.2f}"
@@ -645,43 +665,26 @@ def create_3dviewer_net_profile() -> MappingProfile:
                 ),
             ),
             MappingRule(
-                id="3dviewer_wrist_roll_orbit_hold",
-                name="3dviewer orbit: wrist roll holds left drag",
-                source="fused.wrist_roll_abs_delta",
-                comparator="gt",
-                threshold=THREEDVIEWER_WRIST_ROLL_DELTA_DEG,
-                debounce_ms=60,
-                conditions=[
-                    MappingCondition(source="fused.wrist_roll_dominant", comparator="truthy"),
-                ],
-                action=MappingAction(type="mouse_hold", button="left", center_before=True),
-            ),
-            MappingRule(
-                id="3dviewer_wrist_roll_orbit_follow",
-                name="3dviewer orbit: wrist roll amount rotates model",
-                source="fused.wrist_roll_abs_delta",
-                comparator="gt",
-                threshold=THREEDVIEWER_WRIST_ROLL_DELTA_DEG,
-                debounce_ms=0,
-                conditions=[
-                    MappingCondition(source="fused.wrist_roll_dominant", comparator="truthy"),
-                ],
-                recognition_label="3dviewer wrist orbit",
+                id="3dviewer_wrist_forearm_orbit_follow",
+                name="3dviewer orbit: wristband forearm rotation directly left-drags model",
+                source="fused.wrist_sample_rotate_active",
+                comparator="truthy",
+                recognition_label="wristband forearm rotate",
                 action=MappingAction(
                     type="mouse_move",
-                    delta_x_source="fused.wrist_roll",
-                    delta_x_scale=-THREEDVIEWER_WRIST_ORBIT_PX_PER_DEG,
-                    delta_x_angle=True,
+                    drag_button="left",
+                    delta_x_source="fused.wrist_sample_rotate_position",
+                    delta_x_scale=THREEDVIEWER_WRIST_ORBIT_PX_PER_DEG,
                     delta_max_step=THREEDVIEWER_WRIST_ORBIT_MAX_STEP_PX,
                     center_before=True,
                 ),
             ),
             MappingRule(
-                id="3dviewer_zoom_in_two_hands",
-                name="zoom_in: both open hands move apart",
-                source="fused.both_hands_distance",
-                comparator="delta_increase",
-                threshold=THREEDVIEWER_ZOOM_HAND_DISTANCE_DELTA,
+                id="3dviewer_zoom_in_samples",
+                name="zoom_in: recorded open palms move apart smoothly",
+                source="fused.two_hand_zoom_direction",
+                comparator="eq",
+                threshold="in",
                 conditions=[
                     MappingCondition(source="hands.left.gesture", comparator="eq", threshold="open_palm"),
                     MappingCondition(source="hands.right.gesture", comparator="eq", threshold="open_palm"),
@@ -689,17 +692,17 @@ def create_3dviewer_net_profile() -> MappingProfile:
                 recognition_label="zoom_in",
                 action=MappingAction(
                     type="mouse_scroll",
-                    scroll_y=THREEDVIEWER_ZOOM_SCROLL_STEPS,
-                    interval_ms=120,
+                    scroll_y=1,
+                    interval_ms=THREEDVIEWER_ZOOM_SCROLL_INTERVAL_MS,
                     center_before=True,
                 ),
             ),
             MappingRule(
-                id="3dviewer_zoom_out_two_hands",
-                name="zoom_out: both open hands move closer",
-                source="fused.both_hands_distance",
-                comparator="delta_decrease",
-                threshold=THREEDVIEWER_ZOOM_HAND_DISTANCE_DELTA,
+                id="3dviewer_zoom_out_samples",
+                name="zoom_out: recorded open palms move closer smoothly",
+                source="fused.two_hand_zoom_direction",
+                comparator="eq",
+                threshold="out",
                 conditions=[
                     MappingCondition(source="hands.left.gesture", comparator="eq", threshold="open_palm"),
                     MappingCondition(source="hands.right.gesture", comparator="eq", threshold="open_palm"),
@@ -707,66 +710,8 @@ def create_3dviewer_net_profile() -> MappingProfile:
                 recognition_label="zoom_out",
                 action=MappingAction(
                     type="mouse_scroll",
-                    scroll_y=-THREEDVIEWER_ZOOM_SCROLL_STEPS,
-                    interval_ms=120,
-                    center_before=True,
-                ),
-            ),
-            MappingRule(
-                id="3dviewer_zoom_in_depth",
-                name="3dviewer zoom in: pointing hand moves closer",
-                source="hands.right.z_mm",
-                comparator="delta_decrease",
-                threshold=THREEDVIEWER_ZOOM_DEPTH_DELTA_MM,
-                gate_source="hands.right.gesture",
-                gate_comparator="eq",
-                gate_threshold="index_finger_up",
-                recognition_label="3dviewer zoom in",
-                action=MappingAction(
-                    type="mouse_scroll",
-                    scroll_y=THREEDVIEWER_ZOOM_SCROLL_STEPS,
-                    interval_ms=120,
-                    center_before=True,
-                ),
-            ),
-            MappingRule(
-                id="3dviewer_zoom_out_depth",
-                name="3dviewer zoom out: pointing hand moves away",
-                source="hands.right.z_mm",
-                comparator="delta_increase",
-                threshold=THREEDVIEWER_ZOOM_DEPTH_DELTA_MM,
-                gate_source="hands.right.gesture",
-                gate_comparator="eq",
-                gate_threshold="index_finger_up",
-                recognition_label="3dviewer zoom out",
-                action=MappingAction(
-                    type="mouse_scroll",
-                    scroll_y=-THREEDVIEWER_ZOOM_SCROLL_STEPS,
-                    interval_ms=120,
-                    center_before=True,
-                ),
-            ),
-            MappingRule(
-                id="3dviewer_zoom_in_wrist",
-                name="3dviewer zoom in: wrist pitch up",
-                source="fused.wrist_pitch_up_detected",
-                comparator="truthy",
-                recognition_label="3dviewer zoom in",
-                action=MappingAction(
-                    type="mouse_scroll",
-                    scroll_y=THREEDVIEWER_ZOOM_SCROLL_STEPS,
-                    center_before=True,
-                ),
-            ),
-            MappingRule(
-                id="3dviewer_zoom_out_wrist",
-                name="3dviewer zoom out: wrist pitch down",
-                source="fused.wrist_pitch_down_detected",
-                comparator="truthy",
-                recognition_label="3dviewer zoom out",
-                action=MappingAction(
-                    type="mouse_scroll",
-                    scroll_y=-THREEDVIEWER_ZOOM_SCROLL_STEPS,
+                    scroll_y=-1,
+                    interval_ms=THREEDVIEWER_ZOOM_SCROLL_INTERVAL_MS,
                     center_before=True,
                 ),
             ),
@@ -776,13 +721,26 @@ def create_3dviewer_net_profile() -> MappingProfile:
 
 def create_windows_3d_viewer_profile() -> MappingProfile:
     """Create a profile for the native Windows 3D Viewer app."""
-    return MappingProfile(
-        name=WINDOWS_3D_VIEWER_PROFILE_NAME,
-        mappings=_clone_viewer_mappings(
+    mappings = [
+        rule
+        for rule in _clone_viewer_mappings(
             create_3dviewer_net_profile().mappings,
             id_prefix="windows3dviewer",
             label="Windows 3D Viewer",
-        ),
+        )
+        if rule.source in {"fused.wrist_sample_rotate_active", "fused.two_hand_zoom_direction"}
+    ]
+    for rule in mappings:
+        if rule.source != "fused.wrist_sample_rotate_active":
+            continue
+        rule.action.foreground_process = "3DViewer.exe"
+        rule.action.hide_cursor_during_action = False
+        rule.action.restore_cursor_after_action = False
+        rule.action.pointer_session_warmup_ms = 160
+        rule.action.pointer_mode = "touch"
+    return MappingProfile(
+        name=WINDOWS_3D_VIEWER_PROFILE_NAME,
+        mappings=mappings,
     )
 
 
@@ -874,6 +832,8 @@ class _RuntimeState:
     residual_x: float = 0.0
     residual_y: float = 0.0
     delta_source_values: dict[str, float] = field(default_factory=dict)
+    pointer_session_ready: bool = False
+    pointer_session_started_s: float | None = None
     status: str = "idle"
 
 
@@ -1014,6 +974,7 @@ class InputMapper:
             )
         for holder_id in holder_ids:
             self._release_holder(holder_id)
+            self._end_pointer_session(holder_id)
 
     def _release_holder(self, holder_id: str) -> None:
         for token in list(self._rule_keys.get(holder_id, set())):
@@ -1045,11 +1006,17 @@ class InputMapper:
         self._rule_keys.clear()
         self._rule_buttons.clear()
         self._delta_anchors.clear()
+        end_pointer_session = getattr(self.backend, "end_pointer_session", None)
+        if callable(end_pointer_session):
+            for rule_id in list(self._states):
+                end_pointer_session(rule_id)
         for state in self._states.values():
             state.active = False
             state.pending_desired = None
             state.enter_blocked = False
             state.delta_source_values.clear()
+            state.pointer_session_ready = False
+            state.pointer_session_started_s = None
             state.status = "idle"
 
     def test_action(self, action: MappingAction) -> None:
@@ -1064,7 +1031,10 @@ class InputMapper:
         if action.type == "mouse_hold":
             self.backend.click_mouse(action.button, 1)
             return
-        self._execute_enter(MappingRule(id="__test__", name="Test action", action=action), action, time.monotonic())
+        test_rule = MappingRule(id="__test__", name="Test action", action=action)
+        self._execute_enter(test_rule, action, time.monotonic())
+        if action.foreground_process:
+            self.release_rule(test_rule.id, include_modifiers=False)
 
     def state_for_rule(self, rule_id: str) -> _RuntimeState:
         return self._states.setdefault(rule_id, _RuntimeState())
@@ -1113,6 +1083,8 @@ class InputMapper:
             state.enter_blocked = False
             state.delta_source_values.clear()
             self.release_rule(rule.id, include_modifiers=False)
+            state.pointer_session_ready = False
+            state.pointer_session_started_s = None
             return
 
         if state.active and not state.enter_blocked:
@@ -1137,7 +1109,14 @@ class InputMapper:
 
     def _execute_enter(self, rule: MappingRule, action: MappingAction, now_s: float) -> None:
         rule_id = rule.id
-        if action.center_before:
+        state = self._states.setdefault(rule_id, _RuntimeState())
+        if action.foreground_process:
+            state.pointer_session_ready = self._begin_pointer_session(rule_id, action)
+            if not state.pointer_session_ready:
+                state.status = "waiting for target window"
+                return
+            state.pointer_session_started_s = now_s
+        elif action.center_before:
             self._move_cursor_to_center()
         if action.type == "keyboard_tap":
             self.backend.tap_keys(action.keys)
@@ -1149,11 +1128,12 @@ class InputMapper:
             self.backend.click_mouse(action.button, action.clicks)
         elif action.type == "mouse_hold":
             self._hold_mouse(rule_id, action.button)
+        elif action.type == "mouse_move" and action.drag_button and not action.foreground_process:
+            self._hold_mouse(rule_id, action.drag_button)
         elif action.type == "mouse_scroll":
             self.backend.scroll(action.scroll_x, action.scroll_y)
         elif action.type == "mouse_absolute" and not action.continuous:
             self._move_absolute(action)
-        state = self._states.setdefault(rule_id, _RuntimeState())
         state.last_fired_s = now_s
         state.last_repeat_s = now_s
         if rule.recognition_label:
@@ -1287,13 +1267,64 @@ class InputMapper:
             state.last_fired_s = now_s
             state.last_repeat_s = now_s
         elif action.type == "mouse_move":
+            if action.foreground_process:
+                if state.pointer_session_ready and not self._pointer_session_active(rule_id):
+                    self.release_rule(rule_id, include_modifiers=False)
+                    state.pointer_session_ready = False
+                    state.delta_source_values.clear()
+                    return
+                if not state.pointer_session_ready:
+                    state.pointer_session_ready = self._begin_pointer_session(rule_id, action)
+                    if not state.pointer_session_ready:
+                        state.delta_source_values.clear()
+                        return
+                    state.pointer_session_started_s = now_s
+                warmup_s = max(0.0, action.pointer_session_warmup_ms / 1000.0)
+                started_s = state.pointer_session_started_s if state.pointer_session_started_s is not None else now_s
+                if now_s - started_s < warmup_s:
+                    state.delta_source_values.clear()
+                    return
+                if (
+                    action.pointer_mode != "touch"
+                    and action.drag_button
+                    and action.drag_button not in self._rule_buttons.get(rule_id, set())
+                ):
+                    self._hold_mouse(rule_id, action.drag_button)
             last = state.last_process_s if state.last_process_s is not None else now_s
             dt = max(0.0, min(0.2, now_s - last))
             state.last_process_s = now_s
-            self._move_relative(action, state, dt, now_s, signals)
+            self._move_relative(rule_id, action, state, dt, now_s, signals)
         elif action.type == "mouse_absolute" and action.continuous:
             self._move_absolute(action, signals)
             state.last_fired_s = now_s
+
+    def _begin_pointer_session(self, rule_id: str, action: MappingAction) -> bool:
+        begin_pointer_session = getattr(self.backend, "begin_pointer_session", None)
+        if not callable(begin_pointer_session):
+            return False
+        return bool(
+            begin_pointer_session(
+                rule_id,
+                foreground_process=action.foreground_process,
+                center_in_foreground=action.center_before,
+                hide_cursor=action.hide_cursor_during_action,
+                restore_cursor=action.restore_cursor_after_action,
+                pointer_mode=action.pointer_mode,
+            )
+        )
+
+    def _pointer_session_active(self, rule_id: str) -> bool:
+        pointer_session_active = getattr(self.backend, "pointer_session_active", None)
+        return bool(callable(pointer_session_active) and pointer_session_active(rule_id))
+
+    def _end_pointer_session(self, rule_id: str) -> None:
+        end_pointer_session = getattr(self.backend, "end_pointer_session", None)
+        if callable(end_pointer_session):
+            end_pointer_session(rule_id)
+        state = self._states.get(rule_id)
+        if state is not None:
+            state.pointer_session_ready = False
+            state.pointer_session_started_s = None
 
     def _hold_keys(self, rule_id: str, tokens: list[str]) -> None:
         for token in tokens:
@@ -1315,6 +1346,7 @@ class InputMapper:
 
     def _move_relative(
         self,
+        rule_id: str,
         action: MappingAction,
         state: _RuntimeState,
         dt: float,
@@ -1345,7 +1377,11 @@ class InputMapper:
         state.residual_x = move_x - step_x
         state.residual_y = move_y - step_y
         if step_x or step_y:
-            self.backend.move(step_x, step_y)
+            move_pointer_session = getattr(self.backend, "move_pointer_session", None)
+            if action.pointer_mode and callable(move_pointer_session):
+                move_pointer_session(rule_id, step_x, step_y)
+            else:
+                self.backend.move(step_x, step_y)
             state.last_fired_s = now_s
 
     @staticmethod

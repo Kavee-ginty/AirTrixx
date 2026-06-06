@@ -36,7 +36,6 @@ from input_mapper import (
     MappingRule,
     SignalCatalog,
     THREEDVIEWER_PROFILE_NAME,
-    THREEDVIEWER_ZOOM_HAND_DISTANCE_DELTA,
     WINDOWS_3D_VIEWER_PROFILE_NAME,
     load_mapping_config,
     save_mapping_config,
@@ -1343,10 +1342,10 @@ class AirTrixxGUI:
             self._testing_raw_rule(
                 "raw:zoom_in",
                 "zoom_in",
-                "Two-hand zoom",
-                "fused.both_hands_distance",
-                "delta_increase",
-                THREEDVIEWER_ZOOM_HAND_DISTANCE_DELTA,
+                "Recorded two-hand zoom",
+                "fused.two_hand_zoom_direction",
+                "eq",
+                "in",
                 debounce_ms=0,
                 conditions=[
                     MappingCondition(source="hands.left.gesture", comparator="eq", threshold="open_palm"),
@@ -1356,10 +1355,10 @@ class AirTrixxGUI:
             self._testing_raw_rule(
                 "raw:zoom_out",
                 "zoom_out",
-                "Two-hand zoom",
-                "fused.both_hands_distance",
-                "delta_decrease",
-                THREEDVIEWER_ZOOM_HAND_DISTANCE_DELTA,
+                "Recorded two-hand zoom",
+                "fused.two_hand_zoom_direction",
+                "eq",
+                "out",
                 debounce_ms=0,
                 conditions=[
                     MappingCondition(source="hands.left.gesture", comparator="eq", threshold="open_palm"),
@@ -1367,22 +1366,22 @@ class AirTrixxGUI:
                 ],
             ),
             self._testing_raw_rule(
-                "raw:wrist_roll_right",
-                "Wrist roll right",
+                "raw:rotate_right",
+                "rotate_right",
                 "Wristband",
-                "fused.wrist_roll_right_detected",
-                "truthy",
-                True,
-                debounce_ms=120,
+                "fused.wrist_sample_rotate_direction",
+                "eq",
+                "right",
+                debounce_ms=0,
             ),
             self._testing_raw_rule(
-                "raw:wrist_roll_left",
-                "Wrist roll left",
+                "raw:rotate_left",
+                "rotate_left",
                 "Wristband",
-                "fused.wrist_roll_left_detected",
-                "truthy",
-                True,
-                debounce_ms=120,
+                "fused.wrist_sample_rotate_direction",
+                "eq",
+                "left",
+                debounce_ms=0,
             ),
             self._testing_raw_rule(
                 "raw:wrist_roll_right_then_neutral",
@@ -1630,6 +1629,8 @@ class AirTrixxGUI:
             f"R z {value('hands.right.z_mm')} mm",
             f"pitch {value('fused.wrist_pitch')}",
             f"roll {value('fused.wrist_roll')}",
+            f"sample rotate {value('fused.wrist_sample_rotate_direction')}",
+            f"sample rotate v {value('fused.wrist_sample_rotate_velocity_dps')}",
             f"pitch d {value('fused.wrist_pitch_delta')}",
             f"roll d {value('fused.wrist_roll_delta')}",
             f"pitch v {value('fused.wrist_pitch_velocity_dps')}",
@@ -1859,8 +1860,8 @@ class AirTrixxGUI:
         status = ", viewer opened. " if opened_target else ". "
         self.log(
             f"{label} Mode: profile armed{status}"
-            f"Left fist + right hand movement orbits, wrist roll rotates, right fist pans, index finger points, "
-            f"and open hands apart/together zooms. {focus_hint}"
+            f"Left fist + right hand movement orbits, wristband forearm rotation directly rotates the model, right fist pans, index finger points, "
+            f"and the recorded open-palm zoom_in/zoom_out gestures zoom smoothly. {focus_hint}"
         )
 
     def _schedule_mapping_views_refresh(self) -> None:
@@ -2358,6 +2359,7 @@ class AirTrixxGUI:
                     "type": action_type_var.get(),
                     "keys": parse_key_combo(keys_var.get()),
                     "button": button_var.get(),
+                    "drag_button": working.action.drag_button,
                     "clicks": clicks_var.get(),
                     "interval_ms": interval_var.get(),
                     "scroll_x": scroll_x_var.get(),
@@ -2376,6 +2378,11 @@ class AirTrixxGUI:
                     "delta_y_angle": working.action.delta_y_angle,
                     "delta_max_step": working.action.delta_max_step,
                     "center_before": center_before_var.get(),
+                    "foreground_process": working.action.foreground_process,
+                    "hide_cursor_during_action": working.action.hide_cursor_during_action,
+                    "restore_cursor_after_action": working.action.restore_cursor_after_action,
+                    "pointer_session_warmup_ms": working.action.pointer_session_warmup_ms,
+                    "pointer_mode": working.action.pointer_mode,
                     "continuous": continuous_var.get(),
                 }
             )
@@ -4520,7 +4527,7 @@ class AirTrixxGUI:
         if recognition_status:
             add(recognition_status)
         if time.monotonic() < self._3d_viewer_mode_hint_until_s:
-            add("3D Viewer: left fist orbit, wrist roll rotate, right fist pan, open hands zoom")
+            add("3D Viewer: left fist orbit, wristband forearm rotate, right fist pan, recorded open-palms zoom")
         if self.camera_centering_active:
             add(camera_status)
         if self.hand_calibration_active or self.startup_hand_calibration_pending:

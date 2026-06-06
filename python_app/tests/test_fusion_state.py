@@ -10,14 +10,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fusion_state import FusionState
 
 
-def serial_with_wrist(*, pitch: float, roll: float) -> dict[str, object]:
+def serial_with_wrist(*, pitch: float, roll: float, gyro_y: float = 20.0) -> dict[str, object]:
     return {
         "devices": {
             "wristband": {
                 "pitch": pitch,
                 "roll": roll,
                 "accel": {},
-                "gyro": {},
+                "gyro": {"y": gyro_y},
             },
             "camdock": {"tof": {}},
             "keyboard": {"tof": {}},
@@ -57,6 +57,46 @@ class FusionStateTests(unittest.TestCase):
         self.assertIsNone(values["both_hands_x_distance"])
         self.assertIsNone(values["both_hands_y_distance"])
 
+    def test_recorded_open_palm_motion_produces_stable_zoom_direction(self) -> None:
+        fusion = FusionState()
+        directions = []
+        for index, distance in enumerate((0.20, 0.22, 0.24, 0.26, 0.28, 0.30, 0.32)):
+            values = fusion.build_input_dict(
+                serial_with_wrist(pitch=0, roll=0),
+                {
+                    "right": {"visible": True, "x": 0.5 - distance / 2, "y": 0.5, "gesture": "open_palm"},
+                    "left": {"visible": True, "x": 0.5 + distance / 2, "y": 0.5, "gesture": "open_palm"},
+                },
+                now_s=index * 0.1,
+            )
+            directions.append(values["two_hand_zoom_direction"])
+
+        self.assertEqual(directions[:6], ["none"] * 6)
+        self.assertEqual(directions[-1], "in")
+
+    def test_recorded_zoom_direction_stops_when_a_palm_closes(self) -> None:
+        fusion = FusionState()
+        for index, distance in enumerate((0.20, 0.22, 0.24, 0.26, 0.28, 0.30, 0.32)):
+            values = fusion.build_input_dict(
+                serial_with_wrist(pitch=0, roll=0),
+                {
+                    "right": {"visible": True, "x": 0.5 - distance / 2, "y": 0.5, "gesture": "open_palm"},
+                    "left": {"visible": True, "x": 0.5 + distance / 2, "y": 0.5, "gesture": "open_palm"},
+                },
+                now_s=index * 0.1,
+            )
+        self.assertEqual(values["two_hand_zoom_direction"], "in")
+
+        values = fusion.build_input_dict(
+            serial_with_wrist(pitch=0, roll=0),
+            {
+                "right": {"visible": True, "x": 0.34, "y": 0.5, "gesture": "closed_fist"},
+                "left": {"visible": True, "x": 0.66, "y": 0.5, "gesture": "open_palm"},
+            },
+            now_s=0.7,
+        )
+        self.assertEqual(values["two_hand_zoom_direction"], "none")
+
     def test_wrist_roll_dominates_pitch_when_roll_delta_is_larger(self) -> None:
         fusion = FusionState()
         fusion.build_input_dict(serial_with_wrist(pitch=0, roll=0), {}, now_s=0.0)
@@ -84,6 +124,126 @@ class FusionStateTests(unittest.TestCase):
 
         self.assertAlmostEqual(values["wrist_roll_delta"], 30)
         self.assertTrue(values["wrist_roll_dominant"])
+
+    def test_recorded_wristband_forearm_rotation_directly_uses_positive_gyro_y(self) -> None:
+        fusion = FusionState()
+        directions = []
+        positions = []
+        for index, gyro_y in enumerate((20, 35, 35, 35, 35, 35)):
+            values = fusion.build_input_dict(
+                serial_with_wrist(pitch=0, roll=-30, gyro_y=gyro_y),
+                {},
+                now_s=index * 0.1,
+            )
+            directions.append(values["wrist_sample_rotate_direction"])
+            positions.append(values["wrist_sample_rotate_position"])
+
+        self.assertEqual(directions[-3:], ["right", "right", "right"])
+        self.assertGreater(values["wrist_sample_rotate_velocity_dps"], 0)
+        self.assertGreater(positions[-1], positions[-2])
+        self.assertTrue(values["wrist_sample_rotate_active"])
+
+    def test_recorded_wristband_forearm_rotation_directly_uses_negative_gyro_y(self) -> None:
+        fusion = FusionState()
+        directions = []
+        positions = []
+        for index, gyro_y in enumerate((20, 5, 5, 5, 5, 5)):
+            values = fusion.build_input_dict(
+                serial_with_wrist(pitch=0, roll=-30, gyro_y=gyro_y),
+                {},
+                now_s=index * 0.1,
+            )
+            directions.append(values["wrist_sample_rotate_direction"])
+            positions.append(values["wrist_sample_rotate_position"])
+
+        self.assertEqual(directions[-3:], ["left", "left", "left"])
+        self.assertLess(values["wrist_sample_rotate_velocity_dps"], 0)
+        self.assertLess(positions[-1], positions[-2])
+        self.assertTrue(values["wrist_sample_rotate_active"])
+
+    def test_recorded_wristband_forearm_rotation_ignores_pitch_and_roll_without_gyro_motion(self) -> None:
+        fusion = FusionState()
+        for index, roll in enumerate((-30, -10, 20, 50, 80, 110)):
+            values = fusion.build_input_dict(
+                serial_with_wrist(pitch=index * 10, roll=roll, gyro_y=20),
+                {},
+                now_s=index * 0.1,
+            )
+
+        self.assertEqual(values["wrist_sample_rotate_direction"], "none")
+        self.assertFalse(values["wrist_sample_rotate_active"])
+
+    def test_recorded_wristband_forearm_rotation_releases_after_neutral_pause(self) -> None:
+        fusion = FusionState()
+        now_s = 0.0
+        for gyro_y in (20, 35, 35, 35, 35):
+            values = fusion.build_input_dict(
+                serial_with_wrist(pitch=0, roll=-30, gyro_y=gyro_y),
+                {},
+                now_s=now_s,
+            )
+            now_s += 0.1
+        self.assertEqual(values["wrist_sample_rotate_direction"], "right")
+
+        for _ in range(4):
+            values = fusion.build_input_dict(
+                serial_with_wrist(pitch=0, roll=-30, gyro_y=20),
+                {},
+                now_s=now_s,
+            )
+            now_s += 0.1
+
+        self.assertEqual(values["wrist_sample_rotate_direction"], "none")
+        self.assertFalse(values["wrist_sample_rotate_active"])
+
+    def test_recorded_wristband_forearm_rotation_stays_active_through_brief_neutral_gap(self) -> None:
+        fusion = FusionState()
+        for index, gyro_y in enumerate((20, 35, 35, 35)):
+            values = fusion.build_input_dict(
+                serial_with_wrist(pitch=0, roll=-30, gyro_y=gyro_y),
+                {},
+                now_s=index * 0.1,
+            )
+        self.assertTrue(values["wrist_sample_rotate_active"])
+
+        values = fusion.build_input_dict(
+            serial_with_wrist(pitch=0, roll=-30, gyro_y=20),
+            {},
+            now_s=0.4,
+        )
+        self.assertTrue(values["wrist_sample_rotate_active"])
+
+        values = fusion.build_input_dict(
+            serial_with_wrist(pitch=0, roll=-30, gyro_y=20),
+            {},
+            now_s=0.5,
+        )
+        self.assertEqual(values["wrist_sample_rotate_direction"], "none")
+        self.assertTrue(values["wrist_sample_rotate_active"])
+
+    def test_recorded_wristband_forearm_rotation_auto_zeros_nonstandard_idle_gyro(self) -> None:
+        fusion = FusionState()
+        for index in range(12):
+            values = fusion.build_input_dict(
+                serial_with_wrist(pitch=0, roll=-30, gyro_y=-38),
+                {},
+                now_s=index * 0.1,
+            )
+
+        self.assertEqual(values["wrist_sample_rotate_direction"], "none")
+        self.assertFalse(values["wrist_sample_rotate_active"])
+        self.assertEqual(values["wrist_sample_rotate_position"], 0)
+
+        for index in range(12, 16):
+            values = fusion.build_input_dict(
+                serial_with_wrist(pitch=0, roll=-30, gyro_y=-20),
+                {},
+                now_s=index * 0.1,
+            )
+
+        self.assertEqual(values["wrist_sample_rotate_direction"], "right")
+        self.assertTrue(values["wrist_sample_rotate_active"])
+        self.assertGreater(values["wrist_sample_rotate_position"], 0)
 
     def test_trained_roll_right_detects_held_large_roll(self) -> None:
         fusion = FusionState()

@@ -18,6 +18,7 @@ from input_mapper import (
     MappingConfig,
     MappingRule,
     THREEDVIEWER_PROFILE_NAME,
+    THREEDVIEWER_ZOOM_SCROLL_INTERVAL_MS,
     WINDOWS_3D_VIEWER_PROFILE_NAME,
     SignalCatalog,
     default_mapping_config,
@@ -224,6 +225,32 @@ class InputMapperRuntimeTests(unittest.TestCase):
         mapper.process(snapshot(active=True, roll=350), 0.1)
         mapper.process(snapshot(active=True, roll=10), 0.2)
         self.assertEqual(backend.events, [("move", 40, 0), ("move", -80, 0)])
+
+    def test_mouse_move_drag_holds_button_during_movement_and_releases_on_exit(self) -> None:
+        rule = MappingRule(
+            source="fused.active",
+            comparator="truthy",
+            action=MappingAction(
+                type="mouse_move",
+                drag_button="left",
+                delta_x_source="fused.position",
+                delta_x_scale=4,
+                center_before=True,
+            ),
+        )
+        mapper, backend = self.mapper_with([rule])
+        mapper.process(snapshot(active=True, position=0), 0.0)
+        mapper.process(snapshot(active=True, position=3), 0.1)
+        mapper.process(snapshot(active=False, position=3), 0.2)
+        self.assertEqual(
+            backend.events,
+            [
+                ("move_absolute", 959, 539),
+                ("mouse_down", "left"),
+                ("move", 12, 0),
+                ("mouse_up", "left"),
+            ],
+        )
 
     def test_action_can_center_cursor_before_firing(self) -> None:
         rule = MappingRule(
@@ -442,7 +469,34 @@ class MappingConfigTests(unittest.TestCase):
         profile = next(profile for profile in config.profiles if profile.name == THREEDVIEWER_PROFILE_NAME)
         self.assertGreaterEqual(len(profile.mappings), 8)
         windows_profile = next(profile for profile in config.profiles if profile.name == WINDOWS_3D_VIEWER_PROFILE_NAME)
-        self.assertEqual(len(windows_profile.mappings), len(profile.mappings))
+        self.assertEqual(len(windows_profile.mappings), 3)
+        for viewer_profile in (profile, windows_profile):
+            zoom_rules = [rule for rule in viewer_profile.mappings if rule.action.type == "mouse_scroll"]
+            self.assertEqual(len(zoom_rules), 2)
+            self.assertEqual({rule.recognition_label for rule in zoom_rules}, {"zoom_in", "zoom_out"})
+            self.assertTrue(all(abs(rule.action.scroll_y) == 1 for rule in zoom_rules))
+            self.assertTrue(all(rule.action.interval_ms == THREEDVIEWER_ZOOM_SCROLL_INTERVAL_MS for rule in zoom_rules))
+            self.assertTrue(all(rule.source == "fused.two_hand_zoom_direction" for rule in zoom_rules))
+            self.assertEqual({rule.threshold for rule in zoom_rules}, {"in", "out"})
+            wrist_drag_rules = [
+                rule
+                for rule in viewer_profile.mappings
+                if rule.source == "fused.wrist_sample_rotate_active"
+            ]
+            self.assertEqual(len(wrist_drag_rules), 1)
+            self.assertEqual(wrist_drag_rules[0].action.type, "mouse_move")
+            self.assertEqual(wrist_drag_rules[0].action.drag_button, "left")
+            self.assertTrue(wrist_drag_rules[0].action.center_before)
+        windows_wrist_rule = next(
+            rule
+            for rule in windows_profile.mappings
+            if rule.source == "fused.wrist_sample_rotate_active"
+        )
+        self.assertEqual(windows_wrist_rule.action.foreground_process, "3DViewer.exe")
+        self.assertFalse(windows_wrist_rule.action.hide_cursor_during_action)
+        self.assertFalse(windows_wrist_rule.action.restore_cursor_after_action)
+        self.assertEqual(windows_wrist_rule.action.pointer_session_warmup_ms, 160)
+        self.assertEqual(windows_wrist_rule.action.pointer_mode, "touch")
 
     def test_loaded_legacy_config_gets_3dviewer_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -554,34 +608,7 @@ class MappingConfigTests(unittest.TestCase):
             ],
         )
 
-    def test_3dviewer_profile_zooms_with_pointing_depth_change(self) -> None:
-        backend = FakeInputBackend()
-        config = default_mapping_config()
-        config.active_profile = THREEDVIEWER_PROFILE_NAME
-        mapper = InputMapper(backend, config)
-        mapper.set_enabled(True)
-        mapper.process(hand_snapshot({"right_hand_z_mm": 700}, right_visible=True), 0.0)
-        mapper.process(hand_snapshot({"right_hand_z_mm": 600}, right_visible=True), 0.1)
-        self.assertNotIn(("scroll", 0, 1), backend.events)
-
-        pointing_snapshot = {
-            "input_dict": {"right_hand_z_mm": 600},
-            "hand_state": {
-                "right": {
-                    "visible": True,
-                    "x": 0.5,
-                    "y": 0.5,
-                    "score": 1.0,
-                    "gesture": "index_finger_up",
-                }
-            },
-        }
-        mapper.process(pointing_snapshot, 0.2)
-        pointing_snapshot["input_dict"] = {"right_hand_z_mm": 570}
-        mapper.process(pointing_snapshot, 0.3)
-        self.assertIn(("scroll", 0, 8), backend.events)
-
-    def test_3dviewer_profile_zooms_with_two_open_hands(self) -> None:
+    def test_3dviewer_profile_smoothly_zooms_with_recorded_open_palm_gestures(self) -> None:
         backend = FakeInputBackend()
         config = default_mapping_config()
         config.active_profile = THREEDVIEWER_PROFILE_NAME
@@ -589,41 +616,43 @@ class MappingConfigTests(unittest.TestCase):
         mapper.set_enabled(True)
 
         two_open_hands_snapshot = {
-            "input_dict": {"both_hands_distance": 0.25},
+            "input_dict": {"two_hand_zoom_direction": "none"},
             "hand_state": {
                 "left": {"visible": True, "gesture": "open_palm"},
                 "right": {"visible": True, "gesture": "open_palm"},
             },
         }
         mapper.process(two_open_hands_snapshot, 0.0)
+        for now_s in (0.1, 0.25, 0.40):
+            two_open_hands_snapshot["input_dict"] = {"two_hand_zoom_direction": "in"}
+            mapper.process(two_open_hands_snapshot, now_s)
+        for now_s in (0.55, 0.70, 0.85):
+            two_open_hands_snapshot["input_dict"] = {"two_hand_zoom_direction": "out"}
+            mapper.process(two_open_hands_snapshot, now_s)
+
+        scroll_events = [event for event in backend.events if event[0] == "scroll"]
+        self.assertEqual(scroll_events, [("scroll", 0, 1)] * 3 + [("scroll", 0, -1)] * 3)
         self.assertNotIn(("scroll", 0, 8), backend.events)
+        self.assertNotIn(("scroll", 0, -8), backend.events)
+        self.assertIn(("move_absolute", 959, 539), backend.events)
+        self.assertEqual(mapper.last_recognition(max_age_s=1.0, now_s=0.85), "zoom_out")
 
-        two_open_hands_snapshot["input_dict"] = {"both_hands_distance": 0.39}
-        mapper.process(two_open_hands_snapshot, 0.1)
-        self.assertIn(("scroll", 0, 8), backend.events)
-
-        two_open_hands_snapshot["input_dict"] = {"both_hands_distance": 0.23}
-        mapper.process(two_open_hands_snapshot, 0.2)
-        self.assertIn(("scroll", 0, -8), backend.events)
-
-    def test_3dviewer_two_hand_zoom_requires_open_palms(self) -> None:
+    def test_3dviewer_recorded_zoom_requires_two_open_palms(self) -> None:
         backend = FakeInputBackend()
         config = default_mapping_config()
         config.active_profile = THREEDVIEWER_PROFILE_NAME
         mapper = InputMapper(backend, config)
         mapper.set_enabled(True)
-
         snapshot_with_fist = {
-            "input_dict": {"both_hands_distance": 0.25},
+            "input_dict": {"two_hand_zoom_direction": "in"},
             "hand_state": {
                 "left": {"visible": True, "gesture": "closed_fist"},
                 "right": {"visible": True, "gesture": "open_palm"},
             },
         }
         mapper.process(snapshot_with_fist, 0.0)
-        snapshot_with_fist["input_dict"] = {"both_hands_distance": 0.45}
         mapper.process(snapshot_with_fist, 0.1)
-        self.assertNotIn(("scroll", 0, 8), backend.events)
+        self.assertFalse(any(event[0] == "scroll" for event in backend.events))
 
     def test_3dviewer_profile_points_without_auto_clicking(self) -> None:
         backend = FakeInputBackend()
@@ -649,7 +678,7 @@ class MappingConfigTests(unittest.TestCase):
         self.assertNotIn(("mouse_click", "left", 1), backend.events)
         self.assertIn(("move_absolute", 959, 539), backend.events)
 
-    def test_3dviewer_profile_rotates_with_wrist_roll(self) -> None:
+    def test_3dviewer_profile_smoothly_rotates_with_recorded_wristband_gestures(self) -> None:
         backend = FakeInputBackend()
         config = default_mapping_config()
         config.active_profile = THREEDVIEWER_PROFILE_NAME
@@ -657,33 +686,62 @@ class MappingConfigTests(unittest.TestCase):
         mapper.set_enabled(True)
 
         mapper.process(
-            snapshot(wrist_roll=0, wrist_roll_abs_delta=12, wrist_roll_delta=0, wrist_roll_dominant=True),
+            snapshot(
+                wrist_sample_rotate_active=False,
+                wrist_sample_rotate_direction="none",
+                wrist_sample_rotate_position=0,
+            ),
             0.0,
         )
         mapper.process(
-            snapshot(wrist_roll=-22, wrist_roll_abs_delta=22, wrist_roll_delta=-22, wrist_roll_dominant=True),
+            snapshot(
+                wrist_sample_rotate_active=True,
+                wrist_sample_rotate_direction="right",
+                wrist_sample_rotate_position=3,
+            ),
             0.1,
         )
         mapper.process(
-            snapshot(wrist_roll=-44, wrist_roll_abs_delta=44, wrist_roll_delta=-44, wrist_roll_dominant=True),
+            snapshot(
+                wrist_sample_rotate_active=True,
+                wrist_sample_rotate_direction="right",
+                wrist_sample_rotate_position=7,
+            ),
             0.2,
         )
         mapper.process(
-            snapshot(wrist_roll=-22, wrist_roll_abs_delta=22, wrist_roll_delta=22, wrist_roll_dominant=True),
+            snapshot(
+                wrist_sample_rotate_active=False,
+                wrist_sample_rotate_direction="none",
+                wrist_sample_rotate_position=7,
+            ),
             0.3,
         )
         mapper.process(
-            snapshot(wrist_roll=-22, wrist_roll_abs_delta=0, wrist_roll_delta=0, wrist_roll_dominant=False),
+            snapshot(
+                wrist_sample_rotate_active=True,
+                wrist_sample_rotate_direction="left",
+                wrist_sample_rotate_position=3,
+            ),
             0.4,
+        )
+        mapper.process(
+            snapshot(
+                wrist_sample_rotate_active=True,
+                wrist_sample_rotate_direction="left",
+                wrist_sample_rotate_position=-2,
+            ),
+            0.5,
         )
 
         self.assertIn(("mouse_down", "left"), backend.events)
         self.assertIn(("move_absolute", 959, 539), backend.events)
-        self.assertIn(("move", 88, 0), backend.events)
+        self.assertIn(("move", 16, 0), backend.events)
         self.assertTrue(any(event[0] == "move" and event[1] < 0 for event in backend.events))
         self.assertIn(("mouse_up", "left"), backend.events)
+        self.assertTrue(all(abs(event[1]) <= 18 for event in backend.events if event[0] == "move"))
 
-    def test_windows_3d_viewer_profile_uses_centered_orbit_and_zoom(self) -> None:
+    def test_windows_3d_viewer_profile_ignores_camera_cursor_rules(self) -> None:
         backend = FakeInputBackend()
         config = default_mapping_config()
         config.active_profile = WINDOWS_3D_VIEWER_PROFILE_NAME
@@ -691,28 +749,91 @@ class MappingConfigTests(unittest.TestCase):
         mapper.set_enabled(True)
         mapper.process(hand_snapshot({}, left_gesture="closed_fist", right_visible=True), 0.0)
         mapper.process(hand_snapshot({}, left_gesture="closed_fist", right_visible=True), 0.13)
-        self.assertEqual(
-            backend.events,
-            [
-                ("move_absolute", 959, 539),
-                ("mouse_down", "left"),
-                ("move_absolute", 959, 539),
-            ],
-        )
+        self.assertEqual(backend.events, [])
 
-        mapper.process(hand_snapshot({}, left_gesture="open_palm", right_visible=False), 0.2)
-        backend.events.clear()
-        two_open_hands_snapshot = {
-            "input_dict": {"both_hands_distance": 0.25},
-            "hand_state": {
-                "left": {"visible": True, "gesture": "open_palm"},
-                "right": {"visible": True, "gesture": "open_palm"},
-            },
-        }
-        mapper.process(two_open_hands_snapshot, 0.3)
-        two_open_hands_snapshot["input_dict"] = {"both_hands_distance": 0.39}
-        mapper.process(two_open_hands_snapshot, 0.4)
-        self.assertEqual(backend.events, [("move_absolute", 959, 539), ("scroll", 0, 8)])
+    def test_windows_3d_viewer_wrist_rotation_only_runs_while_viewer_window_exists(self) -> None:
+        backend = FakeInputBackend()
+        backend.active_foreground_process = "Codex.exe"
+        backend.available_target_processes.clear()
+        config = default_mapping_config()
+        config.active_profile = WINDOWS_3D_VIEWER_PROFILE_NAME
+        mapper = InputMapper(backend, config)
+        mapper.set_enabled(True)
+
+        mapper.process(
+            snapshot(
+                wrist_sample_rotate_active=True,
+                wrist_sample_rotate_direction="right",
+                wrist_sample_rotate_position=0,
+            ),
+            0.0,
+        )
+        mapper.process(
+            snapshot(
+                wrist_sample_rotate_active=True,
+                wrist_sample_rotate_direction="right",
+                wrist_sample_rotate_position=3,
+            ),
+            0.1,
+        )
+        self.assertNotIn(("mouse_down", "left"), backend.events)
+        self.assertFalse(any(event[0] == "move" for event in backend.events))
+
+        backend.available_target_processes.add("3DViewer.exe")
+        mapper.process(
+            snapshot(
+                wrist_sample_rotate_active=True,
+                wrist_sample_rotate_direction="right",
+                wrist_sample_rotate_position=6,
+            ),
+            0.2,
+        )
+        mapper.process(
+            snapshot(
+                wrist_sample_rotate_active=True,
+                wrist_sample_rotate_direction="right",
+                wrist_sample_rotate_position=9,
+            ),
+            0.3,
+        )
+        self.assertTrue(any(event[0] == "pointer_session_begin" for event in backend.events))
+        self.assertNotIn(("mouse_down", "left"), backend.events)
+
+        mapper.process(
+            snapshot(
+                wrist_sample_rotate_active=True,
+                wrist_sample_rotate_direction="right",
+                wrist_sample_rotate_position=12,
+            ),
+            0.4,
+        )
+        self.assertNotIn(("mouse_down", "left"), backend.events)
+
+        mapper.process(
+            snapshot(
+                wrist_sample_rotate_active=True,
+                wrist_sample_rotate_direction="right",
+                wrist_sample_rotate_position=15,
+            ),
+            0.5,
+        )
+        self.assertIn(
+            ("pointer_session_move", "windows3dviewer_wrist_forearm_orbit_follow", 12, 0),
+            backend.events,
+        )
+        self.assertFalse(any(event[0] in {"move", "move_absolute"} for event in backend.events))
+
+        backend.active_foreground_process = "Codex.exe"
+        mapper.process(
+            snapshot(
+                wrist_sample_rotate_active=True,
+                wrist_sample_rotate_direction="right",
+                wrist_sample_rotate_position=18,
+            ),
+            0.6,
+        )
+        self.assertNotIn(("mouse_up", "left"), backend.events)
+        self.assertTrue(any(event[0] == "pointer_session_end" for event in backend.events))
 
     def test_invalid_config_falls_back_to_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

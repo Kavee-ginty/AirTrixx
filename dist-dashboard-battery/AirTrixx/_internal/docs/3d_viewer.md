@@ -1,6 +1,6 @@
 # 3D Viewer Control
 
-AirTrixx can control dedicated 3D viewers through the built-in **`3dviewer.net`** and **`Windows 3D Viewer`** mapping profiles. The app translates right-hand MediaPipe gestures and wristband motion into OS mouse events that match standard viewer navigation.
+AirTrixx can control dedicated 3D viewers through the built-in **`3dviewer.net`** and **`Windows 3D Viewer`** mapping profiles. The app translates right-hand MediaPipe gestures and wristband motion into viewer navigation input.
 
 CAD and modeling tools (Blender, Fusion 360, FreeCAD) mix editing with viewing and are poor first targets. Use simple viewers with consistent mouse navigation instead.
 
@@ -39,27 +39,28 @@ https://3dviewer.net/#model=https://raw.githubusercontent.com/kovacsv/Online3DVi
 | Action | Gesture / signal | Viewer behavior |
 |--------|------------------|-----------------|
 | Orbit | Left hand closed fist + move right hand | Left-drag orbit |
-| Orbit right | Wristband hand rolls right | Proportional left-drag rotate right |
-| Orbit left | Wristband hand rolls left | Proportional left-drag rotate left |
+| Rotate right | Rotate wristband forearm right | Direct smooth proportional left-drag rotate right |
+| Rotate left | Rotate wristband forearm left | Direct smooth proportional left-drag rotate left |
 | Pan | Right hand closed fist | Middle-drag pan |
 | Point / move cursor | Right hand index finger up | Move cursor over canvas |
-| Zoom in | Both open hands move apart, index finger up + hand ~25 mm closer (Cam Dock depth), or wrist pitch up | Scroll up |
-| Zoom out | Both open hands move closer, index finger up + hand ~25 mm farther, or wrist pitch down | Scroll down |
+| Zoom in (`zoom_in` samples) | Both open palms move apart | Smooth single-step scroll up |
+| Zoom out (`zoom_out` samples) | Both open palms move closer | Smooth single-step scroll down |
 
-Wrist-roll orbit follows the measured wrist angle delta, so a larger wrist rotation produces a larger model rotation. A full wrist roll is mapped to roughly one full model turn in the browser viewer. Zoom uses larger wheel steps so each recognized gesture changes the model view more noticeably. Recognition labels (`zoom_in`, `zoom_out`, wrist rotate labels, etc.) appear briefly on the camera preview overlay when those actions fire.
+The camera orbit, pan, and pointer-follow rows apply to the `3dviewer.net` profile. The `Windows 3D Viewer` profile intentionally includes only wristband rotation and the two recorded zoom gestures, preventing accidental camera classifications from moving or clicking the normal cursor.
 
-When a 3D viewer gesture action is detected, AirTrixx first moves the cursor to the screen center and then executes the mapped drag or scroll action. Pointer-follow remains a direct cursor-follow rule so it can still place the cursor manually without triggering clicks.
+Forearm rotation directly controls the model using the wristband `gyro_y` angular velocity; it does not wait for a camera gesture or a one-shot rotation gesture. A live neutral baseline and dead zone suppress idle gyro drift, while angular velocity is continuously integrated into proportional orbit movement. In the Windows 3D Viewer profile, wristband orbit locates and activates the actual `3DViewer.exe` window and does nothing if that window is unavailable. It sends a synthetic touch drag directly to the Viewer, so wristband rotation never moves or clicks the normal system cursor. A short focus-settle phase ensures the orbit reaches the Viewer instead of the previously active app, and the action stops immediately if focus leaves the viewer. A short release grace period keeps one rotation active through brief neutral sensor gaps without repeatedly clicking. Individual steps are capped to prevent large rotation jumps. The recorded `rotate_left` and `rotate_right` samples tune direction and scaling. The recorded `zoom_in` and `zoom_out` samples are mapped from sustained changes in open-palm distance. A short rolling window ignores tracking wobble, and each zoom action sends one mouse-wheel notch, preventing the large zoom-level jumps caused by the old multi-notch action.
+
+Camera-based 3D viewer gesture actions move the cursor to the screen center before executing their mapped drag or scroll action. Windows 3D Viewer wristband orbit is the exception: it uses viewer-targeted synthetic touch and leaves the normal cursor untouched. Pointer-follow remains available in the web viewer profile.
 
 ## Hardware requirements
 
 | Component | Required for |
 |-----------|--------------|
 | USB Antenna connected | Mappings run only while serial is connected |
-| Webcam | MediaPipe hand tracking and two-hand zoom |
-| Wristband | Wrist pitch zoom and wrist-roll orbit |
-| Cam Dock ToF | Hand depth zoom while pointing |
+| Webcam | MediaPipe hand tracking and recorded open-palm zoom |
+| Wristband | Recorded forearm rotation |
 
-Hand-only orbit and pan work with camera tracking alone. Zoom needs wristband pitch and/or Cam Dock depth depending on which gesture you use.
+Hand-only orbit, pan, and smooth zoom work with camera tracking alone.
 
 ## Manual live-test checklist
 
@@ -69,13 +70,12 @@ Use this checklist after enabling either viewer mode:
 - [ ] Viewer canvas has focus (click it once)
 - [ ] Mappings status shows **armed**
 - [ ] Left closed fist + right hand moving: model orbits
-- [ ] Wristband hand roll right/left: model rotates right/left
+- [ ] Wristband forearm rotate right/left: model smoothly follows the recorded direction and amount
 - [ ] Right closed fist: model pans while hand moves, without browser right-click menus
 - [ ] Right index finger: cursor follows hand without auto-clicking
-- [ ] Both open hands apart/together: zoom in/out
+- [ ] Both open palms moving apart: gradual zoom in with no large jump
+- [ ] Both open palms moving closer: gradual zoom out with no large jump
 - [ ] Viewer gestures start from the screen center before rotating, panning, or zooming
-- [ ] Wrist pitch up/down: zoom in/out
-- [ ] Pointing + moving hand closer/farther: zoom in/out (Cam Dock required)
 - [ ] Switching gestures releases the previous mouse button (no stuck drag)
 
 ## Troubleshooting
@@ -84,7 +84,7 @@ Use this checklist after enabling either viewer mode:
 |---------|-----|
 | Nothing happens in the browser | Confirm mappings are **armed**, Antenna is connected, and the browser canvas is focused |
 | Cursor jumps or misses the canvas | Use a maximized/fullscreen browser window; hand position maps to the full screen |
-| Zoom does not work | Use both open palms for camera-only zoom; wear wristband for pitch zoom; ensure Cam Dock is online for depth zoom while pointing |
+| Zoom does not work | Keep both palms open and visible, then move them steadily apart or closer |
 | Unwanted clicks while viewing | The viewer profile disables automatic select clicks and uses middle-drag for pan; reload mappings if an older profile is still active |
 | Mappings stop when typing | Expected: mappings suppress while a text field in AirTrixx has focus |
 | Profile missing in dropdown | Click **Load** on the Mappings page; built-in profiles merge automatically on load |
