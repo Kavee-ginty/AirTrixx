@@ -59,16 +59,29 @@ WRIST_SAMPLE_ROTATE_RELEASE_GRACE_S = 0.24
 WRIST_ROLL_ROTATE_HISTORY_S = 0.35
 WRIST_ROLL_ROTATE_DEADZONE_DPS = 2.5
 WRIST_ROLL_ROTATE_RELEASE_GRACE_S = 0.4
+WRIST_WEAPON_SWAP_MIN_DELTA_DEG = 6.0
+WRIST_WEAPON_SWAP_MIN_VELOCITY_DPS = 8.0
+WRIST_WEAPON_SWAP_RETURN_DELTA_DEG = 4.0
+WRIST_WEAPON_SWAP_REARM_SETTLE_S = 0.22
+WRIST_WEAPON_SWAP_DIRECTION_SUSTAIN_S = 0.10
+HAND_CONTROL_CENTER_ALPHA = 0.12
+HAND_DEPTH_CENTER_TRACK_BAND_MM = 70.0
+HAND_POSITION_CENTER_TRACK_BAND = 0.035
+HAND_DEPTH_MIN_VALID_MM = 80.0
+HAND_DEPTH_MAX_VALID_MM = 2500.0
 
 
 FIELD_ORDER = [
     "right_hand_x",
     "right_hand_y",
     "right_hand_z_mm",
+    "right_hand_depth_offset_mm",
+    "right_palm_vertical_offset",
     "right_hand_gesture",
     "left_hand_x",
     "left_hand_y",
     "left_hand_z_mm",
+    "left_palm_horizontal_offset",
     "left_hand_gesture",
     "both_hands_distance",
     "both_hands_x_distance",
@@ -87,6 +100,8 @@ FIELD_ORDER = [
     "wrist_roll_rotate_velocity_abs_dps",
     "wrist_roll_rotate_direction",
     "wrist_roll_rotate_active",
+    "wrist_weapon_clockwise_detected",
+    "wrist_weapon_counterclockwise_detected",
     "wrist_sample_rotate_position",
     "wrist_sample_rotate_velocity_dps",
     "wrist_sample_rotate_direction",
@@ -150,10 +165,46 @@ class FusionState:
         self._wrist_sample_rotate_output_position = 0.0
         self._wrist_roll_rotate_history: list[tuple[float, float]] = []
         self._wrist_roll_rotate_last_motion_s: float | None = None
+        self._wrist_weapon_swap_locked_direction = 0
+        self._wrist_weapon_swap_return_seen = False
+        self._wrist_weapon_swap_last_motion_s: float | None = None
+        self._wrist_weapon_swap_candidate_direction = 0
+        self._wrist_weapon_swap_candidate_since_s = 0.0
+        self._wrist_weapon_swap_candidate_anchor_roll: float | None = None
+        self._wrist_weapon_clockwise_sign = 1
+        self._wrist_weapon_counterclockwise_sign = -1
+        self._wrist_weapon_clockwise_delta_deg = WRIST_WEAPON_SWAP_MIN_DELTA_DEG
+        self._wrist_weapon_counterclockwise_delta_deg = WRIST_WEAPON_SWAP_MIN_DELTA_DEG
+        self._wrist_weapon_min_velocity_dps = WRIST_WEAPON_SWAP_MIN_VELOCITY_DPS
         self._two_hand_zoom_history: list[tuple[float, float]] = []
         self._two_hand_zoom_candidate = "none"
         self._two_hand_zoom_candidate_since_s = 0.0
         self._gesture_peak_states: dict[str, dict[str, Any]] = {}
+        self._right_hand_depth_center_mm: float | None = None
+        self._left_palm_horizontal_center: float | None = None
+        self._right_palm_vertical_center: float | None = None
+
+    def apply_gta_training(self, model: dict[str, Any]) -> None:
+        wrist = model.get("wrist", {}) if isinstance(model, dict) else {}
+        if not isinstance(wrist, dict):
+            return
+        clockwise_sign = int(wrist.get("clockwise_sign", self._wrist_weapon_clockwise_sign) or 1)
+        counterclockwise_sign = int(wrist.get("counterclockwise_sign", self._wrist_weapon_counterclockwise_sign) or -1)
+        if clockwise_sign in {-1, 1} and counterclockwise_sign in {-1, 1} and clockwise_sign != counterclockwise_sign:
+            self._wrist_weapon_clockwise_sign = clockwise_sign
+            self._wrist_weapon_counterclockwise_sign = counterclockwise_sign
+        self._wrist_weapon_clockwise_delta_deg = max(
+            3.0,
+            min(60.0, float(wrist.get("clockwise_delta_deg", self._wrist_weapon_clockwise_delta_deg))),
+        )
+        self._wrist_weapon_counterclockwise_delta_deg = max(
+            3.0,
+            min(60.0, float(wrist.get("counterclockwise_delta_deg", self._wrist_weapon_counterclockwise_delta_deg))),
+        )
+        self._wrist_weapon_min_velocity_dps = max(
+            3.0,
+            min(30.0, float(wrist.get("min_velocity_dps", self._wrist_weapon_min_velocity_dps))),
+        )
 
     @staticmethod
     def _camera_y_up(values: dict[str, Any]) -> float | None:
@@ -197,6 +248,58 @@ class FusionState:
             "both_hands_distance": (x_distance * x_distance + y_distance * y_distance) ** 0.5,
             "both_hands_x_distance": x_distance,
             "both_hands_y_distance": y_distance,
+        }
+
+    def _hand_control_features(
+        self,
+        right_z_mm: Any,
+        right: dict[str, Any],
+        left: dict[str, Any],
+    ) -> dict[str, float | None]:
+        right_visible = bool(right.get("visible"))
+        left_visible = bool(left.get("visible"))
+
+        depth = self._number(right_z_mm) if right_visible else None
+        if depth is None or not HAND_DEPTH_MIN_VALID_MM <= depth <= HAND_DEPTH_MAX_VALID_MM:
+            self._right_hand_depth_center_mm = None
+            depth_offset = None
+        else:
+            if self._right_hand_depth_center_mm is None:
+                self._right_hand_depth_center_mm = depth
+            depth_offset = self._right_hand_depth_center_mm - depth
+            if abs(depth_offset) <= HAND_DEPTH_CENTER_TRACK_BAND_MM:
+                self._right_hand_depth_center_mm += -depth_offset * HAND_CONTROL_CENTER_ALPHA
+                depth_offset = self._right_hand_depth_center_mm - depth
+
+        left_x = self._number(left.get("x")) if left_visible else None
+        if left_x is None:
+            self._left_palm_horizontal_center = None
+            left_horizontal_offset = None
+        else:
+            if self._left_palm_horizontal_center is None:
+                self._left_palm_horizontal_center = left_x
+            # Raw camera x decreases when the user moves physically right.
+            left_horizontal_offset = self._left_palm_horizontal_center - left_x
+            if left.get("gesture") != "open_palm" or abs(left_horizontal_offset) <= HAND_POSITION_CENTER_TRACK_BAND:
+                self._left_palm_horizontal_center += -left_horizontal_offset * HAND_CONTROL_CENTER_ALPHA
+                left_horizontal_offset = self._left_palm_horizontal_center - left_x
+
+        right_y_up = self._camera_y_up(right)
+        if right_y_up is None:
+            self._right_palm_vertical_center = None
+            right_vertical_offset = None
+        else:
+            if self._right_palm_vertical_center is None:
+                self._right_palm_vertical_center = right_y_up
+            right_vertical_offset = right_y_up - self._right_palm_vertical_center
+            if right.get("gesture") != "open_palm" or abs(right_vertical_offset) <= HAND_POSITION_CENTER_TRACK_BAND:
+                self._right_palm_vertical_center += right_vertical_offset * HAND_CONTROL_CENTER_ALPHA
+                right_vertical_offset = right_y_up - self._right_palm_vertical_center
+
+        return {
+            "right_hand_depth_offset_mm": depth_offset,
+            "left_palm_horizontal_offset": left_horizontal_offset,
+            "right_palm_vertical_offset": right_vertical_offset,
         }
 
     def _two_hand_zoom_features(
@@ -325,11 +428,19 @@ class FusionState:
         if roll_number is None:
             self._wrist_roll_rotate_history.clear()
             self._wrist_roll_rotate_last_motion_s = None
+            self._wrist_weapon_swap_locked_direction = 0
+            self._wrist_weapon_swap_return_seen = False
+            self._wrist_weapon_swap_last_motion_s = None
+            self._wrist_weapon_swap_candidate_direction = 0
+            self._wrist_weapon_swap_candidate_since_s = 0.0
+            self._wrist_weapon_swap_candidate_anchor_roll = None
             return {
                 "wrist_roll_rotate_velocity_dps": 0.0,
                 "wrist_roll_rotate_velocity_abs_dps": 0.0,
                 "wrist_roll_rotate_direction": "none",
                 "wrist_roll_rotate_active": False,
+                "wrist_weapon_clockwise_detected": False,
+                "wrist_weapon_counterclockwise_detected": False,
             }
 
         self._wrist_roll_rotate_history.append((now_s, roll_number))
@@ -360,11 +471,69 @@ class FusionState:
             self._wrist_roll_rotate_last_motion_s is not None
             and now_s - self._wrist_roll_rotate_last_motion_s <= WRIST_ROLL_ROTATE_RELEASE_GRACE_S
         )
+        clockwise_detected = False
+        counterclockwise_detected = False
+        travel_delta = unwrapped[-1][1] - unwrapped[0][1] if len(unwrapped) >= 2 else 0.0
+        if abs(velocity) >= self._wrist_weapon_min_velocity_dps:
+            self._wrist_weapon_swap_last_motion_s = now_s
+        motion_direction = 1 if velocity >= self._wrist_weapon_min_velocity_dps else -1 if velocity <= -self._wrist_weapon_min_velocity_dps else 0
+        if self._wrist_weapon_swap_locked_direction == 0 and motion_direction:
+            if self._wrist_weapon_swap_candidate_direction != motion_direction:
+                self._wrist_weapon_swap_candidate_direction = motion_direction
+                self._wrist_weapon_swap_candidate_since_s = now_s
+                self._wrist_weapon_swap_candidate_anchor_roll = unwrapped[-1][1]
+            anchor_roll = self._wrist_weapon_swap_candidate_anchor_roll
+            candidate_travel = 0.0 if anchor_roll is None else (unwrapped[-1][1] - anchor_roll) * motion_direction
+            required_travel = (
+                self._wrist_weapon_clockwise_delta_deg
+                if motion_direction == self._wrist_weapon_clockwise_sign
+                else self._wrist_weapon_counterclockwise_delta_deg
+            )
+            if (
+                candidate_travel >= required_travel
+                and now_s - self._wrist_weapon_swap_candidate_since_s >= WRIST_WEAPON_SWAP_DIRECTION_SUSTAIN_S
+            ):
+                self._wrist_weapon_swap_locked_direction = motion_direction
+                self._wrist_weapon_swap_return_seen = False
+                self._wrist_weapon_swap_candidate_direction = 0
+                self._wrist_weapon_swap_candidate_anchor_roll = None
+                clockwise_detected = motion_direction == self._wrist_weapon_clockwise_sign
+                counterclockwise_detected = motion_direction == self._wrist_weapon_counterclockwise_sign
+        elif (
+            self._wrist_weapon_swap_locked_direction == 0
+            and self._wrist_weapon_swap_last_motion_s is not None
+            and now_s - self._wrist_weapon_swap_last_motion_s > WRIST_ROLL_ROTATE_RELEASE_GRACE_S
+        ):
+            self._wrist_weapon_swap_candidate_direction = 0
+            self._wrist_weapon_swap_candidate_anchor_roll = None
+        elif self._wrist_weapon_swap_locked_direction:
+            return_direction = -self._wrist_weapon_swap_locked_direction
+            if (
+                return_direction > 0
+                and velocity >= self._wrist_weapon_min_velocity_dps
+                and travel_delta >= WRIST_WEAPON_SWAP_RETURN_DELTA_DEG
+            ) or (
+                return_direction < 0
+                and velocity <= -self._wrist_weapon_min_velocity_dps
+                and travel_delta <= -WRIST_WEAPON_SWAP_RETURN_DELTA_DEG
+            ):
+                self._wrist_weapon_swap_return_seen = True
+            if (
+                self._wrist_weapon_swap_return_seen
+                and self._wrist_weapon_swap_last_motion_s is not None
+                and now_s - self._wrist_weapon_swap_last_motion_s >= WRIST_WEAPON_SWAP_REARM_SETTLE_S
+            ):
+                self._wrist_weapon_swap_locked_direction = 0
+                self._wrist_weapon_swap_return_seen = False
+                self._wrist_weapon_swap_candidate_anchor_roll = None
+
         return {
             "wrist_roll_rotate_velocity_dps": velocity,
             "wrist_roll_rotate_velocity_abs_dps": abs(velocity),
             "wrist_roll_rotate_direction": direction,
             "wrist_roll_rotate_active": active,
+            "wrist_weapon_clockwise_detected": clockwise_detected,
+            "wrist_weapon_counterclockwise_detected": counterclockwise_detected,
         }
 
     @staticmethod
@@ -1036,6 +1205,7 @@ class FusionState:
         wrist_roll = wrist.get("roll")
 
         hand_distance_features = self._hand_distance_features(right, left)
+        hand_control_features = self._hand_control_features(tof.get("right_mm"), right, left)
         input_dict = {
             "right_hand_x": right.get("x") if right.get("visible") else None,
             "right_hand_y": self._camera_y_up(right),
@@ -1045,6 +1215,7 @@ class FusionState:
             "left_hand_y": self._camera_y_up(left),
             "left_hand_z_mm": tof.get("left_mm"),
             "left_hand_gesture": left.get("gesture") if left.get("visible") else None,
+            **hand_control_features,
             **hand_distance_features,
             **self._two_hand_zoom_features(
                 hand_distance_features["both_hands_distance"],

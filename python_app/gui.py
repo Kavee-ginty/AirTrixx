@@ -25,6 +25,7 @@ from app_paths import project_resource_path
 from config import AppConfig, load_calibration, save_calibration
 from fusion_state import FIELD_ORDER, FusionState
 from gesture_recorder import GestureRecorder
+from gta_gesture_trainer import GTA_TRAINING_DESCRIPTIONS, GTA_TRAINING_GESTURES, GtaGestureTrainer
 from input_backend import FakeInputBackend, PynputInputBackend, normalize_key_token, parse_key_combo
 from input_mapper import (
     COMPARATORS,
@@ -35,6 +36,8 @@ from input_mapper import (
     MappingProfile,
     MappingRule,
     SignalCatalog,
+    GTA_VICE_CITY_PROFILE_NAME,
+    GTA_VICE_CITY_PROCESS_CANDIDATES,
     THREEDVIEWER_PROFILE_NAME,
     WINDOWS_3D_VIEWER_PROFILE_NAME,
     load_mapping_config,
@@ -329,10 +332,17 @@ class AirTrixxGUI:
             self._snapshot_provider,
             on_status=self.log,
         )
+        self.gta_gesture_trainer = GtaGestureTrainer(
+            self.config.gesture_data_dir,
+            self.config.config_dir / "gta_gesture_training.json",
+        )
+        self.gta_gesture_training = self.gta_gesture_trainer.load()
+        self._last_gesture_recording_phase = "idle"
         self.input_backend = PynputInputBackend()
         self.mapping_config_path = self.config.mapping_path
         mapping_config, mapping_error = load_mapping_config(self.mapping_config_path)
         self.input_mapper = InputMapper(self.input_backend, mapping_config, on_log=self.log)
+        self._apply_gta_gesture_training()
         self.mapping_recording_shortcut = False
         self.mapping_signal_items: dict[str, str] = {}
         self.mapping_signal_group_items: dict[str, str] = {}
@@ -991,6 +1001,11 @@ class AirTrixxGUI:
             text="Windows 3D Viewer Mode",
             command=self.activate_windows_3d_viewer_mode,
         ).grid(row=1, column=4, columnspan=3, sticky="ew", pady=(8, 0))
+        ttk.Button(
+            profile_box,
+            text="GTA Vice City Mode",
+            command=self.activate_gta_vice_city_mode,
+        ).grid(row=2, column=0, columnspan=7, sticky="ew", pady=(8, 0))
 
         split = ttk.Frame(body)
         split.grid(row=2, column=0, sticky="nsew")
@@ -1155,13 +1170,32 @@ class AirTrixxGUI:
         self.gesture_name_var = tk.StringVar()
         ttk.Entry(record_box, textvariable=self.gesture_name_var).grid(row=0, column=1, columnspan=3, sticky="ew")
         ttk.Label(record_box, text="Repetitions").grid(row=1, column=0, sticky="w", pady=(8, 0), padx=(0, 8))
-        self.repetitions_var = tk.StringVar(value="3")
+        self.repetitions_var = tk.StringVar(value="5")
         ttk.Entry(record_box, textvariable=self.repetitions_var, width=10).grid(row=1, column=1, sticky="w", pady=(8, 0))
         ttk.Label(record_box, text="Duration seconds").grid(row=1, column=2, sticky="w", pady=(8, 0), padx=(16, 8))
         self.duration_var = tk.StringVar(value="2.0")
         ttk.Entry(record_box, textvariable=self.duration_var, width=10).grid(row=1, column=3, sticky="w", pady=(8, 0))
+        ttk.Label(record_box, text="GTA action").grid(row=2, column=0, sticky="w", pady=(8, 0), padx=(0, 8))
+        self.gta_training_gesture_var = tk.StringVar(value=GTA_TRAINING_GESTURES[0])
+        self.gta_training_gesture_combo = ttk.Combobox(
+            record_box,
+            textvariable=self.gta_training_gesture_var,
+            values=GTA_TRAINING_GESTURES,
+            state="readonly",
+        )
+        self.gta_training_gesture_combo.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(record_box, text="Select", command=self.select_gta_training_gesture).grid(
+            row=2, column=3, sticky="ew", pady=(8, 0), padx=(8, 0)
+        )
         self.record_button = ttk.Button(record_box, text="Record Gesture", command=self.record_gesture, style="Accent.TButton")
-        self.record_button.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        self.record_button.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        ttk.Button(record_box, text="Train / Reload GTA Controls", command=self.train_gta_gestures).grid(
+            row=4, column=0, columnspan=4, sticky="ew", pady=(6, 0)
+        )
+        self.gta_training_status_var = tk.StringVar(value=self.gta_gesture_trainer.summary(self.gta_gesture_training))
+        ttk.Label(record_box, textvariable=self.gta_training_status_var, wraplength=780).grid(
+            row=5, column=0, columnspan=4, sticky="ew", pady=(8, 0)
+        )
 
         status_box = ttk.LabelFrame(body, text="Recording Status", padding=10)
         status_box.grid(row=1, column=0, sticky="ew")
@@ -1831,6 +1865,38 @@ class AirTrixxGUI:
             focus_hint="Open a model in Windows 3D Viewer, then click the viewer canvas once so it has focus.",
         )
 
+    def activate_gta_vice_city_mode(self) -> None:
+        if GTA_VICE_CITY_PROFILE_NAME not in self.input_mapper.config.profile_names():
+            self.log("GTA Vice City profile missing; reload mappings to restore it.")
+            return
+        self.input_mapper.set_active_profile(GTA_VICE_CITY_PROFILE_NAME)
+        self._apply_gta_gesture_training()
+        self.mapping_profile_var.set(GTA_VICE_CITY_PROFILE_NAME)
+        self._refresh_mapping_profile_combo()
+        self._schedule_mapping_views_refresh()
+        if not self.mapping_enabled_var.get():
+            self.mapping_enabled_var.set(True)
+            self.input_mapper.set_enabled(True)
+        self._update_mapping_status()
+        activation_id = "__gtavc_mode_activate__"
+        begin_pointer_session = getattr(self.input_mapper.backend, "begin_pointer_session", None)
+        end_pointer_session = getattr(self.input_mapper.backend, "end_pointer_session", None)
+        game_found = bool(
+            callable(begin_pointer_session)
+            and begin_pointer_session(
+                activation_id,
+                foreground_process=GTA_VICE_CITY_PROCESS_CANDIDATES,
+                restore_cursor=True,
+            )
+        )
+        if game_found and callable(end_pointer_session):
+            self.root.after(250, lambda: end_pointer_session(activation_id))
+        self.log(
+            "GTA Vice City Mode armed: right-hand forward runs, right-hand backward walks reverse, "
+            "left open-palm movement turns, raising the right hand jumps, and clockwise/counterclockwise wristband rotation swaps weapons. "
+            f"{'GTA: Vice City activated.' if game_found else 'Open GTA: Vice City, then return to this mode.'}"
+        )
+
     def _activate_viewer_mode(
         self,
         profile_name: str,
@@ -1900,6 +1966,7 @@ class AirTrixxGUI:
         if error:
             self.log(f"Input mappings reset because config could not be loaded: {error}")
         self.input_mapper.set_config(config)
+        self._apply_gta_gesture_training()
         self.mapping_enabled_var.set(self.input_mapper.enabled)
         self.mapping_start_enabled_var.set(config.enabled_on_start)
         self.mapping_profile_var.set(config.active_profile)
@@ -1922,6 +1989,7 @@ class AirTrixxGUI:
             self.log(f"Could not import input mappings: {error}")
             return
         self.input_mapper.set_config(config)
+        self._apply_gta_gesture_training()
         self.mapping_enabled_var.set(self.input_mapper.enabled)
         self.mapping_start_enabled_var.set(config.enabled_on_start)
         self.mapping_profile_var.set(config.active_profile)
@@ -2383,6 +2451,7 @@ class AirTrixxGUI:
                     "restore_cursor_after_action": working.action.restore_cursor_after_action,
                     "pointer_session_warmup_ms": working.action.pointer_session_warmup_ms,
                     "pointer_mode": working.action.pointer_mode,
+                    "activate_foreground_process": working.action.activate_foreground_process,
                     "continuous": continuous_var.get(),
                 }
             )
@@ -3974,8 +4043,32 @@ class AirTrixxGUI:
             return
         self.recorder.start(self.gesture_name_var.get(), repetitions, duration_s, countdown_s=3)
 
+    def select_gta_training_gesture(self) -> None:
+        gesture_name = self.gta_training_gesture_var.get()
+        if gesture_name not in GTA_TRAINING_GESTURES:
+            return
+        self.gesture_name_var.set(gesture_name)
+        self.repetitions_var.set("5")
+        self.duration_var.set("2.0")
+        description = GTA_TRAINING_DESCRIPTIONS.get(gesture_name, "")
+        self.gta_training_status_var.set(f"Ready to record {gesture_name}: {description}")
+
+    def train_gta_gestures(self) -> None:
+        self.gta_gesture_training = self.gta_gesture_trainer.train_and_save()
+        self._apply_gta_gesture_training()
+        summary = self.gta_gesture_trainer.summary(self.gta_gesture_training)
+        if hasattr(self, "gta_training_status_var"):
+            self.gta_training_status_var.set(summary)
+        self.log(f"{summary} Personalized GTA controls applied.")
+
+    def _apply_gta_gesture_training(self) -> None:
+        self.fusion_state.apply_gta_training(self.gta_gesture_training)
+        self.input_mapper.apply_gta_training(self.gta_gesture_training)
+
     def _update_gesture_recording_progress(self) -> None:
         state = self.recorder.state
+        previous_phase = self._last_gesture_recording_phase
+        self._last_gesture_recording_phase = state.phase
         pct = int(round(state.progress * 100))
         self.gesture_progress_bar["value"] = pct
         self.gesture_progress_text_var.set(f"Overall: {pct}%")
@@ -4003,6 +4096,8 @@ class AirTrixxGUI:
             self.gesture_status_text_var.set(f"Saving {state.gesture_name}.")
         elif state.phase == "finished":
             self.gesture_status_text_var.set("Gesture recording finished.")
+            if previous_phase != "finished" and state.gesture_name in GTA_TRAINING_GESTURES:
+                self.root.after_idle(self.train_gta_gestures)
         else:
             self.gesture_status_text_var.set("Ready to record.")
             self.gesture_timer_text_var.set("Timer: -")

@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from input_backend import FakeInputBackend
 from input_mapper import (
     GESTURE_COOLDOWN_SEC,
+    GTA_VICE_CITY_PROFILE_NAME,
+    GTA_VICE_CITY_PROCESS_CANDIDATES,
     InputMapper,
     MappingAction,
     MappingCondition,
@@ -54,6 +56,28 @@ def hand_snapshot(
                 "y": 0.5 if right_visible else None,
                 "score": 1.0 if right_visible else 0.0,
                 "gesture": "open_palm" if right_visible else "none",
+            },
+        },
+    }
+
+
+def gesture_pair_snapshot(left_gesture: str | None, right_gesture: str | None) -> dict[str, object]:
+    return {
+        "input_dict": {},
+        "hand_state": {
+            "left": {
+                "visible": left_gesture is not None,
+                "x": 0.4,
+                "y": 0.5,
+                "score": 1.0 if left_gesture is not None else 0.0,
+                "gesture": left_gesture or "none",
+            },
+            "right": {
+                "visible": right_gesture is not None,
+                "x": 0.6,
+                "y": 0.5,
+                "score": 1.0 if right_gesture is not None else 0.0,
+                "gesture": right_gesture or "none",
             },
         },
     }
@@ -466,6 +490,7 @@ class MappingConfigTests(unittest.TestCase):
         config = default_mapping_config()
         self.assertIn(THREEDVIEWER_PROFILE_NAME, config.profile_names())
         self.assertIn(WINDOWS_3D_VIEWER_PROFILE_NAME, config.profile_names())
+        self.assertIn(GTA_VICE_CITY_PROFILE_NAME, config.profile_names())
         profile = next(profile for profile in config.profiles if profile.name == THREEDVIEWER_PROFILE_NAME)
         self.assertGreaterEqual(len(profile.mappings), 8)
         windows_profile = next(profile for profile in config.profiles if profile.name == WINDOWS_3D_VIEWER_PROFILE_NAME)
@@ -500,6 +525,123 @@ class MappingConfigTests(unittest.TestCase):
         self.assertFalse(windows_wrist_rule.action.restore_cursor_after_action)
         self.assertEqual(windows_wrist_rule.action.pointer_session_warmup_ms, 40)
         self.assertEqual(windows_wrist_rule.action.pointer_mode, "touch")
+
+    def test_gta_vice_city_profile_matches_requested_controls_and_targets_game(self) -> None:
+        profile = next(
+            profile
+            for profile in default_mapping_config().profiles
+            if profile.name == GTA_VICE_CITY_PROFILE_NAME
+        )
+        self.assertEqual(len(profile.mappings), 7)
+        self.assertEqual(
+            {rule.id for rule in profile.mappings},
+            {
+                "gtavc_right_hand_forward",
+                "gtavc_right_hand_backward",
+                "gtavc_left_palm_turn_right",
+                "gtavc_left_palm_turn_left",
+                "gtavc_right_palm_up_jump",
+                "gtavc_wrist_clockwise_next_weapon",
+                "gtavc_wrist_counterclockwise_previous_weapon",
+            },
+        )
+        self.assertTrue(all(rule.action.foreground_process == GTA_VICE_CITY_PROCESS_CANDIDATES for rule in profile.mappings))
+        self.assertTrue(all(not rule.action.activate_foreground_process for rule in profile.mappings))
+        sources = {rule.id: rule.source for rule in profile.mappings}
+        self.assertEqual(
+            sources["gtavc_wrist_clockwise_next_weapon"],
+            "fused.wrist_weapon_clockwise_detected",
+        )
+        self.assertEqual(
+            sources["gtavc_wrist_counterclockwise_previous_weapon"],
+            "fused.wrist_weapon_counterclockwise_detected",
+        )
+
+    def test_gta_training_applies_personalized_direction_and_threshold(self) -> None:
+        mapper = InputMapper(FakeInputBackend(), default_mapping_config())
+        mapper.apply_gta_training(
+            {
+                "rule_thresholds": {
+                    "gtavc_right_hand_forward": {"signed_threshold": -85.0},
+                    "gtavc_left_palm_turn_right": {"signed_threshold": 0.045},
+                }
+            }
+        )
+        profile = next(profile for profile in mapper.config.profiles if profile.name == GTA_VICE_CITY_PROFILE_NAME)
+        rules = {rule.id: rule for rule in profile.mappings}
+
+        self.assertEqual(rules["gtavc_right_hand_forward"].comparator, "lt")
+        self.assertEqual(rules["gtavc_right_hand_forward"].threshold, -85.0)
+        self.assertEqual(rules["gtavc_left_palm_turn_right"].comparator, "gt")
+        self.assertAlmostEqual(rules["gtavc_left_palm_turn_right"].threshold, 0.045)
+
+    def test_gta_vice_city_right_hand_depth_walks_forward_and_reverse(self) -> None:
+        backend = FakeInputBackend()
+        backend.available_target_processes.add("Mss32.exe")
+        backend.active_foreground_process = "Mss32.exe"
+        config = default_mapping_config()
+        config.active_profile = GTA_VICE_CITY_PROFILE_NAME
+        mapper = InputMapper(backend, config)
+        mapper.set_enabled(True)
+
+        mapper.process(snapshot(right_hand_depth_offset_mm=150), 0.0)
+        mapper.process(snapshot(right_hand_depth_offset_mm=150), 0.09)
+        mapper.process(snapshot(right_hand_depth_offset_mm=0), 0.18)
+        mapper.process(snapshot(right_hand_depth_offset_mm=0), 0.27)
+        mapper.process(snapshot(right_hand_depth_offset_mm=-150), 0.36)
+        mapper.process(snapshot(right_hand_depth_offset_mm=-150), 0.45)
+
+        self.assertIn(("key_down", "w"), backend.events)
+        self.assertIn(("key_down", "space"), backend.events)
+        self.assertIn(("key_up", "w"), backend.events)
+        self.assertIn(("key_up", "space"), backend.events)
+        self.assertIn(("key_down", "s"), backend.events)
+        self.assertTrue(any(event[0] == "pointer_session_begin" for event in backend.events))
+        self.assertFalse(any(event[0].startswith("mouse_") or event[0] in {"move", "move_absolute"} for event in backend.events))
+
+    def test_gta_vice_city_open_palms_turn_and_jump(self) -> None:
+        backend = FakeInputBackend()
+        backend.available_target_processes.add("Mss32.exe")
+        backend.active_foreground_process = "Mss32.exe"
+        config = default_mapping_config()
+        config.active_profile = GTA_VICE_CITY_PROFILE_NAME
+        mapper = InputMapper(backend, config)
+        mapper.set_enabled(True)
+
+        right_turn = gesture_pair_snapshot("open_palm", "none")
+        right_turn["input_dict"] = {"left_palm_horizontal_offset": 0.10, "right_palm_vertical_offset": 0.0}
+        mapper.process(right_turn, 0.0)
+        mapper.process(right_turn, 0.08)
+        neutral = gesture_pair_snapshot("open_palm", "open_palm")
+        neutral["input_dict"] = {"left_palm_horizontal_offset": 0.0, "right_palm_vertical_offset": 0.0}
+        mapper.process(neutral, 0.16)
+        mapper.process(neutral, 0.24)
+        jump = gesture_pair_snapshot("open_palm", "open_palm")
+        jump["input_dict"] = {"left_palm_horizontal_offset": 0.0, "right_palm_vertical_offset": 0.13}
+        mapper.process(jump, 0.32)
+        mapper.process(jump, 0.41)
+
+        self.assertIn(("key_down", "d"), backend.events)
+        self.assertIn(("key_up", "d"), backend.events)
+        self.assertIn(("key_tap", ("ctrl",)), backend.events)
+        self.assertFalse(any(event[0].startswith("mouse_") or event[0] in {"move", "move_absolute"} for event in backend.events))
+
+    def test_gta_vice_city_wrist_rotations_swap_weapons_one_step_each(self) -> None:
+        backend = FakeInputBackend()
+        backend.available_target_processes.add("Mss32.exe")
+        backend.active_foreground_process = "Mss32.exe"
+        config = default_mapping_config()
+        config.active_profile = GTA_VICE_CITY_PROFILE_NAME
+        mapper = InputMapper(backend, config)
+        mapper.set_enabled(True)
+
+        mapper.process(snapshot(wrist_weapon_clockwise_detected=True, wrist_weapon_counterclockwise_detected=False), 0.0)
+        mapper.process(snapshot(wrist_weapon_clockwise_detected=False, wrist_weapon_counterclockwise_detected=False), 0.1)
+        mapper.process(snapshot(wrist_weapon_clockwise_detected=False, wrist_weapon_counterclockwise_detected=True), 0.8)
+
+        self.assertIn(("scroll", 0, 1), backend.events)
+        self.assertIn(("scroll", 0, -1), backend.events)
+        self.assertFalse(any(event[0] in {"move", "move_absolute", "mouse_click", "mouse_down", "mouse_up"} for event in backend.events))
 
     def test_loaded_legacy_config_gets_3dviewer_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -16,12 +16,17 @@ MAPPING_SCHEMA_VERSION = 1
 DEFAULT_PROFILE_NAME = "Default"
 THREEDVIEWER_PROFILE_NAME = "3dviewer.net"
 WINDOWS_3D_VIEWER_PROFILE_NAME = "Windows 3D Viewer"
+GTA_VICE_CITY_PROFILE_NAME = "GTA Vice City"
 THREEDVIEWER_ZOOM_SCROLL_INTERVAL_MS = 140
 THREEDVIEWER_WRIST_ORBIT_PX_PER_DEG = 4.0
 THREEDVIEWER_WRIST_ORBIT_MAX_STEP_PX = 18.0
 WINDOWS_3D_VIEWER_ROLL_SIGN = 1
 WINDOWS_3D_VIEWER_PROCESS_CANDIDATES = "3DViewer.exe|View3D.exe"
 WINDOWS_3D_VIEWER_POINTER_WARMUP_MS = 40
+GTA_VICE_CITY_PROCESS_CANDIDATES = "Mss32.exe|gta-vc.exe|ViceCity.exe"
+GTA_VICE_CITY_HAND_DEPTH_THRESHOLD_MM = 120.0
+GTA_VICE_CITY_PALM_TURN_THRESHOLD = 0.07
+GTA_VICE_CITY_PALM_UP_THRESHOLD = 0.10
 DEFAULT_MAPPING_PATH = MAPPING_PATH
 
 ACTION_TYPES = {
@@ -60,6 +65,8 @@ WRIST_GESTURE_SIGNAL_NAMES = {
     "fused.wrist_pitch_up_detected": "wrist_pitch_up",
     "fused.wrist_pitch_down_detected": "wrist_pitch_down",
     "fused.wrist_roll_right_then_neutral_detected": "wrist_roll_right_then_neutral",
+    "fused.wrist_weapon_clockwise_detected": "wrist_weapon_clockwise",
+    "fused.wrist_weapon_counterclockwise_detected": "wrist_weapon_counterclockwise",
 }
 
 
@@ -236,6 +243,7 @@ class MappingAction:
     restore_cursor_after_action: bool = False
     pointer_session_warmup_ms: int = 0
     pointer_mode: str = ""
+    activate_foreground_process: bool = True
     continuous: bool = False
 
     @classmethod
@@ -281,6 +289,7 @@ class MappingAction:
             restore_cursor_after_action=bool(data.get("restore_cursor_after_action", False)),
             pointer_session_warmup_ms=max(0, int(float(data.get("pointer_session_warmup_ms", 0) or 0))),
             pointer_mode=str(data.get("pointer_mode") or "").strip().lower(),
+            activate_foreground_process=bool(data.get("activate_foreground_process", True)),
             continuous=bool(data.get("continuous", False)),
         )
 
@@ -317,6 +326,7 @@ class MappingAction:
             "restore_cursor_after_action": self.restore_cursor_after_action,
             "pointer_session_warmup_ms": self.pointer_session_warmup_ms,
             "pointer_mode": self.pointer_mode,
+            "activate_foreground_process": self.activate_foreground_process,
             "continuous": self.continuous,
         }
 
@@ -596,7 +606,12 @@ class MappingConfig:
 
 
 def default_mapping_config() -> MappingConfig:
-    profiles = [MappingProfile(), create_3dviewer_net_profile(), create_windows_3d_viewer_profile()]
+    profiles = [
+        MappingProfile(),
+        create_3dviewer_net_profile(),
+        create_windows_3d_viewer_profile(),
+        create_gta_vice_city_profile(),
+    ]
     return MappingConfig(profiles=profiles)
 
 
@@ -781,6 +796,109 @@ def create_windows_3d_viewer_profile() -> MappingProfile:
     )
 
 
+def create_gta_vice_city_profile() -> MappingProfile:
+    """Camera-dock movement gestures and wristband weapon swaps for GTA Vice City."""
+
+    def game_action(action_type: str, keys: list[str]) -> MappingAction:
+        return MappingAction(
+            type=action_type,
+            keys=keys,
+            foreground_process=GTA_VICE_CITY_PROCESS_CANDIDATES,
+            activate_foreground_process=False,
+        )
+
+    def game_scroll(direction: int) -> MappingAction:
+        return MappingAction(
+            type="mouse_scroll",
+            scroll_y=direction,
+            foreground_process=GTA_VICE_CITY_PROCESS_CANDIDATES,
+            activate_foreground_process=False,
+        )
+
+    return MappingProfile(
+        name=GTA_VICE_CITY_PROFILE_NAME,
+        mappings=[
+            MappingRule(
+                id="gtavc_right_hand_forward",
+                name="GTA Vice City: move right hand forward to run forward",
+                source="fused.right_hand_depth_offset_mm",
+                comparator="gt",
+                threshold=GTA_VICE_CITY_HAND_DEPTH_THRESHOLD_MM,
+                hysteresis=35.0,
+                debounce_ms=80,
+                recognition_label="Vice City run forward",
+                action=game_action("keyboard_hold", ["w", "space"]),
+            ),
+            MappingRule(
+                id="gtavc_right_hand_backward",
+                name="GTA Vice City: move right hand backward to walk reverse",
+                source="fused.right_hand_depth_offset_mm",
+                comparator="lt",
+                threshold=-GTA_VICE_CITY_HAND_DEPTH_THRESHOLD_MM,
+                hysteresis=35.0,
+                debounce_ms=80,
+                recognition_label="Vice City walk reverse",
+                action=game_action("keyboard_hold", ["s"]),
+            ),
+            MappingRule(
+                id="gtavc_left_palm_turn_right",
+                name="GTA Vice City: move left open palm right to turn right",
+                source="fused.left_palm_horizontal_offset",
+                comparator="gt",
+                threshold=GTA_VICE_CITY_PALM_TURN_THRESHOLD,
+                conditions=[
+                    MappingCondition(source="hands.left.gesture", comparator="eq", threshold="open_palm"),
+                ],
+                hysteresis=0.02,
+                debounce_ms=70,
+                recognition_label="Vice City turn right",
+                action=game_action("keyboard_hold", ["d"]),
+            ),
+            MappingRule(
+                id="gtavc_left_palm_turn_left",
+                name="GTA Vice City: move left open palm left to turn left",
+                source="fused.left_palm_horizontal_offset",
+                comparator="lt",
+                threshold=-GTA_VICE_CITY_PALM_TURN_THRESHOLD,
+                conditions=[
+                    MappingCondition(source="hands.left.gesture", comparator="eq", threshold="open_palm"),
+                ],
+                hysteresis=0.02,
+                debounce_ms=70,
+                recognition_label="Vice City turn left",
+                action=game_action("keyboard_hold", ["a"]),
+            ),
+            MappingRule(
+                id="gtavc_right_palm_up_jump",
+                name="GTA Vice City: raise right hand to jump",
+                source="fused.right_palm_vertical_offset",
+                comparator="gt",
+                threshold=GTA_VICE_CITY_PALM_UP_THRESHOLD,
+                hysteresis=0.025,
+                debounce_ms=80,
+                recognition_label="Vice City jump",
+                action=game_action("keyboard_tap", ["ctrl"]),
+            ),
+            MappingRule(
+                id="gtavc_wrist_clockwise_next_weapon",
+                name="GTA Vice City: rotate wristband clockwise to swap weapon",
+                source="fused.wrist_weapon_clockwise_detected",
+                comparator="truthy",
+                recognition_label="Vice City next weapon",
+                action=game_scroll(1),
+            ),
+            MappingRule(
+                id="gtavc_wrist_counterclockwise_previous_weapon",
+                name="GTA Vice City: rotate wristband counterclockwise to swap weapon other side",
+                source="fused.wrist_weapon_counterclockwise_detected",
+                comparator="truthy",
+                recognition_label="Vice City previous weapon",
+                action=game_scroll(-1),
+            ),
+        ],
+    )
+
+
 def _clone_viewer_mappings(
     mappings: list[MappingRule],
     *,
@@ -799,7 +917,7 @@ def _clone_viewer_mappings(
 
 
 def _builtin_viewer_profiles() -> list[MappingProfile]:
-    return [create_3dviewer_net_profile(), create_windows_3d_viewer_profile()]
+    return [create_3dviewer_net_profile(), create_windows_3d_viewer_profile(), create_gta_vice_city_profile()]
 
 
 def _ensure_builtin_profiles(profiles: list[MappingProfile]) -> None:
@@ -917,6 +1035,28 @@ class InputMapper:
         self.enabled = bool(config.enabled_on_start)
         self._states.clear()
         self._gesture_last_fired.clear()
+
+    def apply_gta_training(self, model: dict[str, Any]) -> None:
+        settings = model.get("rule_thresholds", {}) if isinstance(model, dict) else {}
+        if not isinstance(settings, dict):
+            return
+        profile = next(
+            (profile for profile in self.config.profiles if profile.name == GTA_VICE_CITY_PROFILE_NAME),
+            None,
+        )
+        if profile is None:
+            return
+        for rule in profile.mappings:
+            trained = settings.get(rule.id)
+            if not isinstance(trained, dict):
+                continue
+            try:
+                signed_threshold = float(trained["signed_threshold"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            rule.comparator = "gt" if signed_threshold > 0 else "lt"
+            rule.threshold = signed_threshold
+            rule.hysteresis = abs(signed_threshold) * 0.25
 
     def set_active_profile(self, profile_name: str) -> bool:
         if profile_name not in self.config.profile_names():
@@ -1347,6 +1487,7 @@ class InputMapper:
                 hide_cursor=action.hide_cursor_during_action,
                 restore_cursor=action.restore_cursor_after_action,
                 pointer_mode=action.pointer_mode,
+                activate_foreground=action.activate_foreground_process,
             )
         )
 

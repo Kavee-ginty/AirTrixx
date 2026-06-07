@@ -51,6 +51,7 @@ class InputBackend(Protocol):
         hide_cursor: bool = False,
         restore_cursor: bool = False,
         pointer_mode: str = "",
+        activate_foreground: bool = True,
     ) -> bool:
         ...
 
@@ -207,6 +208,7 @@ class PynputInputBackend:
         hide_cursor: bool = False,
         restore_cursor: bool = False,
         pointer_mode: str = "",
+        activate_foreground: bool = True,
     ) -> bool:
         if session_id in self._pointer_sessions:
             return self.pointer_session_active(session_id)
@@ -215,8 +217,10 @@ class PynputInputBackend:
         if not target_window:
             return False
         matched_process = self._window_process_name(target_window) if target else ""
-        if target:
+        if target and activate_foreground:
             self._activate_window(target_window)
+        elif target and not self._foreground_process_matches(target):
+            return False
         mode = str(pointer_mode).strip().lower()
         if mode == "touch":
             center = self._window_client_center(target_window)
@@ -341,8 +345,14 @@ class PynputInputBackend:
     @classmethod
     def _window_process_matches(cls, hwnd: Any, expected: str) -> bool:
         actual = cls._window_process_name(hwnd)
-        expected_name = os.path.basename(expected).lower()
-        return bool(actual and (actual == expected_name or os.path.splitext(actual)[0] == os.path.splitext(expected_name)[0]))
+        if not actual:
+            return False
+        actual_root = os.path.splitext(actual)[0]
+        for candidate in cls._process_candidates(expected):
+            expected_name = os.path.basename(candidate).lower()
+            if actual == expected_name or actual_root == os.path.splitext(expected_name)[0]:
+                return True
+        return False
 
     @staticmethod
     def _window_process_name(hwnd: Any) -> str:
@@ -668,6 +678,7 @@ class FakeInputBackend:
         hide_cursor: bool = False,
         restore_cursor: bool = False,
         pointer_mode: str = "",
+        activate_foreground: bool = True,
     ) -> bool:
         candidates = {
             candidate.lower()
@@ -677,8 +688,10 @@ class FakeInputBackend:
         if candidates and candidates.isdisjoint(available_targets):
             return False
         matched = next(iter(candidates & available_targets), foreground_process.split("|", 1)[0].strip())
-        if matched:
+        if matched and activate_foreground:
             self.active_foreground_process = matched
+        elif matched and matched.lower() != self.active_foreground_process.lower():
+            return False
         if session_id not in self._pointer_sessions:
             self._pointer_sessions[session_id] = {
                 "foreground_process": matched,
@@ -693,6 +706,7 @@ class FakeInputBackend:
                     bool(hide_cursor),
                     bool(restore_cursor),
                     str(pointer_mode),
+                    bool(activate_foreground),
                 )
             )
         return True

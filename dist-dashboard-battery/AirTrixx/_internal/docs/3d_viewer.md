@@ -39,18 +39,33 @@ https://3dviewer.net/#model=https://raw.githubusercontent.com/kovacsv/Online3DVi
 | Action | Gesture / signal | Viewer behavior |
 |--------|------------------|-----------------|
 | Orbit | Left hand closed fist + move right hand | Left-drag orbit |
-| Rotate right | Rotate wristband forearm right | Direct smooth proportional left-drag rotate right |
-| Rotate left | Rotate wristband forearm left | Direct smooth proportional left-drag rotate left |
+| Rotate right (`3dviewer.net`) | Rotate wristband forearm right | Direct smooth proportional left-drag rotate right |
+| Rotate left (`3dviewer.net`) | Rotate wristband forearm left | Direct smooth proportional left-drag rotate left |
+| Rotate right (`Windows 3D Viewer`) | Roll wristband right (roll angle increases) | Continuous touch-drag rotates model right |
+| Rotate left (`Windows 3D Viewer`) | Roll wristband left (roll angle decreases) | Continuous touch-drag rotates model left |
 | Pan | Right hand closed fist | Middle-drag pan |
 | Point / move cursor | Right hand index finger up | Move cursor over canvas |
 | Zoom in (`zoom_in` samples) | Both open palms move apart | Smooth single-step scroll up |
 | Zoom out (`zoom_out` samples) | Both open palms move closer | Smooth single-step scroll down |
 
-The camera orbit, pan, and pointer-follow rows apply to the `3dviewer.net` profile. The `Windows 3D Viewer` profile intentionally includes only wristband rotation and the two recorded zoom gestures, preventing accidental camera classifications from moving or clicking the normal cursor.
+The camera orbit, pan, and pointer-follow rows apply to the `3dviewer.net` profile only.
 
-Forearm rotation directly controls the model using the wristband `gyro_y` angular velocity; it does not wait for a camera gesture or a one-shot rotation gesture. A live neutral baseline and dead zone suppress idle gyro drift, while angular velocity is continuously integrated into proportional orbit movement. In the Windows 3D Viewer profile, wristband orbit locates and activates the actual `3DViewer.exe` window and does nothing if that window is unavailable. It sends a synthetic touch drag directly to the Viewer, so wristband rotation never moves or clicks the normal system cursor. A short focus-settle phase ensures the orbit reaches the Viewer instead of the previously active app, and the action stops immediately if focus leaves the viewer. A short release grace period keeps one rotation active through brief neutral sensor gaps without repeatedly clicking. Individual steps are capped to prevent large rotation jumps. The recorded `rotate_left` and `rotate_right` samples tune direction and scaling. The recorded `zoom_in` and `zoom_out` samples are mapped from sustained changes in open-palm distance. A short rolling window ignores tracking wobble, and each zoom action sends one mouse-wheel notch, preventing the large zoom-level jumps caused by the old multi-notch action.
+### `3dviewer.net` wrist rotation
 
-Camera-based 3D viewer gesture actions move the cursor to the screen center before executing their mapped drag or scroll action. Windows 3D Viewer wristband orbit is the exception: it uses viewer-targeted synthetic touch and leaves the normal cursor untouched. Pointer-follow remains available in the web viewer profile.
+Forearm rotation uses wristband `gyro_y` angular velocity with a live neutral baseline and dead zone. It continuously integrates motion into proportional left-drag orbit in the browser.
+
+### `Windows 3D Viewer` wrist rotation
+
+The Windows profile uses **wrist roll angle velocity** (`wrist_roll`), not forearm gyro twist:
+
+- Roll wristband **right** (roll angle increasing) → model rotates **right**
+- Roll wristband **left** (roll angle decreasing) → model rotates **left**
+
+Rotation stays active while roll speed stays above the threshold, with a short grace period so brief neutral gaps do not drop the drag. The rule locates `3DViewer.exe` or `View3D.exe`, sends synthetic touch drag directly to the Viewer (never moving the system cursor), and keeps working while the Viewer window is open even when AirTrixx has focus. Per-frame movement is capped to prevent jumps.
+
+Both viewer profiles include the recorded `zoom_in` and `zoom_out` open-palm distance gestures. Each zoom action sends one mouse-wheel notch.
+
+Camera-based `3dviewer.net` gesture actions move the cursor to the screen center before drag or scroll. Windows 3D Viewer wrist rotation is the exception: viewer-targeted synthetic touch only.
 
 ## Hardware requirements
 
@@ -70,7 +85,8 @@ Use this checklist after enabling either viewer mode:
 - [ ] Viewer canvas has focus (click it once)
 - [ ] Mappings status shows **armed**
 - [ ] Left closed fist + right hand moving: model orbits
-- [ ] Wristband forearm rotate right/left: model smoothly follows the recorded direction and amount
+- [ ] `3dviewer.net`: wristband forearm rotate right/left follows recorded direction
+- [ ] `Windows 3D Viewer`: wrist roll right rotates model right; wrist roll left rotates model left continuously
 - [ ] Right closed fist: model pans while hand moves, without browser right-click menus
 - [ ] Right index finger: cursor follows hand without auto-clicking
 - [ ] Both open palms moving apart: gradual zoom in with no large jump
@@ -88,6 +104,8 @@ Use this checklist after enabling either viewer mode:
 | Unwanted clicks while viewing | The viewer profile disables automatic select clicks and uses middle-drag for pan; reload mappings if an older profile is still active |
 | Mappings stop when typing | Expected: mappings suppress while a text field in AirTrixx has focus |
 | Profile missing in dropdown | Click **Load** on the Mappings page; built-in profiles merge automatically on load |
+| Windows 3D Viewer rotation stops mid-gesture | Keep rolling steadily; rotation needs roll speed above ~2.5 deg/s with a 0.4 s grace window. Reload mappings to pick up the roll-velocity profile |
+| Windows rotation direction feels inverted | Report it; `WINDOWS_3D_VIEWER_ROLL_SIGN` in `input_mapper.py` can flip drag direction |
 
 ## Technical notes
 

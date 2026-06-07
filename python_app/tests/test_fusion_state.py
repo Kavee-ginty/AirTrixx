@@ -10,7 +10,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fusion_state import FusionState
 
 
-def serial_with_wrist(*, pitch: float, roll: float, gyro_y: float = 20.0) -> dict[str, object]:
+def serial_with_wrist(
+    *,
+    pitch: float,
+    roll: float,
+    gyro_y: float = 20.0,
+    right_mm: float | None = None,
+) -> dict[str, object]:
     return {
         "devices": {
             "wristband": {
@@ -19,7 +25,7 @@ def serial_with_wrist(*, pitch: float, roll: float, gyro_y: float = 20.0) -> dic
                 "accel": {},
                 "gyro": {"y": gyro_y},
             },
-            "camdock": {"tof": {}},
+            "camdock": {"tof": {"right_mm": right_mm}},
             "keyboard": {"tof": {}},
             "fans": {},
         }
@@ -27,6 +33,51 @@ def serial_with_wrist(*, pitch: float, roll: float, gyro_y: float = 20.0) -> dic
 
 
 class FusionStateTests(unittest.TestCase):
+    def test_right_hand_depth_offset_tracks_forward_and_backward_from_neutral(self) -> None:
+        fusion = FusionState()
+        neutral_hand = {"right": {"visible": True, "x": 0.5, "y": 0.5, "gesture": "none"}}
+        neutral = fusion.build_input_dict(
+            serial_with_wrist(pitch=0, roll=0, right_mm=700),
+            neutral_hand,
+            now_s=0.0,
+        )
+        forward = fusion.build_input_dict(
+            serial_with_wrist(pitch=0, roll=0, right_mm=550),
+            neutral_hand,
+            now_s=0.1,
+        )
+        backward = fusion.build_input_dict(
+            serial_with_wrist(pitch=0, roll=0, right_mm=850),
+            neutral_hand,
+            now_s=0.2,
+        )
+
+        self.assertAlmostEqual(neutral["right_hand_depth_offset_mm"], 0)
+        self.assertGreater(forward["right_hand_depth_offset_mm"], 120)
+        self.assertLess(backward["right_hand_depth_offset_mm"], -120)
+
+    def test_open_palm_offsets_follow_physical_right_and_up_movements(self) -> None:
+        fusion = FusionState()
+        fusion.build_input_dict(
+            serial_with_wrist(pitch=0, roll=0),
+            {
+                "left": {"visible": True, "x": 0.5, "y": 0.5, "gesture": "open_palm"},
+                "right": {"visible": True, "x": 0.5, "y": 0.5, "gesture": "open_palm"},
+            },
+            now_s=0.0,
+        )
+        values = fusion.build_input_dict(
+            serial_with_wrist(pitch=0, roll=0),
+            {
+                "left": {"visible": True, "x": 0.4, "y": 0.5, "gesture": "open_palm"},
+                "right": {"visible": True, "x": 0.5, "y": 0.35, "gesture": "open_palm"},
+            },
+            now_s=0.1,
+        )
+
+        self.assertGreater(values["left_palm_horizontal_offset"], 0.07)
+        self.assertGreater(values["right_palm_vertical_offset"], 0.10)
+
     def test_both_hand_distance_uses_visible_normalized_hand_positions(self) -> None:
         fusion = FusionState()
         values = fusion.build_input_dict(
@@ -153,6 +204,50 @@ class FusionStateTests(unittest.TestCase):
             velocities.append(values["wrist_roll_rotate_velocity_dps"])
 
         self.assertTrue(any(velocity < 0 for velocity in velocities[2:]))
+
+    def test_wrist_weapon_swap_pulses_once_and_ignores_return_motion(self) -> None:
+        fusion = FusionState()
+        clockwise_pulses = 0
+        counterclockwise_pulses = 0
+        rolls = [0, 4, 8, 12, 16, 16, 12, 8, 4, 0]
+        rolls.extend([0] * 6)
+        rolls.extend([-4, -8, -12, -16])
+        for index, roll in enumerate(rolls):
+            values = fusion.build_input_dict(
+                serial_with_wrist(pitch=0, roll=roll),
+                {},
+                now_s=index * 0.1,
+            )
+            clockwise_pulses += int(values["wrist_weapon_clockwise_detected"])
+            counterclockwise_pulses += int(values["wrist_weapon_counterclockwise_detected"])
+
+        self.assertEqual(clockwise_pulses, 1)
+        self.assertEqual(counterclockwise_pulses, 1)
+
+    def test_wrist_weapon_swap_uses_trained_wristband_orientation(self) -> None:
+        fusion = FusionState()
+        fusion.apply_gta_training(
+            {
+                "wrist": {
+                    "clockwise_sign": -1,
+                    "counterclockwise_sign": 1,
+                    "clockwise_delta_deg": 6,
+                    "counterclockwise_delta_deg": 6,
+                    "min_velocity_dps": 8,
+                }
+            }
+        )
+        clockwise_pulses = 0
+        for index, roll in enumerate((0, -4, -8, -12, -16)):
+            values = fusion.build_input_dict(
+                serial_with_wrist(pitch=0, roll=roll),
+                {},
+                now_s=index * 0.1,
+            )
+            clockwise_pulses += int(values["wrist_weapon_clockwise_detected"])
+
+        self.assertEqual(clockwise_pulses, 1)
+        self.assertFalse(values["wrist_weapon_counterclockwise_detected"])
 
     def test_recorded_wristband_forearm_rotation_directly_uses_positive_gyro_y(self) -> None:
         fusion = FusionState()
