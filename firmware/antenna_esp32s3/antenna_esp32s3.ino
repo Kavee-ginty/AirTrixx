@@ -90,6 +90,17 @@ static size_t serialLineLen = 0;
 static const uint32_t BATTERY_STATUS_STALE_MS = 11UL * 60UL * 1000UL;
 static const uint8_t ESPNOW_BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static const int8_t WIFI_TX_POWER_QDBM = 34;  // 8.5 dBm in 0.25 dBm units.
+static const uint8_t ANTENNA_TOTAL_TRACKED_DEVICES = 6;
+static const uint32_t ANTENNA_LED_UPDATE_MS = 250;
+static const uint32_t AUDIODOCK_LED_TIMEOUT_MS = 30000;
+static uint8_t lastAntennaLedState = 255;
+static uint32_t lastAntennaLedUpdateMs = 0;
+
+#if defined(RGB_BUILTIN)
+static const uint8_t ANTENNA_STATUS_LED_PIN = RGB_BUILTIN;
+#else
+static const uint8_t ANTENNA_STATUS_LED_PIN = 48;
+#endif
 
 void debugPrintln(const String &message) {
   if (DEBUG_SERIAL) {
@@ -97,6 +108,74 @@ void debugPrintln(const String &message) {
       Serial.println(message);
       xSemaphoreGive(serialMutex);
     }
+  }
+}
+
+void setAntennaStatusLed(uint8_t r, uint8_t g, uint8_t b) {
+  neopixelWrite(ANTENNA_STATUS_LED_PIN, r, g, b);
+}
+
+bool stateFresh(bool seen, uint32_t receivedMs, uint32_t nowMs, uint32_t timeoutMs = DEVICE_TIMEOUT_MS) {
+  return seen && (nowMs - receivedMs <= timeoutMs);
+}
+
+uint8_t connectedDeviceCount(uint32_t nowMs) {
+  bool wristOk = false;
+  bool camOk = false;
+  bool keyboardOk = false;
+  bool chargingOk = false;
+  bool audioOk = false;
+  bool fansOk = false;
+
+  portENTER_CRITICAL(&stateMux);
+  wristOk = stateFresh(latestWristband.seen, latestWristband.received_ms, nowMs);
+  camOk = stateFresh(latestCamDock.seen, latestCamDock.received_ms, nowMs);
+  keyboardOk = stateFresh(latestKeyboard.seen, latestKeyboard.received_ms, nowMs);
+  chargingOk = stateFresh(latestChargingDock.seen, latestChargingDock.received_ms, nowMs);
+  audioOk = stateFresh(latestAudioDock.seen, latestAudioDock.received_ms, nowMs, AUDIODOCK_LED_TIMEOUT_MS);
+  fansOk = stateFresh(latestFans.seen, latestFans.received_ms, nowMs);
+  portEXIT_CRITICAL(&stateMux);
+
+  uint8_t count = 0;
+  if (wristOk) count++;
+  if (camOk) count++;
+  if (keyboardOk) count++;
+  if (chargingOk) count++;
+  if (audioOk) count++;
+  if (fansOk) count++;
+  return count;
+}
+
+void updateAntennaStatusLed(uint32_t nowMs) {
+  if (nowMs - lastAntennaLedUpdateMs < ANTENNA_LED_UPDATE_MS) {
+    return;
+  }
+  lastAntennaLedUpdateMs = nowMs;
+
+  uint8_t connected = connectedDeviceCount(nowMs);
+  uint8_t state = connected;
+  if (state > 3 && state < ANTENNA_TOTAL_TRACKED_DEVICES) {
+    state = 3;
+  }
+  if (connected >= ANTENNA_TOTAL_TRACKED_DEVICES) {
+    state = ANTENNA_TOTAL_TRACKED_DEVICES;
+  }
+
+  if (state == lastAntennaLedState) {
+    return;
+  }
+  lastAntennaLedState = state;
+
+  if (state == 0) {
+    setAntennaStatusLed(32, 0, 0);        // red: none connected
+  } else if (state == 1) {
+    setAntennaStatusLed(24, 24, 24);      // white: one connected
+  } else if (state == 2) {
+    setAntennaStatusLed(32, 24, 0);       // yellow: two connected
+  } else if (state == ANTENNA_TOTAL_TRACKED_DEVICES) {
+    setAntennaStatusLed(0, 32, 0);        // green: all connected
+  } else {
+    setAntennaStatusLed(0, 0, 40);        // blue: three or more connected
   }
 }
 
@@ -1302,6 +1381,7 @@ void setup() {
   Serial.setTxBufferSize(2048);
   Serial.begin(AIRTRIXX_SERIAL_BAUD);
   delay(200);
+  setAntennaStatusLed(32, 0, 0);
 
   // Initialize the thread-safe FreeRTOS Mutex for Serial operations
   serialMutex = xSemaphoreCreateMutex();
@@ -1363,6 +1443,7 @@ void loop() {
   pumpSerialCommands();
 
   uint32_t nowMs = millis();
+  updateAntennaStatusLed(nowMs);
   
   if (isStreamingAudioDock && (nowMs - lastAudioDockChunkMs >= AUDIODOCK_STREAM_TIMEOUT_MS)) {
     isStreamingAudioDock = false;
