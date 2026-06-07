@@ -21,10 +21,14 @@ class AppPaths:
     temp_dir: Path
     exports_dir: Path
     gesture_data_dir: Path
+    keyboard_data_dir: Path
     calibration_path: Path
     mapping_path: Path
     servo_debug_log_path: Path
     audio_recording_path: Path
+    keyboard_dataset_path: Path
+    keyboard_model_path: Path
+    keyboard_words_path: Path
 
 
 def is_frozen() -> bool:
@@ -68,6 +72,7 @@ def build_app_paths(app_name: str = APP_NAME) -> AppPaths:
     temp_dir = user_data_dir / "temp"
     exports_dir = user_data_dir / "exports"
     gesture_data_dir = user_data_dir / "gestures"
+    keyboard_data_dir = user_data_dir / "keyboard"
     return AppPaths(
         user_data_dir=user_data_dir,
         config_dir=config_dir,
@@ -75,10 +80,14 @@ def build_app_paths(app_name: str = APP_NAME) -> AppPaths:
         temp_dir=temp_dir,
         exports_dir=exports_dir,
         gesture_data_dir=gesture_data_dir,
+        keyboard_data_dir=keyboard_data_dir,
         calibration_path=config_dir / "calibration.json",
         mapping_path=config_dir / "input_mappings.json",
         servo_debug_log_path=logs_dir / "servo_debug.log",
         audio_recording_path=temp_dir / "last_esp32_recording.wav",
+        keyboard_dataset_path=keyboard_data_dir / "raw_samples.csv",
+        keyboard_model_path=keyboard_data_dir / "word_knn_model.npz",
+        keyboard_words_path=keyboard_data_dir / "current_training_words.txt",
     )
 
 
@@ -90,6 +99,7 @@ def ensure_app_paths(paths: AppPaths) -> None:
         paths.temp_dir,
         paths.exports_dir,
         paths.gesture_data_dir,
+        paths.keyboard_data_dir,
     ):
         directory.mkdir(parents=True, exist_ok=True)
 

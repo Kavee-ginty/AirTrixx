@@ -15,6 +15,10 @@ from audio_dock import AudioDockBridge
 from config import DEFAULT_CALIBRATION, load_calibration_with_warnings, save_calibration
 
 
+class FakeConnectedSerialBridge:
+    is_connected = True
+
+
 class AppPathTests(unittest.TestCase):
     def test_windows_user_data_uses_appdata(self) -> None:
         with patch("app_paths.platform.system", return_value="Windows"), patch.dict(
@@ -36,6 +40,10 @@ class AppPathTests(unittest.TestCase):
         self.assertEqual(paths.servo_debug_log_path, paths.logs_dir / "servo_debug.log")
         self.assertEqual(paths.audio_recording_path, paths.temp_dir / "last_esp32_recording.wav")
         self.assertEqual(paths.gesture_data_dir, paths.user_data_dir / "gestures")
+        self.assertEqual(paths.keyboard_data_dir, paths.user_data_dir / "keyboard")
+        self.assertEqual(paths.keyboard_dataset_path, paths.keyboard_data_dir / "raw_samples.csv")
+        self.assertEqual(paths.keyboard_model_path, paths.keyboard_data_dir / "word_knn_model.npz")
+        self.assertEqual(paths.keyboard_words_path, paths.keyboard_data_dir / "current_training_words.txt")
 
 
 class ConfigTests(unittest.TestCase):
@@ -68,6 +76,17 @@ class AudioDockSettingsTests(unittest.TestCase):
         bridge = AudioDockBridge()
         with patch.dict(os.environ, {"DEEPGRAM_API_KEY": "env-key"}):
             self.assertEqual(bridge.load_deepgram_key(), "env-key")
+
+    def test_audio_dock_connects_without_deepgram_key(self) -> None:
+        logs: list[str] = []
+        bridge = AudioDockBridge(serial_bridge=FakeConnectedSerialBridge(), on_log=logs.append)
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(bridge.connect())
+
+        self.assertTrue(bridge.is_connected)
+        self.assertEqual(bridge.status, "Waiting for Clap")
+        self.assertTrue(any("transcription needs a key" in message for message in logs))
 
 
 if __name__ == "__main__":

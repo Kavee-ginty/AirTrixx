@@ -45,6 +45,7 @@ class AudioDockBridge:
         self.audio_buffer = bytearray()
         self.deepgram_api_key = deepgram_api_key.strip()
         self.audio_recording_path = audio_recording_path
+        self._missing_key_warning_logged = False
 
     def _log(self, message: str) -> None:
         if self.on_log:
@@ -65,14 +66,10 @@ class AudioDockBridge:
 
     def set_deepgram_key(self, api_key: str) -> None:
         self.deepgram_api_key = api_key.strip()
+        if self.deepgram_api_key:
+            self._missing_key_warning_logged = False
 
     def connect(self, port: str | None = None) -> bool:
-        try:
-            self.load_deepgram_key()
-        except Exception as exc:
-            self._log(f"Error: {exc}")
-            return False
-
         if not self.serial_bridge:
             self._log("Error: Serial bridge reference not set.")
             return False
@@ -82,9 +79,18 @@ class AudioDockBridge:
             self._set_status("Error")
             return False
 
+        if self.is_connected:
+            return True
+
         self.is_connected = True
         self._set_status("Waiting for Clap")
         self._log("Connected wirelessly via Antenna ESP-NOW bridge.")
+        try:
+            self.load_deepgram_key()
+        except Exception as exc:
+            if not self._missing_key_warning_logged:
+                self._missing_key_warning_logged = True
+                self._log(f"Warning: {exc} Audio will be received, but transcription needs a key.")
         self._log("Waiting for clap detection and audio stream...")
         return True
 
