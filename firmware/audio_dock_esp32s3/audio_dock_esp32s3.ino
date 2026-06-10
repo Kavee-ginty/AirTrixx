@@ -30,6 +30,7 @@
 #include <esp_wifi.h>
 #include <esp_heap_caps.h>
 #include <math.h>
+#include <stdlib.h>
 
 #if __has_include("../shared/AirTrixxConfig.h")
 #include "../shared/AirTrixxConfig.h"
@@ -105,6 +106,11 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 #define COMPONENT_STATUS_STALE_MS 2000
 #define AUDIODOCK_HEARTBEAT_INTERVAL_MS 500
 Adafruit_NeoPixel ledRing(LED_RING_COUNT, LED_RING_PIN, NEO_GRB + NEO_KHZ800);
+static const uint8_t AUDIO_DOCK_RING_SEGMENTS = 8;
+static const uint8_t AUDIO_DOCK_COMPONENT_SEGMENTS = 6;
+static const uint8_t AUDIO_DOCK_LEDS_PER_SEGMENT = LED_RING_COUNT / AUDIO_DOCK_RING_SEGMENTS;
+static const uint32_t AUDIO_DOCK_HEARTBEAT_MS = 2000;
+static const uint32_t AUDIO_DOCK_RING_REFRESH_MS = 100;
 
 bool i2sReady = false;
 bool speakerReady = false;
@@ -113,7 +119,7 @@ uint8_t *audioBuffer = nullptr;
 uint16_t audioDockSequence = 0;
 uint8_t pendingTriggerType = 0;
 uint32_t recordedWavBytes = 0;
-String lastRecordError = "";
+static uint32_t lastAudioDockHeartbeatMs = 0;
 
 // -------------------- Edge Impulse Inferencing Variables --------------------
 typedef struct {
@@ -143,6 +149,7 @@ void displayLCDTranscript(const String &transcript);
 void ringChase(uint8_t r, uint8_t g, uint8_t b, uint16_t head);
 void ringProgress(uint32_t current, uint32_t total, uint8_t r, uint8_t g, uint8_t b);
 void ringFlash(uint8_t r, uint8_t g, uint8_t b, uint8_t flashes, uint16_t onMs, uint16_t offMs);
+void ringShowConnectionMask(uint8_t mask);
 void ringShowReady();
 void ringShowSuccess();
 void ringShowError();
@@ -283,6 +290,7 @@ void ringShowReady() {
   if (!ringShowComponentStatus()) {
     ringFill(0, 0, 24);
   }
+}
 }
 
 void ringShowSuccess() {
@@ -954,7 +962,11 @@ static int ei_i2s_deinit(void) {
 }
 
 static bool microphone_inference_start(uint32_t n_samples) {
-  inference.buffer = (int16_t *)malloc(n_samples * sizeof(int16_t));
+  size_t inferenceBytes = n_samples * sizeof(int16_t);
+  inference.buffer = (int16_t *)heap_caps_malloc(inferenceBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (inference.buffer == NULL) {
+    inference.buffer = (int16_t *)heap_caps_malloc(inferenceBytes, MALLOC_CAP_8BIT);
+  }
   if (inference.buffer == NULL) {
     return false;
   }
@@ -1197,7 +1209,7 @@ bool sendAudioDockHeartbeat() {
              ++audioDockSequence,
              millis(),
              false);
-  return sendEspNowToAntenna(reinterpret_cast<const uint8_t *>(&packet), sizeof(packet), 0);
+  return sendEspNowToAntenna(reinterpret_cast<const uint8_t *>(&packet), sizeof(packet), 2);
 }
 
 uint8_t audioDockBatteryPercentFromVoltage(float voltage) {
@@ -1269,7 +1281,6 @@ void pumpAudioDockBatteryStatus() {
   lastBatteryReportMs = nowMs;
   sendAudioDockBatteryStatus();
 }
-
 bool sendAudioDockTrigger(uint8_t triggerType, uint32_t audioSize) {
   AudioDockDataPacket dataPacket = {};
   fillHeader(dataPacket.header,
@@ -1668,6 +1679,8 @@ void loop() {
           } else if (label.equalsIgnoreCase("Double clap")) {
             doubleClapScore = val;
           } else if (label.equalsIgnoreCase("Noice") || label.equalsIgnoreCase("Noise")) {
+            noiseScore = val;
+          } else if (val > noiseScore) {
             noiseScore = val;
           }
         }
