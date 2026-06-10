@@ -315,9 +315,9 @@ void debugPrintln(const String &message) {
   }
 }
 
-void setAntennaStatusLed(uint8_t r, uint8_t g, uint8_t b) {
-  neopixelWrite(ANTENNA_STATUS_LED_PIN, r, g, b);
-}
+// void setAntennaStatusLed(uint8_t r, uint8_t g, uint8_t b) {
+//   neopixelWrite(ANTENNA_STATUS_LED_PIN, r, g, b);
+// }
 
 bool stateFresh(bool seen, uint32_t receivedMs, uint32_t nowMs, uint32_t timeoutMs = DEVICE_TIMEOUT_MS) {
   return seen && (nowMs - receivedMs <= timeoutMs);
@@ -361,47 +361,47 @@ uint8_t connectedDeviceCountFromMask(uint8_t mask) {
   return count;
 }
 
-void updateAntennaStatusLed(uint32_t nowMs) {
-  if (nowMs - lastAntennaLedUpdateMs < ANTENNA_LED_UPDATE_MS) {
-    return;
-  }
-  lastAntennaLedUpdateMs = nowMs;
+// void updateAntennaStatusLed(uint32_t nowMs) {
+//   if (nowMs - lastAntennaLedUpdateMs < ANTENNA_LED_UPDATE_MS) {
+//     return;
+//   }
+//   lastAntennaLedUpdateMs = nowMs;
 
-  uint8_t connectedMask = connectedDeviceMask(nowMs);
-  uint8_t connected = connectedDeviceCountFromMask(connectedMask);
-  if (connected > ANTENNA_TOTAL_TRACKED_DEVICES) {
-    connected = ANTENNA_TOTAL_TRACKED_DEVICES;
-  }
+//   uint8_t connectedMask = connectedDeviceMask(nowMs);
+//   uint8_t connected = connectedDeviceCountFromMask(connectedMask);
+//   if (connected > ANTENNA_TOTAL_TRACKED_DEVICES) {
+//     connected = ANTENNA_TOTAL_TRACKED_DEVICES;
+//   }
 
-  if (connected == lastAntennaLedState) {
-    return;
-  }
-  lastAntennaLedState = connected;
+//   if (connected == lastAntennaLedState) {
+//     return;
+//   }
+//   lastAntennaLedState = connected;
 
-  switch (connected) {
-    case 0:
-      setAntennaStatusLed(32, 0, 0);
-      break;
-    case 1:
-      setAntennaStatusLed(24, 24, 24);
-      break;
-    case 2:
-      setAntennaStatusLed(32, 24, 0);
-      break;
-    case 3:
-      setAntennaStatusLed(0, 28, 48);
-      break;
-    case 4:
-      setAntennaStatusLed(48, 0, 20);
-      break;
-    case 5:
-      setAntennaStatusLed(28, 0, 48);
-      break;
-    default:
-      setAntennaStatusLed(0, 32, 0);
-      break;
-  }
-}
+//   switch (connected) {
+//     case 0:
+//       setAntennaStatusLed(32, 0, 0);
+//       break;
+//     case 1:
+//       setAntennaStatusLed(24, 24, 24);
+//       break;
+//     case 2:
+//       setAntennaStatusLed(32, 24, 0);
+//       break;
+//     case 3:
+//       setAntennaStatusLed(0, 28, 48);
+//       break;
+//     case 4:
+//       setAntennaStatusLed(48, 0, 20);
+//       break;
+//     case 5:
+//       setAntennaStatusLed(28, 0, 48);
+//       break;
+//     default:
+//       setAntennaStatusLed(0, 32, 0);
+//       break;
+//   }
+// }
 
 void broadcastAudioDockStatusMask(uint32_t nowMs) {
   if (nowMs - lastAudioDockStatusBroadcastMs < AUDIODOCK_STATUS_BROADCAST_MS) {
