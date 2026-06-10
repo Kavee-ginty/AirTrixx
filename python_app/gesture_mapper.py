@@ -25,6 +25,43 @@ MIN_STEP_AMPLITUDE_BY_SUFFIX: dict[str, float] = {
     "_dps": 2.0,
 }
 DEFAULT_MIN_STEP_AMPLITUDE = 0.5
+REMOVED_WRIST_FIELD_KEYS = {
+    "keyboard_input",
+    "wrist_pitch_delta",
+    "wrist_roll_delta",
+    "wrist_pitch_abs_delta",
+    "wrist_roll_abs_delta",
+    "wrist_pitch_dominant",
+    "wrist_roll_dominant",
+    "wrist_dominant_axis",
+    "wrist_motion_roll_delta",
+    "wrist_motion_pitch_delta",
+    "wrist_motion_roll_abs_delta",
+    "wrist_motion_pitch_abs_delta",
+    "wrist_motion",
+    "wrist_roll_right_detected",
+    "wrist_roll_left_detected",
+    "wrist_roll_right_then_neutral_detected",
+    "wrist_roll_velocity_dps",
+    "wrist_pitch_velocity_dps",
+    "wrist_roll_velocity_abs_dps",
+    "wrist_pitch_velocity_abs_dps",
+    "wrist_roll_velocity_peak_dps",
+    "wrist_pitch_velocity_peak_dps",
+    "wrist_roll_velocity_peak_ratio",
+    "wrist_pitch_velocity_peak_ratio",
+    "wrist_roll_velocity_peak_detected",
+    "wrist_pitch_velocity_peak_detected",
+    "wrist_roll_velocity_profile",
+    "wrist_pitch_velocity_profile",
+    "wrist_roll_candidate_active",
+    "wrist_pitch_candidate_active",
+    "wrist_pitch_up_detected",
+    "wrist_pitch_down_detected",
+    "wrist_roll_event_cooldown_active",
+    "wrist_roll_event_blocked",
+    "wrist_roll_event_pulse_active",
+}
 
 EXCLUDED_KEY_PATTERNS = (
     re.compile(r"_gesture$"),
@@ -145,6 +182,8 @@ def _min_step_amplitude_for_key(key: str) -> float:
 
 
 def _is_excluded_key(key: str) -> bool:
+    if key in REMOVED_WRIST_FIELD_KEYS:
+        return True
     return any(pattern.search(key) for pattern in EXCLUDED_KEY_PATTERNS)
 
 

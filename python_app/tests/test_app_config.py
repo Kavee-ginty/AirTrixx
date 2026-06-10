@@ -48,10 +48,14 @@ class AppPathTests(unittest.TestCase):
         self.assertEqual(paths.audio_recording_path, paths.temp_dir / "last_esp32_recording.wav")
         self.assertEqual(paths.gesture_data_dir, paths.user_data_dir / "gestures")
         self.assertEqual(paths.keyboard_data_dir, paths.user_data_dir / "keyboard")
+        self.assertEqual(paths.wristband_data_dir, paths.user_data_dir / "wristband")
+        self.assertEqual(paths.wristband_model_dir, paths.wristband_data_dir / "model")
         self.assertEqual(paths.audio_training_dir, paths.user_data_dir / "audio_training")
         self.assertEqual(paths.keyboard_dataset_path, paths.keyboard_data_dir / "raw_samples.csv")
         self.assertEqual(paths.keyboard_model_path, paths.keyboard_data_dir / "word_knn_model.npz")
         self.assertEqual(paths.keyboard_words_path, paths.keyboard_data_dir / "current_training_words.txt")
+        self.assertEqual(paths.wristband_model_path, paths.wristband_model_dir / "wristband_gesture_model.tflite")
+        self.assertEqual(paths.wristband_labels_path, paths.wristband_model_dir / "labels.txt")
 
 
 class ConfigTests(unittest.TestCase):

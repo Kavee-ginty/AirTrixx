@@ -46,13 +46,6 @@ DELTA_COMPARATORS = {
 }
 COMPARATORS = STANDARD_COMPARATORS | DELTA_COMPARATORS
 GESTURE_COOLDOWN_SEC = 0.6
-WRIST_GESTURE_SIGNAL_NAMES = {
-    "fused.wrist_roll_right_detected": "wrist_roll_right",
-    "fused.wrist_roll_left_detected": "wrist_roll_left",
-    "fused.wrist_pitch_up_detected": "wrist_pitch_up",
-    "fused.wrist_pitch_down_detected": "wrist_pitch_down",
-    "fused.wrist_roll_right_then_neutral_detected": "wrist_roll_right_then_neutral",
-}
 TEXT_COMMAND_KEYS = {
     "space": ["space"],
     "return": ["enter"],
@@ -557,7 +550,6 @@ class MappingConfig:
         profiles = [MappingProfile.from_dict(item) for item in data.get("profiles", [])]
         if not profiles:
             profiles = [MappingProfile()]
-        _upgrade_wrist_pitch_rules(profiles)
         active_profile = str(data.get("active_profile") or profiles[0].name)
         if active_profile not in {profile.name for profile in profiles}:
             active_profile = profiles[0].name
@@ -589,30 +581,6 @@ class MappingConfig:
 
 def default_mapping_config() -> MappingConfig:
     return MappingConfig()
-
-
-def _upgrade_wrist_pitch_rules(profiles: list[MappingProfile]) -> None:
-    for profile in profiles:
-        for rule in profile.mappings:
-            if rule.source != "fused.wrist_pitch_delta":
-                continue
-            if not any(condition.source == "fused.wrist_pitch_dominant" for condition in rule.all_conditions()):
-                continue
-            try:
-                threshold = float(rule.threshold)
-            except (TypeError, ValueError):
-                continue
-            if rule.comparator == "gt" and threshold > 0:
-                rule.source = "fused.wrist_pitch_up_detected"
-            elif rule.comparator == "lt" and threshold < 0:
-                rule.source = "fused.wrist_pitch_down_detected"
-            else:
-                continue
-            rule.comparator = "truthy"
-            rule.threshold = True
-            rule.low = 0.0
-            rule.high = 1.0
-            rule.hysteresis = 0.0
 
 
 def load_mapping_config(path: Path = DEFAULT_MAPPING_PATH) -> tuple[MappingConfig, str | None]:
@@ -885,13 +853,10 @@ class InputMapper:
             self._execute_active(rule.id, rule.action, state, now_s, source_value, signals or {})
 
     def _gesture_name_for_rule(self, rule: MappingRule) -> str | None:
-        gesture_name = WRIST_GESTURE_SIGNAL_NAMES.get(rule.source)
-        if gesture_name:
-            return gesture_name
-        if rule.source == "fused.wrist_motion" and rule.comparator == "eq":
+        if rule.source == "fused.model_value" and rule.comparator == "eq":
             threshold = str(rule.threshold).strip().lower()
             if threshold and threshold != "none":
-                return f"wrist_motion:{threshold}"
+                return f"model_value:{threshold}"
         return None
 
     def _can_fire_gesture(self, name: str, now_s: float) -> bool:

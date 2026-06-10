@@ -135,51 +135,56 @@ class InputMapperRuntimeTests(unittest.TestCase):
         mapper.process(snapshot(a=True), 0.11)
         self.assertEqual(backend.events, [("key_tap", ("enter",))])
 
-    def test_wrist_gesture_bypasses_debounce_and_uses_action_cooldown(self) -> None:
+    def test_model_value_gesture_bypasses_debounce_and_uses_action_cooldown(self) -> None:
         rule = MappingRule(
-            source="fused.wrist_roll_right_detected",
-            comparator="truthy",
+            source="fused.model_value",
+            comparator="eq",
+            threshold="rotate_right",
             debounce_ms=1000,
             action=MappingAction(type="keyboard_tap", keys=["r"]),
         )
         mapper, backend = self.mapper_with([rule])
-        mapper.process(snapshot(wrist_roll_right_detected=True), 0.0)
-        mapper.process(snapshot(wrist_roll_right_detected=False), 0.01)
-        mapper.process(snapshot(wrist_roll_right_detected=True), GESTURE_COOLDOWN_SEC - 0.01)
-        mapper.process(snapshot(wrist_roll_right_detected=False), GESTURE_COOLDOWN_SEC)
-        mapper.process(snapshot(wrist_roll_right_detected=True), GESTURE_COOLDOWN_SEC + 0.01)
+        mapper.process(snapshot(model_value="rotate_right"), 0.0)
+        mapper.process(snapshot(model_value="none"), 0.01)
+        mapper.process(snapshot(model_value="rotate_right"), GESTURE_COOLDOWN_SEC - 0.01)
+        mapper.process(snapshot(model_value="none"), GESTURE_COOLDOWN_SEC)
+        mapper.process(snapshot(model_value="rotate_right"), GESTURE_COOLDOWN_SEC + 0.01)
         self.assertEqual(backend.events, [("key_tap", ("r",)), ("key_tap", ("r",))])
 
-    def test_wrist_gesture_cooldowns_are_per_gesture_class(self) -> None:
+    def test_model_value_cooldowns_are_per_gesture_class(self) -> None:
         rules = [
             MappingRule(
                 id="roll",
-                source="fused.wrist_roll_right_detected",
-                comparator="truthy",
+                source="fused.model_value",
+                comparator="eq",
+                threshold="rotate_right",
                 action=MappingAction(type="keyboard_tap", keys=["r"]),
             ),
             MappingRule(
-                id="pitch",
-                source="fused.wrist_pitch_up_detected",
-                comparator="truthy",
+                id="flick",
+                source="fused.model_value",
+                comparator="eq",
+                threshold="flick",
                 action=MappingAction(type="keyboard_tap", keys=["p"]),
             ),
         ]
         mapper, backend = self.mapper_with(rules)
-        mapper.process(snapshot(wrist_roll_right_detected=True, wrist_pitch_up_detected=True), 0.0)
+        mapper.process(snapshot(model_value="rotate_right"), 0.0)
+        mapper.process(snapshot(model_value="none"), 0.01)
+        mapper.process(snapshot(model_value="flick"), 0.02)
         self.assertEqual(backend.events, [("key_tap", ("r",)), ("key_tap", ("p",))])
 
-    def test_learned_wrist_motion_mapping_uses_action_cooldown(self) -> None:
+    def test_model_value_mapping_uses_action_cooldown(self) -> None:
         rule = MappingRule(
-            source="fused.wrist_motion",
+            source="fused.model_value",
             comparator="eq",
-            threshold="roll_right_then_neutral",
+            threshold="wrist_circle",
             action=MappingAction(type="keyboard_tap", keys=["n"]),
         )
         mapper, backend = self.mapper_with([rule])
-        mapper.process(snapshot(wrist_motion="roll_right_then_neutral"), 0.0)
-        mapper.process(snapshot(wrist_motion="none"), 0.01)
-        mapper.process(snapshot(wrist_motion="roll_right_then_neutral"), 0.2)
+        mapper.process(snapshot(model_value="wrist_circle"), 0.0)
+        mapper.process(snapshot(model_value="none"), 0.01)
+        mapper.process(snapshot(model_value="wrist_circle"), 0.2)
         self.assertEqual(backend.events, [("key_tap", ("n",))])
 
     def test_repeat_action_uses_interval(self) -> None:
@@ -429,6 +434,11 @@ class InputMapperRuntimeTests(unittest.TestCase):
         visible = SignalCatalog.flatten(hand_snapshot({"right_hand_z_mm": 700}, right_visible=True))
         self.assertIsNone(hidden["hands.right.z_mm"].value)
         self.assertEqual(visible["hands.right.z_mm"].value, 700)
+
+    def test_signal_catalog_exposes_model_value(self) -> None:
+        signals = SignalCatalog.flatten(snapshot(model_value="flick"))
+
+        self.assertEqual(signals["fused.model_value"].value, "flick")
 
     def test_keyboard_text_action_types_live_signal_value(self) -> None:
         rule = MappingRule(
