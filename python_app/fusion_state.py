@@ -34,6 +34,9 @@ FIELD_ORDER = [
     "audiodock_input",
     "fans_input",
     "model_value",
+    "wrist_rule_value",
+    "wrist_rotate_left_return",
+    "wrist_rotate_right_return",
 ]
 
 
@@ -55,6 +58,9 @@ class FusionState:
         hand_state: dict[str, dict[str, Any]],
         now_s: float | None = None,
         model_value: str | None = None,
+        wrist_rule_value: str | None = None,
+        wrist_rotate_left_return: bool = False,
+        wrist_rotate_right_return: bool = False,
     ) -> dict[str, Any]:
         devices = serial_state.get("devices", {}) if isinstance(serial_state, dict) else {}
         wrist = devices.get("wristband", {}) if isinstance(devices, dict) else {}
@@ -99,6 +105,9 @@ class FusionState:
             "audiodock_input": audiodock_input if audiodock_input not in (None, "") else "TBD",
             "fans_input": fans.get("input") if isinstance(fans, dict) else None,
             "model_value": str(model_value or "none"),
+            "wrist_rule_value": str(wrist_rule_value or "none"),
+            "wrist_rotate_left_return": bool(wrist_rotate_left_return),
+            "wrist_rotate_right_return": bool(wrist_rotate_right_return),
         }
 
     def build_input_array(self, input_dict: dict[str, Any]) -> list[Any]:
@@ -110,12 +119,18 @@ class FusionState:
         hand_state: dict[str, dict[str, Any]],
         now_s: float | None = None,
         model_value: str | None = None,
+        wrist_rule_value: str | None = None,
+        wrist_rotate_left_return: bool = False,
+        wrist_rotate_right_return: bool = False,
     ) -> dict[str, Any]:
         input_dict = self.build_input_dict(
             serial_state,
             hand_state,
             now_s=now_s,
             model_value=model_value,
+            wrist_rule_value=wrist_rule_value,
+            wrist_rotate_left_return=wrist_rotate_left_return,
+            wrist_rotate_right_return=wrist_rotate_right_return,
         )
         return {
             "field_order": FIELD_ORDER,

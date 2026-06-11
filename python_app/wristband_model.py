@@ -461,9 +461,10 @@ class WristbandCsvCapture:
     on_status: StatusCallback | None = None
     is_recording: bool = False
     label: str = ""
+    red_label: str = "idle"
     started_s: float = 0.0
     samples: list[dict[str, Any]] = field(default_factory=list)
-    completed_samples: list[list[dict[str, Any]]] = field(default_factory=list)
+    completed_samples: list[tuple[str, list[dict[str, Any]]]] = field(default_factory=list)
     phase: str = "idle"
     phase_started_s: float = 0.0
     phase_seconds: float = CAPTURE_PHASE_SECONDS
@@ -479,17 +480,18 @@ class WristbandCsvCapture:
 
     @property
     def row_count(self) -> int:
-        return len(self.samples) + sum(len(segment) for segment in self.completed_samples)
+        return len(self.samples) + sum(len(segment) for _label, segment in self.completed_samples)
 
     @property
     def is_record_phase(self) -> bool:
         return self.is_recording and self.phase == "record"
 
-    def start(self, label: str) -> bool:
+    def start(self, label: str, red_label: str = "idle") -> bool:
         if self.is_recording:
             self._status("Wristband capture is already running.")
             return False
         self.label = sanitize_label(label)
+        self.red_label = sanitize_label(red_label)
         self.samples = []
         self.completed_samples = []
         self._last_sequence = None
@@ -498,7 +500,7 @@ class WristbandCsvCapture:
         self.phase = "record"
         self.phase_started_s = time.monotonic()
         self.is_recording = True
-        self._status(f"Recording wristband label: {self.label}. Green phase records, red phase pauses.")
+        self._status(f"Recording wristband labels: green={self.label}, red={self.red_label}.")
         return True
 
     def update_phase(self, now_s: float | None = None) -> None:
@@ -513,7 +515,7 @@ class WristbandCsvCapture:
                 self._finish_current_sample()
                 self.phase = "rest"
             else:
-                self.samples = []
+                self._finish_current_sample()
                 self.phase = "record"
             self._last_sequence = None
             self._has_last_sequence = False
@@ -533,16 +535,16 @@ class WristbandCsvCapture:
 
     def _finish_current_sample(self) -> None:
         if self.samples:
-            self.completed_samples.append(list(self.samples))
+            phase_label = self.label if self.phase == "record" else self.red_label
+            self.completed_samples.append((phase_label, list(self.samples)))
         self.samples = []
 
     def add_serial_state(self, serial_state: dict[str, Any]) -> None:
         if not self.is_recording:
             return
         self.update_phase()
-        if self.phase != "record":
-            return
-        sample = extract_wristband_imu_sample(serial_state, label=self.label)
+        phase_label = self.label if self.phase == "record" else self.red_label
+        sample = extract_wristband_imu_sample(serial_state, label=phase_label)
         if sample is not None:
             self.samples.append(sample)
 
@@ -550,8 +552,7 @@ class WristbandCsvCapture:
         if not self.is_recording:
             return []
         self.update_phase()
-        if self.phase == "record":
-            self._finish_current_sample()
+        self._finish_current_sample()
         self.is_recording = False
         self.phase = "idle"
         self._last_sequence = None
@@ -562,8 +563,14 @@ class WristbandCsvCapture:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         paths: list[Path] = []
-        for index, segment in enumerate(self.completed_samples, start=1):
-            path = self.output_dir / edge_impulse_sample_filename(self.label, timestamp, index)
+        label_counts: dict[str, int] = {}
+        for phase_label, segment in self.completed_samples:
+            label_counts[phase_label] = label_counts.get(phase_label, 0) + 1
+            path = self.output_dir / edge_impulse_sample_filename(
+                phase_label,
+                timestamp,
+                label_counts[phase_label],
+            )
             write_samples_csv(path, segment)
             paths.append(path)
         self.completed_samples = []

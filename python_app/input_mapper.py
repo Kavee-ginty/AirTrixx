@@ -578,9 +578,59 @@ class MappingConfig:
     def profile_names(self) -> list[str]:
         return [profile.name for profile in self.profiles]
 
+    def remove_profile(self, name: str) -> bool:
+        if len(self.profiles) <= 1 or name not in self.profile_names():
+            return False
+        self.profiles = [profile for profile in self.profiles if profile.name != name]
+        if self.active_profile == name:
+            self.active_profile = self.profiles[0].name
+        return True
+
+
+TAB_SWITCH_PROFILE_NAME = "Wrist Tab Switching"
+
+
+def wrist_tab_switching_profile() -> MappingProfile:
+    left_fist = MappingCondition(
+        source="hands.left.gesture",
+        comparator="eq",
+        threshold="closed_fist",
+    )
+    return MappingProfile(
+        name=TAB_SWITCH_PROFILE_NAME,
+        mappings=[
+            MappingRule(
+                id="wrist_tab_cycle_forward",
+                name="Cycle tabs forward",
+                source="fused.wrist_rule_value",
+                comparator="eq",
+                threshold="rotate_right_return",
+                conditions=[left_fist],
+                recognition_label="Cycle tabs forward",
+                action=MappingAction(type="keyboard_tap", keys=["alt", "tab"]),
+            ),
+            MappingRule(
+                id="wrist_tab_cycle_backward",
+                name="Cycle tabs backward",
+                source="fused.wrist_rule_value",
+                comparator="eq",
+                threshold="rotate_left_return",
+                conditions=[
+                    MappingCondition(
+                        source="hands.left.gesture",
+                        comparator="eq",
+                        threshold="closed_fist",
+                    )
+                ],
+                recognition_label="Cycle tabs backward",
+                action=MappingAction(type="keyboard_tap", keys=["alt", "shift", "tab"]),
+            ),
+        ],
+    )
+
 
 def default_mapping_config() -> MappingConfig:
-    return MappingConfig()
+    return MappingConfig(profiles=[MappingProfile(), wrist_tab_switching_profile()])
 
 
 def load_mapping_config(path: Path = DEFAULT_MAPPING_PATH) -> tuple[MappingConfig, str | None]:
@@ -853,10 +903,10 @@ class InputMapper:
             self._execute_active(rule.id, rule.action, state, now_s, source_value, signals or {})
 
     def _gesture_name_for_rule(self, rule: MappingRule) -> str | None:
-        if rule.source == "fused.model_value" and rule.comparator == "eq":
+        if rule.source in {"fused.model_value", "fused.wrist_rule_value"} and rule.comparator == "eq":
             threshold = str(rule.threshold).strip().lower()
             if threshold and threshold != "none":
-                return f"model_value:{threshold}"
+                return f"{rule.source}:{threshold}"
         return None
 
     def _can_fire_gesture(self, name: str, now_s: float) -> bool:

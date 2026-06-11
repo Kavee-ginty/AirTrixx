@@ -91,7 +91,7 @@ class WristbandModelTests(unittest.TestCase):
 
         self.assertEqual(len(capture.samples), 3)
 
-    def test_capture_records_only_green_phases_as_samples(self) -> None:
+    def test_capture_records_green_as_gesture_and_red_as_idle(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             capture = WristbandCsvCapture(Path(tmpdir))
             capture.phase_seconds = 3.0
@@ -101,14 +101,31 @@ class WristbandModelTests(unittest.TestCase):
             capture.update_phase(start_s + 3.1)
             self.assertEqual(capture.phase, "rest")
             capture.add_serial_state(serial_state(sequence=2))
-            self.assertEqual(capture.sample_count, 1)
-            self.assertEqual(capture.row_count, 1)
+            self.assertEqual(capture.sample_count, 2)
+            self.assertEqual(capture.row_count, 2)
             capture.update_phase(start_s + 6.1)
             self.assertEqual(capture.phase, "record")
             capture.add_serial_state(serial_state(sequence=3))
             paths = capture.stop()
 
-            self.assertEqual(len(paths), 2)
+            self.assertEqual(len(paths), 3)
+            self.assertEqual([infer_label_from_sample_filename(path) for path in paths], ["flick", "idle", "flick"])
+
+    def test_capture_records_custom_green_and_red_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            capture = WristbandCsvCapture(Path(tmpdir))
+            capture.phase_seconds = 3.0
+            self.assertTrue(capture.start("rotate left", "rotate right"))
+            start_s = capture.phase_started_s
+            capture.add_serial_state(serial_state(sequence=1))
+            capture.update_phase(start_s + 3.1)
+            capture.add_serial_state(serial_state(sequence=2))
+            paths = capture.stop()
+
+            self.assertEqual(
+                [infer_label_from_sample_filename(path) for path in paths],
+                ["rotate_left", "rotate_right"],
+            )
 
     def test_sanitize_label_preserves_mapper_friendly_name(self) -> None:
         self.assertEqual(sanitize_label("wrist circle!"), "wrist_circle")
