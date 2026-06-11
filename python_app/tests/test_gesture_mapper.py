@@ -100,16 +100,29 @@ class GestureMapperTests(unittest.TestCase):
     def test_boolean_detected(self) -> None:
         baseline = make_rep(
             gesture_name="baseline",
-            frames=[{"wrist_roll_right_detected": False} for _ in range(40)],
+            frames=[{"custom_detected": False} for _ in range(40)],
         )
         target = make_rep(
-            gesture_name="wrist_roll_right",
-            frames=[{"wrist_roll_right_detected": index > 10} for index in range(50)],
+            gesture_name="custom",
+            frames=[{"custom_detected": index > 10} for index in range(50)],
         )
         result = analyze([baseline], [target])
         boolean = [item for item in result.candidates if item.signal_kind == "boolean"]
         self.assertTrue(boolean)
         self.assertEqual(boolean[0].comparator, "truthy")
+
+    def test_removed_wrist_fields_are_excluded(self) -> None:
+        baseline = make_rep(
+            gesture_name="baseline",
+            frames=[{"wrist_roll_right_detected": False, "wrist_pitch_delta": 0.0} for _ in range(40)],
+        )
+        target = make_rep(
+            gesture_name="legacy_wrist",
+            frames=[{"wrist_roll_right_detected": index > 10, "wrist_pitch_delta": 2.0 + index} for index in range(50)],
+        )
+        result = analyze([baseline], [target])
+
+        self.assertFalse(any(item.field_key in {"wrist_roll_right_detected", "wrist_pitch_delta"} for item in result.candidates))
 
     def test_baseline_drift_tolerated(self) -> None:
         baseline_a = make_rep(
@@ -190,15 +203,15 @@ class GestureMapperTests(unittest.TestCase):
     def test_signed_window_delta_field(self) -> None:
         baseline = make_rep(
             gesture_name="baseline",
-            frames=[{"wrist_pitch_delta": (index % 3) * 0.1} for index in range(40)],
+            frames=[{"custom_delta": (index % 3) * 0.1} for index in range(40)],
         )
         target = make_rep(
             gesture_name="wrist_tilt_up",
-            frames=[{"wrist_pitch_delta": 2.0 + index * 0.8} for index in range(50)],
+            frames=[{"custom_delta": 2.0 + index * 0.8} for index in range(50)],
         )
         result = analyze([baseline], [target])
-        delta_candidates = [item for item in result.candidates if item.field_key == "wrist_pitch_delta"]
-        parent_candidates = [item for item in result.candidates if item.field_key == "wrist_pitch"]
+        delta_candidates = [item for item in result.candidates if item.field_key == "custom_delta"]
+        parent_candidates = [item for item in result.candidates if item.field_key == "custom"]
         chosen = delta_candidates or parent_candidates
         self.assertTrue(chosen)
         top = chosen[0]

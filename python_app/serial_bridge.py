@@ -5,6 +5,7 @@ import json
 import queue
 import threading
 import time
+from collections import deque
 from typing import Any, Callable
 
 try:
@@ -16,6 +17,8 @@ except Exception:  # pragma: no cover - handled at runtime for missing dependenc
 
 
 LogCallback = Callable[[str], None]
+WRISTBAND_SAMPLE_STALE_S = 1.5
+DISCONNECTED_STATUSES = {"not_connected", "disconnected", "tbd"}
 
 
 class SerialBridge:
@@ -32,6 +35,8 @@ class SerialBridge:
         self._serial_lock = threading.RLock()
         self._latest_lock = threading.Lock()
         self._latest_state: dict[str, Any] = {}
+        self._wristband_states: deque[dict[str, Any]] = deque(maxlen=512)
+        self._wristband_last_sample_s: float | None = None
         self._reader_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._manual_disconnect = False
@@ -98,6 +103,8 @@ class SerialBridge:
             thread.join(timeout=0.5)
         with self._latest_lock:
             self._latest_state = {}
+            self._wristband_states.clear()
+            self._wristband_last_sample_s = None
         self._current_port = None
         self._log("Serial disconnected.")
 
@@ -112,7 +119,59 @@ class SerialBridge:
 
     def get_latest_state(self) -> dict[str, Any]:
         with self._latest_lock:
+            self._expire_stale_wristband_locked()
             return copy.deepcopy(self._latest_state)
+
+    def drain_wristband_states(self) -> list[dict[str, Any]]:
+        with self._latest_lock:
+            self._expire_stale_wristband_locked()
+            states = list(self._wristband_states)
+            self._wristband_states.clear()
+        return states
+
+    def _expire_stale_wristband_locked(self) -> None:
+        if self._wristband_last_sample_s is None:
+            return
+        if time.monotonic() - self._wristband_last_sample_s <= WRISTBAND_SAMPLE_STALE_S:
+            return
+        self._mark_wristband_disconnected_locked()
+
+    def _mark_wristband_disconnected_locked(self) -> None:
+        devices = self._latest_state.get("devices")
+        wristband = devices.get("wristband") if isinstance(devices, dict) else None
+        if isinstance(wristband, dict):
+            wristband["status"] = "not_connected"
+            wristband["sequence"] = None
+            wristband["t_ms"] = None
+            wristband["accel"] = {"x": None, "y": None, "z": None}
+            wristband["gyro"] = {"x": None, "y": None, "z": None}
+            wristband["pitch"] = None
+            wristband["roll"] = None
+            wristband["yaw"] = None
+        self._wristband_states.clear()
+        self._wristband_last_sample_s = None
+
+    def _store_state_locked(self, state: dict[str, Any]) -> dict[str, Any]:
+        wristband_sample = state.get("wristband_sample")
+        if isinstance(wristband_sample, dict):
+            devices = self._latest_state.setdefault("devices", {})
+            if isinstance(devices, dict):
+                wristband = devices.setdefault("wristband", {})
+                if isinstance(wristband, dict):
+                    wristband.update(wristband_sample)
+            self._wristband_last_sample_s = time.monotonic()
+            merged_state = copy.deepcopy(self._latest_state)
+            self._wristband_states.append(copy.deepcopy(merged_state))
+            return merged_state
+
+        self._latest_state = state
+        devices = state.get("devices")
+        wristband = devices.get("wristband") if isinstance(devices, dict) else None
+        status = str(wristband.get("status", "")).lower() if isinstance(wristband, dict) else ""
+        if status in DISCONNECTED_STATUSES:
+            self._wristband_states.clear()
+            self._wristband_last_sample_s = None
+        return state
 
     def send_command(self, command: dict[str, Any], coalesce_key: str | None = None) -> bool:
         line = json.dumps(command, separators=(",", ":")) + "\n"
@@ -279,7 +338,7 @@ class SerialBridge:
                             state = json.loads(leading)
                             if isinstance(state, dict):
                                 with self._latest_lock:
-                                    self._latest_state = state
+                                    state = self._store_state_locked(state)
                                 if self.on_state:
                                     self.on_state(copy.deepcopy(state))
                         except Exception:
@@ -299,6 +358,6 @@ class SerialBridge:
                 continue
 
             with self._latest_lock:
-                self._latest_state = state
+                state = self._store_state_locked(state)
             if self.on_state:
                 self.on_state(copy.deepcopy(state))

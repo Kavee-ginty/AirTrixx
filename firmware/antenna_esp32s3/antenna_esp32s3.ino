@@ -13,6 +13,25 @@
 
 static SemaphoreHandle_t serialMutex = NULL;
 
+static const uint16_t ESPNOW_RX_MAX_BYTES = 250;
+static const uint16_t ESPNOW_RX_QUEUE_LENGTH = 96;
+
+struct EspNowRxItem {
+  uint8_t sender_mac[6];
+  uint16_t len = 0;
+  uint8_t data[ESPNOW_RX_MAX_BYTES];
+};
+
+struct PacketDiagnostics {
+  bool haveSequence = false;
+  uint16_t lastSequence = 0;
+  uint32_t received = 0;
+  uint32_t dropped = 0;
+  uint32_t duplicates = 0;
+  uint32_t outOfOrder = 0;
+  uint32_t rejectedSender = 0;
+};
+
 struct LatestWristband {
   bool seen = false;
   uint32_t received_ms = 0;
@@ -117,6 +136,7 @@ static LatestAudioDock latestAudioDock;
 static portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
 
 static uint16_t antennaJsonSequence = 0;
+static uint16_t audioDockStatusSequence = 0;
 static uint16_t servoCommandSequence = 0;
 static uint16_t otaCommandSequence = 0;
 static uint16_t fanCommandSequence = 0;
@@ -131,6 +151,9 @@ static const uint32_t AUDIODOCK_STATUS_INTERVAL_MS = 500;
 static const uint32_t ANTENNA_STATUS_LED_INTERVAL_MS = 250;
 
 static QueueHandle_t audioChunkQueue = NULL;
+static QueueHandle_t espNowRxQueue = NULL;
+static PacketDiagnostics packetDiagnostics[DEVICE_FANS + 1] = {};
+static volatile uint32_t espNowRxQueueDrops = 0;
 
 static char serialLine[768];
 static size_t serialLineLen = 0;
@@ -170,6 +193,48 @@ void wristbandPacketToValues(const WristbandDataPacket &packet, WristbandMotionV
   out.gyroDpsZ = packet.gyro_mdps_z * AIRTRIXX_GYRO_MDPS_TO_DPS;
   out.pitchDeg = packet.pitch_cdeg * AIRTRIXX_CDEG_TO_DEG;
   out.rollDeg = packet.roll_cdeg * AIRTRIXX_CDEG_TO_DEG;
+}
+
+const uint8_t *expectedMacForDevice(uint8_t deviceId) {
+  switch (deviceId) {
+    case DEVICE_CAMDOCK: return CAMDOCK_MAC_PLACEHOLDER;
+    case DEVICE_WRISTBAND: return WRISTBAND_MAC_PLACEHOLDER;
+    case DEVICE_KEYBOARD: return KEYBOARD_MAC_PLACEHOLDER;
+    case DEVICE_CHARGING_DOCK: return CHARGING_DOCK_MAC_PLACEHOLDER;
+    case DEVICE_AUDIODOCK: return AUDIODOCK_MAC_PLACEHOLDER;
+    case DEVICE_FANS: return FANS_MAC_PLACEHOLDER;
+    default: return nullptr;
+  }
+}
+
+bool senderMatchesDevice(const uint8_t senderMac[6], uint8_t deviceId) {
+  const uint8_t *expected = expectedMacForDevice(deviceId);
+  return expected != nullptr && memcmp(senderMac, expected, 6) == 0;
+}
+
+void updatePacketDiagnostics(uint8_t deviceId, uint16_t sequence) {
+  if (deviceId > DEVICE_FANS) {
+    return;
+  }
+  PacketDiagnostics &diagnostics = packetDiagnostics[deviceId];
+  diagnostics.received++;
+  if (!diagnostics.haveSequence) {
+    diagnostics.haveSequence = true;
+    diagnostics.lastSequence = sequence;
+    return;
+  }
+
+  uint16_t forward = static_cast<uint16_t>(sequence - diagnostics.lastSequence);
+  if (forward == 0) {
+    diagnostics.duplicates++;
+  } else if (forward < 0x8000) {
+    if (forward > 1) {
+      diagnostics.dropped += static_cast<uint32_t>(forward - 1);
+    }
+    diagnostics.lastSequence = sequence;
+  } else {
+    diagnostics.outOfOrder++;
+  }
 }
 
 void logWristbandCalibrationLine(const String &message) {
@@ -290,9 +355,6 @@ void applyWristbandCalibration(const WristbandDataPacket &packet,
   pitchOut = angleDelta(raw.pitchDeg, state.pitchOffsetDeg);
   rollOut = angleDelta(raw.rollDeg, state.rollOffsetDeg);
   yawOut = angleDelta(state.yawDeg, state.yawOffsetDeg);
-  raw.accelMps2X -= state.accelOffsetMps2X;
-  raw.accelMps2Y -= state.accelOffsetMps2Y;
-  raw.accelMps2Z -= state.accelOffsetMps2Z;
 }
 
 void updateWristbandConnectionState(uint32_t nowMs) {
@@ -1105,7 +1167,7 @@ void sendAudioDockComponentStatus(uint32_t nowMs) {
   fillHeader(packet.header,
              MSG_AUDIODOCK_TRANSCRIPT,
              DEVICE_ANTENNA,
-             ++antennaJsonSequence,
+             ++audioDockStatusSequence,
              nowMs,
              false);
   char statusText[16];
@@ -1116,7 +1178,7 @@ void sendAudioDockComponentStatus(uint32_t nowMs) {
                sizeof(packet));
 }
 
-void handleIncomingPacket(const uint8_t *data, int len) {
+void handleIncomingPacket(const uint8_t senderMac[6], const uint8_t *data, int len) {
   if (len < static_cast<int>(sizeof(AirTrixxPacketHeader))) {
     return;
   }
@@ -1126,7 +1188,17 @@ void handleIncomingPacket(const uint8_t *data, int len) {
   if (header.protocol_version != AIRTRIXX_PROTOCOL_VERSION) {
     return;
   }
+  if (!senderMatchesDevice(senderMac, header.device_id)) {
+    if (header.device_id <= DEVICE_FANS) {
+      packetDiagnostics[header.device_id].rejectedSender++;
+    }
+    return;
+  }
+  updatePacketDiagnostics(header.device_id, header.sequence);
 
+  if (header.msg_type == MSG_WRISTBAND_DATA &&
+      header.device_id == DEVICE_WRISTBAND &&
+      len == static_cast<int>(sizeof(WristbandDataPacket))) {
   if (header.msg_type == MSG_HEARTBEAT &&
       header.device_id == DEVICE_AUDIODOCK &&
       len == static_cast<int>(sizeof(HeartbeatPacket))) {
@@ -1183,7 +1255,9 @@ void handleIncomingPacket(const uint8_t *data, int len) {
     target->seen = true;
     target->received_ms = millis();
     portEXIT_CRITICAL(&stateMux);
-  } else if (header.msg_type == MSG_CAMDOCK_DATA && len == static_cast<int>(sizeof(CamDockDataPacket))) {
+  } else if (header.msg_type == MSG_CAMDOCK_DATA &&
+             header.device_id == DEVICE_CAMDOCK &&
+             len == static_cast<int>(sizeof(CamDockDataPacket))) {
     CamDockDataPacket packet = {};
     memcpy(&packet, data, sizeof(packet));
     portENTER_CRITICAL(&stateMux);
@@ -1301,13 +1375,33 @@ void handleIncomingPacket(const uint8_t *data, int len) {
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
 void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
-  (void)info;
-  handleIncomingPacket(incomingData, len);
+  if (info == nullptr || incomingData == nullptr || len <= 0 ||
+      len > ESPNOW_RX_MAX_BYTES || espNowRxQueue == NULL) {
+    espNowRxQueueDrops++;
+    return;
+  }
+  EspNowRxItem item = {};
+  memcpy(item.sender_mac, info->src_addr, sizeof(item.sender_mac));
+  item.len = static_cast<uint16_t>(len);
+  memcpy(item.data, incomingData, len);
+  if (xQueueSend(espNowRxQueue, &item, 0) != pdPASS) {
+    espNowRxQueueDrops++;
+  }
 }
 #else
 void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
-  (void)mac;
-  handleIncomingPacket(incomingData, len);
+  if (mac == nullptr || incomingData == nullptr || len <= 0 ||
+      len > ESPNOW_RX_MAX_BYTES || espNowRxQueue == NULL) {
+    espNowRxQueueDrops++;
+    return;
+  }
+  EspNowRxItem item = {};
+  memcpy(item.sender_mac, mac, sizeof(item.sender_mac));
+  item.len = static_cast<uint16_t>(len);
+  memcpy(item.data, incomingData, len);
+  if (xQueueSend(espNowRxQueue, &item, 0) != pdPASS) {
+    espNowRxQueueDrops++;
+  }
 }
 #endif
 
@@ -1407,6 +1501,12 @@ void printWristbandJson(const LatestWristband &snapshot,
     Serial.print(values.gyroDpsY, 3);
     Serial.print(",\"z\":");
     Serial.print(values.gyroDpsZ, 3);
+    Serial.print("},\"calibrated_accel\":{\"x\":");
+    Serial.print(values.accelMps2X - calState.accelOffsetMps2X, 3);
+    Serial.print(",\"y\":");
+    Serial.print(values.accelMps2Y - calState.accelOffsetMps2Y, 3);
+    Serial.print(",\"z\":");
+    Serial.print(values.accelMps2Z - calState.accelOffsetMps2Z, 3);
     Serial.print("},\"pitch\":");
     Serial.print(pitch, 2);
     Serial.print(",\"roll\":");
@@ -1416,9 +1516,51 @@ void printWristbandJson(const LatestWristband &snapshot,
   } else {
     Serial.print(",\"accel\":{\"x\":null,\"y\":null,\"z\":null}");
     Serial.print(",\"gyro\":{\"x\":null,\"y\":null,\"z\":null}");
+    Serial.print(",\"calibrated_accel\":{\"x\":null,\"y\":null,\"z\":null}");
     Serial.print(",\"pitch\":null,\"roll\":null,\"yaw\":null");
   }
   Serial.print("}");
+}
+
+void printPacketDiagnosticsJson(uint8_t deviceId) {
+  const PacketDiagnostics &diagnostics = packetDiagnostics[deviceId];
+  Serial.print("{\"received\":");
+  Serial.print(diagnostics.received);
+  Serial.print(",\"dropped\":");
+  Serial.print(diagnostics.dropped);
+  Serial.print(",\"duplicates\":");
+  Serial.print(diagnostics.duplicates);
+  Serial.print(",\"out_of_order\":");
+  Serial.print(diagnostics.outOfOrder);
+  Serial.print(",\"rejected_sender\":");
+  Serial.print(diagnostics.rejectedSender);
+  Serial.print("}");
+}
+
+void printWristbandSampleJson(const WristbandDataPacket &packet) {
+  WristbandMotionValues values = {};
+  wristbandPacketToValues(packet, values);
+  if (serialMutex == NULL || xSemaphoreTake(serialMutex, portMAX_DELAY) != pdTRUE) {
+    return;
+  }
+  Serial.print("{\"wristband_sample\":{\"status\":\"ok\",\"sequence\":");
+  Serial.print(packet.header.sequence);
+  Serial.print(",\"t_ms\":");
+  Serial.print(packet.header.t_ms);
+  Serial.print(",\"accel\":{\"x\":");
+  Serial.print(values.accelMps2X, 4);
+  Serial.print(",\"y\":");
+  Serial.print(values.accelMps2Y, 4);
+  Serial.print(",\"z\":");
+  Serial.print(values.accelMps2Z, 4);
+  Serial.print("},\"gyro\":{\"x\":");
+  Serial.print(values.gyroDpsX, 4);
+  Serial.print(",\"y\":");
+  Serial.print(values.gyroDpsY, 4);
+  Serial.print(",\"z\":");
+  Serial.print(values.gyroDpsZ, 4);
+  Serial.println("}}}");
+  xSemaphoreGive(serialMutex);
 }
 
 void printCamDockJson(const LatestCamDock &snapshot, uint32_t nowMs) {
@@ -1977,6 +2119,21 @@ void printJsonState() {
     Serial.print(",\"antenna_mac\":\"");
     Serial.print(macStr);
     Serial.print("\"");
+    Serial.print(",\"radio\":{\"rx_queue_dropped\":");
+    Serial.print(espNowRxQueueDrops);
+    Serial.print(",\"wristband\":");
+    printPacketDiagnosticsJson(DEVICE_WRISTBAND);
+    Serial.print(",\"camdock\":");
+    printPacketDiagnosticsJson(DEVICE_CAMDOCK);
+    Serial.print(",\"keyboard\":");
+    printPacketDiagnosticsJson(DEVICE_KEYBOARD);
+    Serial.print(",\"charging_dock\":");
+    printPacketDiagnosticsJson(DEVICE_CHARGING_DOCK);
+    Serial.print(",\"audiodock\":");
+    printPacketDiagnosticsJson(DEVICE_AUDIODOCK);
+    Serial.print(",\"fans\":");
+    printPacketDiagnosticsJson(DEVICE_FANS);
+    Serial.print("}");
 
     Serial.print(",\"devices\":{");
     printWristbandJson(wristSnapshot, wristBatterySnapshot, wristCalSnapshot, nowMs);
@@ -2007,6 +2164,7 @@ void setup() {
 
   // Create FreeRTOS queue for Audio Dock chunks
   audioChunkQueue = xQueueCreate(64, sizeof(AudioDockChunkPacket));
+  espNowRxQueue = xQueueCreate(ESPNOW_RX_QUEUE_LENGTH, sizeof(EspNowRxItem));
 
   configureWiFiChannel();
   
@@ -2057,7 +2215,31 @@ void pumpAudioDockChunks() {
   }
 }
 
+void pumpEspNowPackets() {
+  if (espNowRxQueue == NULL) {
+    return;
+  }
+  EspNowRxItem item;
+  while (xQueueReceive(espNowRxQueue, &item, 0) == pdPASS) {
+    AirTrixxPacketHeader header = {};
+    if (item.len >= sizeof(header)) {
+      memcpy(&header, item.data, sizeof(header));
+    }
+    handleIncomingPacket(item.sender_mac, item.data, item.len);
+    if (header.protocol_version == AIRTRIXX_PROTOCOL_VERSION &&
+        header.msg_type == MSG_WRISTBAND_DATA &&
+        header.device_id == DEVICE_WRISTBAND &&
+        item.len == sizeof(WristbandDataPacket) &&
+        senderMatchesDevice(item.sender_mac, DEVICE_WRISTBAND)) {
+      WristbandDataPacket packet = {};
+      memcpy(&packet, item.data, sizeof(packet));
+      printWristbandSampleJson(packet);
+    }
+  }
+}
+
 void loop() {
+  pumpEspNowPackets();
   pumpAudioDockChunks();
   pumpSerialCommands();
 

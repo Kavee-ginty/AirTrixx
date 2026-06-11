@@ -18,9 +18,12 @@ from input_mapper import (
     MappingConfig,
     MappingRule,
     SignalCatalog,
+    TAB_SWITCH_PROFILE_NAME,
+    default_mapping_config,
     evaluate_condition,
     load_mapping_config,
     save_mapping_config,
+    wrist_tab_switching_profile,
 )
 
 
@@ -135,51 +138,70 @@ class InputMapperRuntimeTests(unittest.TestCase):
         mapper.process(snapshot(a=True), 0.11)
         self.assertEqual(backend.events, [("key_tap", ("enter",))])
 
-    def test_wrist_gesture_bypasses_debounce_and_uses_action_cooldown(self) -> None:
+    def test_model_value_gesture_bypasses_debounce_and_uses_action_cooldown(self) -> None:
         rule = MappingRule(
-            source="fused.wrist_roll_right_detected",
-            comparator="truthy",
+            source="fused.model_value",
+            comparator="eq",
+            threshold="rotate_right",
             debounce_ms=1000,
             action=MappingAction(type="keyboard_tap", keys=["r"]),
         )
         mapper, backend = self.mapper_with([rule])
-        mapper.process(snapshot(wrist_roll_right_detected=True), 0.0)
-        mapper.process(snapshot(wrist_roll_right_detected=False), 0.01)
-        mapper.process(snapshot(wrist_roll_right_detected=True), GESTURE_COOLDOWN_SEC - 0.01)
-        mapper.process(snapshot(wrist_roll_right_detected=False), GESTURE_COOLDOWN_SEC)
-        mapper.process(snapshot(wrist_roll_right_detected=True), GESTURE_COOLDOWN_SEC + 0.01)
+        mapper.process(snapshot(model_value="rotate_right"), 0.0)
+        mapper.process(snapshot(model_value="none"), 0.01)
+        mapper.process(snapshot(model_value="rotate_right"), GESTURE_COOLDOWN_SEC - 0.01)
+        mapper.process(snapshot(model_value="none"), GESTURE_COOLDOWN_SEC)
+        mapper.process(snapshot(model_value="rotate_right"), GESTURE_COOLDOWN_SEC + 0.01)
         self.assertEqual(backend.events, [("key_tap", ("r",)), ("key_tap", ("r",))])
 
-    def test_wrist_gesture_cooldowns_are_per_gesture_class(self) -> None:
+    def test_model_value_cooldowns_are_per_gesture_class(self) -> None:
         rules = [
             MappingRule(
                 id="roll",
-                source="fused.wrist_roll_right_detected",
-                comparator="truthy",
+                source="fused.model_value",
+                comparator="eq",
+                threshold="rotate_right",
                 action=MappingAction(type="keyboard_tap", keys=["r"]),
             ),
             MappingRule(
-                id="pitch",
-                source="fused.wrist_pitch_up_detected",
-                comparator="truthy",
+                id="flick",
+                source="fused.model_value",
+                comparator="eq",
+                threshold="flick",
                 action=MappingAction(type="keyboard_tap", keys=["p"]),
             ),
         ]
         mapper, backend = self.mapper_with(rules)
-        mapper.process(snapshot(wrist_roll_right_detected=True, wrist_pitch_up_detected=True), 0.0)
+        mapper.process(snapshot(model_value="rotate_right"), 0.0)
+        mapper.process(snapshot(model_value="none"), 0.01)
+        mapper.process(snapshot(model_value="flick"), 0.02)
         self.assertEqual(backend.events, [("key_tap", ("r",)), ("key_tap", ("p",))])
 
-    def test_learned_wrist_motion_mapping_uses_action_cooldown(self) -> None:
+    def test_wrist_rule_value_bypasses_debounce_and_uses_gesture_cooldown(self) -> None:
         rule = MappingRule(
-            source="fused.wrist_motion",
+            source="fused.wrist_rule_value",
             comparator="eq",
-            threshold="roll_right_then_neutral",
+            threshold="rotate_right_return",
+            debounce_ms=1000,
+            action=MappingAction(type="keyboard_tap", keys=["r"]),
+        )
+        mapper, backend = self.mapper_with([rule])
+        mapper.process(snapshot(wrist_rule_value="rotate_right_return"), 0.0)
+        mapper.process(snapshot(wrist_rule_value="none"), 0.01)
+
+        self.assertEqual(backend.events, [("key_tap", ("r",))])
+
+    def test_model_value_mapping_uses_action_cooldown(self) -> None:
+        rule = MappingRule(
+            source="fused.model_value",
+            comparator="eq",
+            threshold="wrist_circle",
             action=MappingAction(type="keyboard_tap", keys=["n"]),
         )
         mapper, backend = self.mapper_with([rule])
-        mapper.process(snapshot(wrist_motion="roll_right_then_neutral"), 0.0)
-        mapper.process(snapshot(wrist_motion="none"), 0.01)
-        mapper.process(snapshot(wrist_motion="roll_right_then_neutral"), 0.2)
+        mapper.process(snapshot(model_value="wrist_circle"), 0.0)
+        mapper.process(snapshot(model_value="none"), 0.01)
+        mapper.process(snapshot(model_value="wrist_circle"), 0.2)
         self.assertEqual(backend.events, [("key_tap", ("n",))])
 
     def test_repeat_action_uses_interval(self) -> None:
@@ -430,6 +452,11 @@ class InputMapperRuntimeTests(unittest.TestCase):
         self.assertIsNone(hidden["hands.right.z_mm"].value)
         self.assertEqual(visible["hands.right.z_mm"].value, 700)
 
+    def test_signal_catalog_exposes_model_value(self) -> None:
+        signals = SignalCatalog.flatten(snapshot(model_value="flick"))
+
+        self.assertEqual(signals["fused.model_value"].value, "flick")
+
     def test_keyboard_text_action_types_live_signal_value(self) -> None:
         rule = MappingRule(
             source="keyboard.input",
@@ -483,6 +510,48 @@ class InputMapperRuntimeTests(unittest.TestCase):
 
 
 class MappingConfigTests(unittest.TestCase):
+    def test_default_config_includes_wrist_tab_switching_profile(self) -> None:
+        config = default_mapping_config()
+        self.assertIn(TAB_SWITCH_PROFILE_NAME, config.profile_names())
+
+    def test_remove_profile_falls_back_and_protects_last_profile(self) -> None:
+        config = default_mapping_config()
+        config.active_profile = TAB_SWITCH_PROFILE_NAME
+        self.assertTrue(config.remove_profile(TAB_SWITCH_PROFILE_NAME))
+        self.assertEqual(config.active_profile, "Default")
+        self.assertFalse(config.remove_profile("Default"))
+
+    def test_wrist_tab_switching_profile_uses_left_fist_and_modifier_combos(self) -> None:
+        backend = FakeInputBackend()
+        mapper = InputMapper(
+            backend,
+            MappingConfig(profiles=[wrist_tab_switching_profile()], active_profile=TAB_SWITCH_PROFILE_NAME),
+        )
+        mapper.enabled = True
+
+        mapper.process(
+            hand_snapshot({"wrist_rule_value": "rotate_right_return"}, left_gesture="open_palm"),
+            now_s=0.0,
+        )
+        mapper.process(hand_snapshot({"wrist_rule_value": "none"}, left_gesture="closed_fist"), now_s=0.1)
+        mapper.process(
+            hand_snapshot({"wrist_rule_value": "rotate_right_return"}, left_gesture="closed_fist"),
+            now_s=0.2,
+        )
+        mapper.process(hand_snapshot({"wrist_rule_value": "none"}, left_gesture="closed_fist"), now_s=0.3)
+        mapper.process(
+            hand_snapshot({"wrist_rule_value": "rotate_left_return"}, left_gesture="closed_fist"),
+            now_s=0.4,
+        )
+
+        self.assertEqual(
+            backend.events,
+            [
+                ("key_tap", ("alt", "tab")),
+                ("key_tap", ("alt", "shift", "tab")),
+            ],
+        )
+
     def test_save_and_load_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "input_mappings.json"

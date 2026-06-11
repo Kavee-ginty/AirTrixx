@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import csv
 import hashlib
 import http.server
 import io
@@ -11,10 +12,12 @@ import queue
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, ttk
+from collections import deque
+from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +53,18 @@ from mediapipe_tracker import HandTracker
 from serial_bridge import SerialBridge
 from servo_controller import ServoController
 from audio_dock import AudioDockBridge, TRAINING_LABELS
+from wristband_model import (
+    DEFAULT_MIN_CONFIDENCE,
+    WristbandCsvCapture,
+    WristbandModelRuntime,
+    export_combined_csv,
+    extract_wristband_imu_sample,
+    find_companion_labels,
+    infer_label_from_sample_filename,
+    install_model_files,
+    sanitize_label,
+)
+from wrist_rule_detector import WristReturnRuleDetector
 
 
 SERVO_BRACKETS = {
@@ -274,6 +289,7 @@ class AirTrixxGUI:
         self.hub_status_var = tk.StringVar(value="Hub: disconnected")
         self.mapper_chip_var = tk.StringVar(value="Mapper: disabled")
         self.camera_chip_var = tk.StringVar(value="Camera: starting")
+        self.camera_enabled = True
         self.permissions_status_var = tk.StringVar(value="Permissions: check camera and input access on first launch")
         self.active_page = "Dashboard"
         self.camera_popup: tk.Toplevel | None = None
@@ -340,6 +356,68 @@ class AirTrixxGUI:
             self.keyboard_model_var.set(f"Model: {len(self.keyboard_bridge.model_words)} word(s)")
         elif self.keyboard_bridge.model_error:
             self.keyboard_model_var.set(f"Model: {self.keyboard_bridge.model_error}")
+
+        self.wristband_model_value_var = tk.StringVar(value="none")
+        self.wristband_model_status_var = tk.StringVar(value="Model: loading")
+        self.wristband_capture_status_var = tk.StringVar(value="Capture: idle")
+        self.wristband_capture_count_var = tk.StringVar(value="Samples: 0")
+        self.wristband_capture_green_label_var = tk.StringVar(value="rotate_right")
+        self.wristband_capture_red_label_var = tk.StringVar(value="idle")
+        self.wristband_capture_phase_var = tk.StringVar(value="Timer: idle")
+        self.wristband_confidence_var = tk.StringVar(value=f"{DEFAULT_MIN_CONFIDENCE:.2f}")
+        self.wristband_live_imu_var = tk.StringVar(value="IMU: waiting")
+        self.wristband_labels_var = tk.StringVar(value="Labels: none")
+        self.wristband_visualizer_status_var = tk.StringVar(value="Wristband: waiting")
+        self.wristband_visualizer_paused = False
+        self.wristband_visualizer_samples: deque[tuple[float, tuple[float, float, float, float, float, float]]] = deque(maxlen=512)
+        self._wristband_visualizer_last_sequence: Any = None
+        self.wristband_visualizer_capture_duration_var = tk.StringVar(value="10")
+        self.wristband_visualizer_capture_status_var = tk.StringVar(value="Capture: idle")
+        self.wristband_visualizer_capture_phase = "idle"
+        self.wristband_visualizer_capture_started_s = 0.0
+        self.wristband_visualizer_capture_duration_s = 10.0
+        self.wristband_visualizer_capture_samples: list[tuple[float, tuple[float, float, float, float, float, float]]] = []
+        self.wristband_visualizer_last_capture: list[tuple[float, tuple[float, float, float, float, float, float]]] = []
+        self.wrist_rule_detector = WristReturnRuleDetector()
+        self.wrist_rule_enabled_var = tk.BooleanVar(value=True)
+        self.wrist_rule_value_var = tk.StringVar(value="none")
+        self.wrist_rule_state_var = tk.StringVar(value="State: idle")
+        self.wrist_rule_gyro_var = tk.StringVar(value="Corrected gyro: waiting")
+        self.wrist_rule_metrics_var = tk.StringVar(value="Rotation: -")
+        self.wrist_rule_last_event_var = tk.StringVar(value="Last event: none")
+        self.wrist_rule_rejection_var = tk.StringVar(value="Rejected: none")
+        self.wrist_rule_setting_vars = {
+            key: tk.StringVar(value=f"{getattr(self.wrist_rule_detector.config, key):g}")
+            for key in (
+                "first_peak_dps",
+                "second_peak_dps",
+                "neutral_dps",
+                "max_other_axis_dps",
+                "dominance_ratio",
+                "opposite_timeout_s",
+                "min_duration_s",
+                "max_duration_s",
+                "neutral_hold_s",
+                "cooldown_s",
+                "min_total_rotation_deg",
+                "max_signed_rotation_deg",
+            )
+        }
+        self.wristband_model = WristbandModelRuntime(
+            self.config.wristband_model_path,
+            self.config.wristband_labels_path,
+            on_log=self.log,
+            min_confidence=DEFAULT_MIN_CONFIDENCE,
+        )
+        self.wristband_model.model_value = "none"
+        self.wristband_model_value_var.set("disabled")
+        self.wristband_model_status_var.set(f"Model: {self.wristband_model.status}")
+        if self.wristband_model.labels:
+            self.wristband_labels_var.set("Labels: " + ", ".join(self.wristband_model.labels))
+        self.wristband_capture = WristbandCsvCapture(
+            self.config.wristband_data_dir,
+            on_status=self._on_wristband_capture_status,
+        )
 
         # Initialize Audio Dock variables and instance
         self.audio_dock_status_var = tk.StringVar(value="Disconnected")
@@ -410,10 +488,9 @@ class AirTrixxGUI:
             self.log(warning)
 
         self.root.title("AirTrixx")
-        self.root.geometry("1280x860")
-        self.root.minsize(1120, 760)
+        self.root.minsize(960, 620)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
-        self.root.after(0, lambda: self.root.state("zoomed"))
+        self._fit_root_to_work_area()
 
         self._configure_styles()
         self._build_ui()
@@ -422,6 +499,36 @@ class AirTrixxGUI:
         self.root.bind("<Configure>", self._on_root_configure, add="+")
         self.root.after(SERIAL_AUTOCONNECT_DELAY_MS, self.auto_connect_serial)
         self._tick()
+
+    def _fit_root_to_work_area(self) -> None:
+        left = 0
+        top = 0
+        right = self.root.winfo_screenwidth()
+        bottom = self.root.winfo_screenheight()
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                import ctypes.wintypes
+
+                work_area = ctypes.wintypes.RECT()
+                if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(work_area), 0):
+                    left, top, right, bottom = (
+                        work_area.left,
+                        work_area.top,
+                        work_area.right,
+                        work_area.bottom,
+                    )
+            except Exception:
+                pass
+
+        available_width = max(960, right - left)
+        available_height = max(620, bottom - top)
+        width = min(1280, available_width)
+        height = min(860, available_height)
+        x = left + max(0, (available_width - width) // 2)
+        y = top + max(0, (available_height - height) // 2)
+        self.root.maxsize(available_width, available_height)
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
 
     def log(self, message: str) -> None:
         self.log_queue.put(message)
@@ -501,9 +608,31 @@ class AirTrixxGUI:
         self.root.columnconfigure(1, weight=1)
         self.root.rowconfigure(0, weight=1)
 
-        sidebar = ttk.Frame(self.root, padding=(16, 18), style="Sidebar.TFrame")
-        sidebar.grid(row=0, column=0, sticky="ns")
+        sidebar_canvas = tk.Canvas(
+            self.root,
+            width=290,
+            highlightthickness=0,
+            borderwidth=0,
+            bg="#111827",
+        )
+        sidebar_canvas.grid(row=0, column=0, sticky="nsew")
+        sidebar_scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=sidebar_canvas.yview)
+        sidebar_scrollbar.grid(row=0, column=0, sticky="nse")
+        sidebar_canvas.configure(yscrollcommand=sidebar_scrollbar.set)
+
+        sidebar = ttk.Frame(sidebar_canvas, padding=(16, 18), style="Sidebar.TFrame")
+        sidebar_window = sidebar_canvas.create_window((0, 0), window=sidebar, anchor="nw")
+        sidebar.bind(
+            "<Configure>",
+            lambda _event: sidebar_canvas.configure(scrollregion=sidebar_canvas.bbox("all")),
+        )
+        sidebar_canvas.bind(
+            "<Configure>",
+            lambda event: sidebar_canvas.itemconfigure(sidebar_window, width=event.width),
+        )
         sidebar.columnconfigure(0, weight=1)
+        self._register_scroll_target(sidebar_canvas, sidebar_canvas)
+        self._register_scroll_target(sidebar, sidebar_canvas)
 
         ttk.Label(sidebar, text="AirTrixx", style="Brand.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(sidebar, text="Hardware input console", style="BrandSubtle.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 14))
@@ -527,6 +656,9 @@ class AirTrixxGUI:
             "Dashboard",
             "Signals",
             "Keyboard",
+            "Wristband",
+            "Visualiser",
+            "Wrist Rules",
             "Mappings",
             "Testing",
             "Camera & Servo",
@@ -550,11 +682,13 @@ class AirTrixxGUI:
 
         topbar = ttk.Frame(content, padding=(12, 10), style="Topbar.TFrame")
         topbar.grid(row=0, column=0, sticky="ew", pady=(0, 12))
-        topbar.columnconfigure(4, weight=1)
+        topbar.columnconfigure(5, weight=1)
         ttk.Label(topbar, textvariable=self.hub_status_var, style="Chip.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Label(topbar, textvariable=self.mapper_chip_var, style="WarnChip.TLabel").grid(row=0, column=1, sticky="w", padx=(0, 8))
         ttk.Label(topbar, textvariable=self.camera_chip_var, style="Chip.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 8))
-        ttk.Label(topbar, textvariable=self.permissions_status_var, style="PanelSubtle.TLabel").grid(row=0, column=3, sticky="w")
+        self.camera_power_button = ttk.Button(topbar, text="Camera Off", command=self.toggle_camera_power, style="Secondary.TButton")
+        self.camera_power_button.grid(row=0, column=3, sticky="w", padx=(0, 8))
+        ttk.Label(topbar, textvariable=self.permissions_status_var, style="PanelSubtle.TLabel").grid(row=0, column=4, sticky="w")
 
         for name in nav_items:
             page = ttk.Frame(content)
@@ -566,6 +700,9 @@ class AirTrixxGUI:
         self._build_dashboard_page(self.pages["Dashboard"])
         self._build_signals_page(self.pages["Signals"])
         self._build_keyboard_page(self.pages["Keyboard"])
+        self._build_wristband_page(self.pages["Wristband"])
+        self._build_visualiser_page(self.pages["Visualiser"])
+        self._build_wrist_rules_page(self.pages["Wrist Rules"])
         self._build_mappings_page(self.pages["Mappings"])
         self._build_testing_page(self.pages["Testing"])
         self._build_camera_servo_page(self.pages["Camera & Servo"])
@@ -689,21 +826,22 @@ class AirTrixxGUI:
         paths_box = ttk.LabelFrame(body, text="App Data", padding=12)
         paths_box.grid(row=2, column=0, sticky="ew")
         paths_box.columnconfigure(1, weight=1)
-        for row, (label, value) in enumerate(
-            (
-                ("User data", self.config.user_data_dir),
-                ("Config", self.config.config_dir),
-                ("Calibration", self.config.calibration_path),
-                ("Mappings", self.config.mapping_path),
-                ("Gesture data", self.config.gesture_data_dir),
-                ("Logs", self.config.logs_dir),
-                ("Audio temp", self.config.audio_recording_path),
-            )
-        ):
+        path_rows = (
+            ("User data", self.config.user_data_dir),
+            ("Config", self.config.config_dir),
+            ("Calibration", self.config.calibration_path),
+            ("Mappings", self.config.mapping_path),
+            ("Gesture data", self.config.gesture_data_dir),
+            ("Wristband data", self.config.wristband_data_dir),
+            ("Wristband model", self.config.wristband_model_path),
+            ("Logs", self.config.logs_dir),
+            ("Audio temp", self.config.audio_recording_path),
+        )
+        for row, (label, value) in enumerate(path_rows):
             ttk.Label(paths_box, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=2)
             ttk.Label(paths_box, text=str(value), style="PanelSubtle.TLabel", wraplength=760).grid(row=row, column=1, sticky="ew", pady=2)
         ttk.Button(paths_box, text="Open App Data", command=self.open_user_data_dir, style="Secondary.TButton").grid(
-            row=7, column=0, columnspan=2, sticky="w", pady=(10, 0)
+            row=len(path_rows), column=0, columnspan=2, sticky="w", pady=(10, 0)
         )
 
     def _build_dashboard_page(self, page: ttk.Frame) -> None:
@@ -847,6 +985,8 @@ class AirTrixxGUI:
     @staticmethod
     def _battery_status_style(level: float | None, status: str) -> tuple[str, str, str, str]:
         normalized = status.strip().lower().replace("_", " ")
+        if normalized in {"not connected", "disconnected", "tbd", "offline"}:
+            return "Offline", "#f2f4f7", "#475467", "#98a2b3"
         if level is None:
             if normalized in {
                 "ok",
@@ -945,11 +1085,9 @@ class AirTrixxGUI:
             return
         raw_state = snapshot.get("raw_device_state", {})
         devices = raw_state.get("devices", {}) if isinstance(raw_state, dict) else {}
-        keyboard = devices.get("keyboard", {}) if isinstance(devices, dict) else {}
         audiodock = devices.get("audiodock", {}) if isinstance(devices, dict) else {}
-        if isinstance(keyboard, dict):
-            input_dict["keyboard_input"] = keyboard.get("input")
         input_dict["audiodock_input"] = self._audio_dock_input_value(audiodock if isinstance(audiodock, dict) else {})
+        input_dict["model_value"] = "none"
         snapshot["input_array"] = [input_dict.get(field) for field in FIELD_ORDER]
 
     def _dashboard_battery_device_state(self, device_key: str, devices: dict[str, Any]) -> dict[str, Any]:
@@ -1158,6 +1296,816 @@ class AirTrixxGUI:
         notebook.add(live_tab, text="Live")
         notebook.add(training_tab, text="Training")
         notebook.add(log_tab, text="Log")
+
+    def _build_wristband_page(self, page: ttk.Frame) -> None:
+        self._build_page_header(page, "Wristband", "Live IMU capture and optional TFLite model management.")
+        body = self._scrollable_body(page)
+        body.columnconfigure(0, weight=1)
+
+        status_box = ttk.LabelFrame(body, text="Model Management", padding=10)
+        status_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        status_box.columnconfigure(1, weight=1)
+        ttk.Label(status_box, text="Runtime output").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(status_box, textvariable=self.wristband_model_value_var, style="Value.TLabel").grid(row=0, column=1, sticky="w", pady=4)
+        ttk.Label(status_box, text="Model").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(status_box, textvariable=self.wristband_model_status_var, wraplength=850).grid(row=1, column=1, sticky="ew", pady=4)
+        ttk.Label(status_box, text="Labels").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(status_box, textvariable=self.wristband_labels_var, wraplength=850).grid(row=2, column=1, sticky="ew", pady=4)
+        ttk.Label(status_box, text="IMU").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(status_box, textvariable=self.wristband_live_imu_var, wraplength=850).grid(row=3, column=1, sticky="ew", pady=4)
+
+        capture_box = ttk.LabelFrame(body, text="Training CSV Capture", padding=10)
+        capture_box.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        capture_box.columnconfigure(1, weight=1)
+        capture_box.columnconfigure(4, weight=0)
+        ttk.Label(capture_box, text="Green label").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        self.wristband_capture_green_label_entry = ttk.Entry(
+            capture_box,
+            textvariable=self.wristband_capture_green_label_var,
+            width=24,
+        )
+        self.wristband_capture_green_label_entry.grid(row=0, column=1, sticky="w", pady=4)
+        ttk.Label(capture_box, text="Red label").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        self.wristband_capture_red_label_entry = ttk.Entry(
+            capture_box,
+            textvariable=self.wristband_capture_red_label_var,
+            width=24,
+        )
+        self.wristband_capture_red_label_entry.grid(row=1, column=1, sticky="w", pady=4)
+        ttk.Label(capture_box, textvariable=self.wristband_capture_status_var, wraplength=760).grid(
+            row=2, column=0, columnspan=4, sticky="ew", pady=(0, 6)
+        )
+        ttk.Label(capture_box, textvariable=self.wristband_capture_count_var).grid(row=0, column=2, sticky="w", padx=(12, 8), pady=4)
+        ttk.Label(capture_box, textvariable=self.wristband_capture_phase_var, style="Value.TLabel").grid(
+            row=0, column=3, sticky="w", padx=(8, 0), pady=4
+        )
+        self.wristband_capture_timer_canvas = tk.Canvas(
+            capture_box,
+            width=178,
+            height=178,
+            bg="#ffffff",
+            highlightthickness=0,
+        )
+        self.wristband_capture_timer_canvas.grid(row=0, column=4, rowspan=4, sticky="ne", padx=(12, 0), pady=2)
+        capture_actions = ttk.Frame(capture_box)
+        capture_actions.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(4, 10))
+        for column in range(5):
+            capture_actions.columnconfigure(column, weight=1)
+        self.wristband_start_button = ttk.Button(
+            capture_actions,
+            text="Start Capture",
+            command=self.wristband_start_capture,
+            style="Accent.TButton",
+        )
+        self.wristband_start_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.wristband_stop_button = ttk.Button(
+            capture_actions,
+            text="Stop Capture",
+            command=self.wristband_stop_capture,
+            style="Secondary.TButton",
+        )
+        self.wristband_stop_button.grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(
+            capture_actions,
+            text="Export CSV",
+            command=self.wristband_export_dataset,
+            style="Secondary.TButton",
+        ).grid(row=0, column=2, sticky="ew", padx=4)
+        ttk.Button(
+            capture_actions,
+            text="Refresh",
+            command=self._refresh_wristband_capture_files,
+            style="Secondary.TButton",
+        ).grid(row=0, column=3, sticky="ew", padx=4)
+        ttk.Button(
+            capture_actions,
+            text="Open Folder",
+            command=self.wristband_open_folder,
+            style="Secondary.TButton",
+        ).grid(row=0, column=4, sticky="ew", padx=(4, 0))
+
+        self.wristband_capture_tree = ttk.Treeview(
+            capture_box,
+            columns=("label", "rows", "file"),
+            show="headings",
+            height=8,
+        )
+        self.wristband_capture_tree.heading("label", text="Label")
+        self.wristband_capture_tree.heading("rows", text="Rows")
+        self.wristband_capture_tree.heading("file", text="File")
+        self.wristband_capture_tree.column("label", width=180, stretch=False)
+        self.wristband_capture_tree.column("rows", width=90, stretch=False)
+        self.wristband_capture_tree.column("file", width=620, stretch=True)
+        self.wristband_capture_tree.grid(row=4, column=0, columnspan=4, sticky="ew")
+
+        model_box = ttk.LabelFrame(body, text="PC Model", padding=10)
+        model_box.grid(row=2, column=0, sticky="ew")
+        model_box.columnconfigure(1, weight=1)
+        ttk.Label(model_box, text="Confidence").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(model_box, textvariable=self.wristband_confidence_var, width=8).grid(row=0, column=1, sticky="w", pady=4)
+        ttk.Label(model_box, text="Model path").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(model_box, text=str(self.config.wristband_model_path), style="PanelSubtle.TLabel", wraplength=820).grid(
+            row=1, column=1, columnspan=3, sticky="ew", pady=4
+        )
+        model_actions = ttk.Frame(model_box)
+        model_actions.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        for column in range(3):
+            model_actions.columnconfigure(column, weight=1)
+        ttk.Button(model_actions, text="Import TFLite", command=self.import_wristband_model, style="Accent.TButton").grid(
+            row=0, column=0, sticky="ew", padx=(0, 4)
+        )
+        ttk.Button(model_actions, text="Reload Model", command=self.reload_wristband_model, style="Secondary.TButton").grid(
+            row=0, column=1, sticky="ew", padx=4
+        )
+        ttk.Button(
+            model_actions,
+            text="Open Model Folder",
+            command=self.open_wristband_model_folder,
+            style="Secondary.TButton",
+        ).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+
+        self._refresh_wristband_capture_files()
+        self._sync_wristband_controls()
+        self._draw_wristband_capture_timer()
+
+    def _build_visualiser_page(self, page: ttk.Frame) -> None:
+        self._build_page_header(page, "Visualiser", "Live three-second wristband IMU history.")
+        body = ttk.Frame(page)
+        body.grid(row=1, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(2, weight=1)
+        body.rowconfigure(3, weight=1)
+
+        toolbar = ttk.Frame(body)
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        toolbar.columnconfigure(0, weight=1)
+        ttk.Label(toolbar, textvariable=self.wristband_visualizer_status_var, style="Value.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        self.wristband_visualizer_pause_button = ttk.Button(
+            toolbar,
+            text="Pause",
+            command=self.toggle_wristband_visualizer_pause,
+            style="Secondary.TButton",
+        )
+        self.wristband_visualizer_pause_button.grid(row=0, column=1, sticky="e", padx=(8, 4))
+        ttk.Button(
+            toolbar,
+            text="Clear",
+            command=self.clear_wristband_visualizer,
+            style="Secondary.TButton",
+        ).grid(row=0, column=2, sticky="e", padx=(4, 0))
+
+        capture_toolbar = ttk.Frame(body)
+        capture_toolbar.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        capture_toolbar.columnconfigure(4, weight=1)
+        ttk.Label(capture_toolbar, text="Capture window").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.wristband_visualizer_duration_entry = ttk.Entry(
+            capture_toolbar,
+            textvariable=self.wristband_visualizer_capture_duration_var,
+            width=7,
+        )
+        self.wristband_visualizer_duration_entry.grid(row=0, column=1, sticky="w")
+        ttk.Label(capture_toolbar, text="seconds").grid(row=0, column=2, sticky="w", padx=(4, 12))
+        self.wristband_visualizer_start_capture_button = ttk.Button(
+            capture_toolbar,
+            text="Start Capture",
+            command=self.start_wristband_visualizer_capture,
+            style="Accent.TButton",
+        )
+        self.wristband_visualizer_start_capture_button.grid(row=0, column=3, sticky="w")
+        ttk.Label(capture_toolbar, textvariable=self.wristband_visualizer_capture_status_var).grid(
+            row=0, column=4, sticky="w", padx=(12, 8)
+        )
+        self.wristband_visualizer_save_button = ttk.Button(
+            capture_toolbar,
+            text="Save Last",
+            command=self.save_wristband_visualizer_capture,
+            style="Secondary.TButton",
+            state="disabled",
+        )
+        self.wristband_visualizer_save_button.grid(row=0, column=5, sticky="e")
+
+        accel_box = ttk.LabelFrame(body, text="Acceleration (m/s²)", padding=8)
+        accel_box.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
+        accel_box.columnconfigure(0, weight=1)
+        accel_box.rowconfigure(0, weight=1)
+        self.wristband_accel_canvas = tk.Canvas(accel_box, bg="#ffffff", highlightthickness=0, height=260)
+        self.wristband_accel_canvas.grid(row=0, column=0, sticky="nsew")
+        self.wristband_accel_canvas.bind("<Configure>", lambda _event: self._draw_wristband_visualizer())
+
+        gyro_box = ttk.LabelFrame(body, text="Gyroscope (°/s)", padding=8)
+        gyro_box.grid(row=3, column=0, sticky="nsew")
+        gyro_box.columnconfigure(0, weight=1)
+        gyro_box.rowconfigure(0, weight=1)
+        self.wristband_gyro_canvas = tk.Canvas(gyro_box, bg="#ffffff", highlightthickness=0, height=260)
+        self.wristband_gyro_canvas.grid(row=0, column=0, sticky="nsew")
+        self.wristband_gyro_canvas.bind("<Configure>", lambda _event: self._draw_wristband_visualizer())
+        self._draw_wristband_visualizer()
+
+    def toggle_wristband_visualizer_pause(self) -> None:
+        self.wristband_visualizer_paused = not self.wristband_visualizer_paused
+        self.wristband_visualizer_pause_button.configure(
+            text="Resume" if self.wristband_visualizer_paused else "Pause"
+        )
+        self._draw_wristband_visualizer()
+
+    def clear_wristband_visualizer(self) -> None:
+        self.wristband_visualizer_samples.clear()
+        self._wristband_visualizer_last_sequence = None
+        self._draw_wristband_visualizer()
+
+    def start_wristband_visualizer_capture(self) -> None:
+        if self.wristband_visualizer_capture_phase in {"ready", "capturing"}:
+            return
+        try:
+            duration_s = float(self.wristband_visualizer_capture_duration_var.get())
+        except ValueError:
+            self.wristband_visualizer_capture_status_var.set("Capture: duration must be a number")
+            return
+        if duration_s < 1.0 or duration_s > 120.0:
+            self.wristband_visualizer_capture_status_var.set("Capture: choose 1 to 120 seconds")
+            return
+        self.wristband_visualizer_capture_duration_s = duration_s
+        self.wristband_visualizer_capture_duration_var.set(f"{duration_s:g}")
+        self.wristband_visualizer_capture_samples = []
+        self.wristband_visualizer_capture_phase = "ready"
+        self.wristband_visualizer_capture_started_s = time.monotonic()
+        self.wristband_visualizer_start_capture_button.configure(state="disabled")
+        self.wristband_visualizer_duration_entry.configure(state="disabled")
+        self.wristband_visualizer_capture_status_var.set("Ready in 3.0 s")
+
+    def _update_wristband_visualizer_capture(self, now_s: float) -> None:
+        phase = self.wristband_visualizer_capture_phase
+        if phase == "ready":
+            remaining_s = max(0.0, 3.0 - (now_s - self.wristband_visualizer_capture_started_s))
+            self.wristband_visualizer_capture_status_var.set(f"Ready in {remaining_s:.1f} s")
+            if remaining_s <= 0.0:
+                self.wristband_visualizer_capture_phase = "capturing"
+                self.wristband_visualizer_capture_started_s = now_s
+                self.wristband_visualizer_capture_samples = []
+        elif phase == "capturing":
+            elapsed_s = now_s - self.wristband_visualizer_capture_started_s
+            remaining_s = max(0.0, self.wristband_visualizer_capture_duration_s - elapsed_s)
+            self.wristband_visualizer_capture_status_var.set(
+                f"Capturing: {remaining_s:.1f} s | {len(self.wristband_visualizer_capture_samples)} samples"
+            )
+            if remaining_s <= 0.0:
+                self.wristband_visualizer_capture_phase = "complete"
+                self.wristband_visualizer_last_capture = list(self.wristband_visualizer_capture_samples)
+                self.wristband_visualizer_start_capture_button.configure(state="normal")
+                self.wristband_visualizer_duration_entry.configure(state="normal")
+                self.wristband_visualizer_save_button.configure(
+                    state="normal" if self.wristband_visualizer_last_capture else "disabled"
+                )
+                self.wristband_visualizer_capture_status_var.set(
+                    f"Capture complete: {len(self.wristband_visualizer_last_capture)} samples"
+                )
+                if self.wristband_visualizer_last_capture:
+                    self.root.after(0, self.save_wristband_visualizer_capture)
+
+    def save_wristband_visualizer_capture(self) -> None:
+        if not self.wristband_visualizer_last_capture:
+            self.wristband_visualizer_capture_status_var.set("Capture: no completed recording to save")
+            return
+        self.config.exports_dir.mkdir(parents=True, exist_ok=True)
+        selected = filedialog.asksaveasfilename(
+            title="Save wristband visualisation",
+            initialdir=str(self.config.exports_dir),
+            initialfile=f"wristband_visualisation_{time.strftime('%Y%m%d_%H%M%S')}.png",
+            defaultextension=".png",
+            filetypes=[("PNG image", "*.png"), ("PDF document", "*.pdf")],
+        )
+        if not selected:
+            return
+        image = self._render_wristband_capture_image(self.wristband_visualizer_last_capture)
+        path = Path(selected)
+        if path.suffix.lower() == ".pdf":
+            image.convert("RGB").save(path, "PDF", resolution=150.0)
+        else:
+            if path.suffix.lower() != ".png":
+                path = path.with_suffix(".png")
+            image.save(path, "PNG")
+        self.wristband_visualizer_capture_status_var.set(f"Saved: {path.name}")
+        self.log(f"Saved wristband visualisation to {path}.")
+
+    def _add_wristband_visualizer_state(self, serial_state: dict[str, Any]) -> None:
+        devices = serial_state.get("devices", {}) if isinstance(serial_state, dict) else {}
+        wristband = devices.get("wristband", {}) if isinstance(devices, dict) else {}
+        if not isinstance(wristband, dict):
+            return
+        status = str(wristband.get("status", "")).lower()
+        if status in {"not_connected", "disconnected", "tbd"}:
+            self.wristband_visualizer_samples.clear()
+            self._wristband_visualizer_last_sequence = None
+            self.wristband_visualizer_status_var.set("Wristband: disconnected")
+            return
+        sequence = wristband.get("sequence")
+        if sequence is not None and sequence == self._wristband_visualizer_last_sequence:
+            return
+        sample = extract_wristband_imu_sample(serial_state)
+        packet_ms = wristband.get("t_ms")
+        if sample is None or not isinstance(packet_ms, (int, float)):
+            return
+        values = tuple(float(sample[key]) for key in ("accX", "accY", "accZ", "gyroX", "gyroY", "gyroZ"))
+        timestamp_s = float(packet_ms) / 1000.0
+        if self.wristband_visualizer_capture_phase == "capturing":
+            self.wristband_visualizer_capture_samples.append((timestamp_s, values))
+        if self.wristband_visualizer_paused:
+            return
+        if self.wristband_visualizer_samples and timestamp_s < self.wristband_visualizer_samples[-1][0]:
+            self.wristband_visualizer_samples.clear()
+        self.wristband_visualizer_samples.append((timestamp_s, values))
+        self._wristband_visualizer_last_sequence = sequence
+        cutoff_s = timestamp_s - 3.0
+        while self.wristband_visualizer_samples and self.wristband_visualizer_samples[0][0] < cutoff_s:
+            self.wristband_visualizer_samples.popleft()
+        self.wristband_visualizer_status_var.set(
+            f"Wristband: live | {len(self.wristband_visualizer_samples)} samples | 3.0 s window"
+        )
+
+    def _draw_wristband_visualizer(self) -> None:
+        if not hasattr(self, "wristband_accel_canvas"):
+            return
+        if self.wristband_visualizer_capture_phase == "capturing" and self.wristband_visualizer_capture_samples:
+            samples = list(self.wristband_visualizer_capture_samples)
+            window_s = self.wristband_visualizer_capture_duration_s
+        elif self.wristband_visualizer_capture_phase == "complete" and self.wristband_visualizer_last_capture:
+            samples = list(self.wristband_visualizer_last_capture)
+            window_s = self.wristband_visualizer_capture_duration_s
+        else:
+            samples = list(self.wristband_visualizer_samples)
+            window_s = 3.0
+        self._draw_wristband_plot(self.wristband_accel_canvas, samples, (0, 1, 2), minimum_span=20.0, window_s=window_s)
+        self._draw_wristband_plot(self.wristband_gyro_canvas, samples, (3, 4, 5), minimum_span=20.0, window_s=window_s)
+
+    @staticmethod
+    def _draw_wristband_plot(
+        canvas: tk.Canvas,
+        samples: list[tuple[float, tuple[float, float, float, float, float, float]]],
+        value_indices: tuple[int, int, int],
+        *,
+        minimum_span: float,
+        window_s: float,
+    ) -> None:
+        canvas.delete("all")
+        width = max(240, canvas.winfo_width())
+        height = max(160, canvas.winfo_height())
+        left, top, right, bottom = 62, 18, width - 18, height - 34
+        plot_width = max(1, right - left)
+        plot_height = max(1, bottom - top)
+        canvas.create_rectangle(left, top, right, bottom, fill="#ffffff", outline="#d0d5dd")
+
+        values = [sample[1][index] for sample in samples for index in value_indices]
+        if values:
+            minimum = min(values)
+            maximum = max(values)
+            center = (minimum + maximum) / 2.0
+            span = max(minimum_span, (maximum - minimum) * 1.25)
+        else:
+            center, span = 0.0, minimum_span
+        y_min, y_max = center - span / 2.0, center + span / 2.0
+
+        for tick in range(5):
+            fraction = tick / 4.0
+            x = left + plot_width * fraction
+            time_label = -window_s + window_s * fraction
+            canvas.create_line(x, top, x, bottom, fill="#eef2f6")
+            canvas.create_text(x, bottom + 16, text=f"{time_label:.1f}s", fill="#667085", font=("Segoe UI", 8))
+            y = top + plot_height * fraction
+            value_label = y_max - span * fraction
+            canvas.create_line(left, y, right, y, fill="#eef2f6")
+            canvas.create_text(left - 8, y, text=f"{value_label:.1f}", anchor="e", fill="#667085", font=("Segoe UI", 8))
+
+        legend = (("X", "#dc2626"), ("Y", "#16a34a"), ("Z", "#2563eb"))
+        legend_x = left + 8
+        for axis, color in legend:
+            canvas.create_line(legend_x, top + 10, legend_x + 18, top + 10, fill=color, width=2)
+            canvas.create_text(legend_x + 23, top + 10, text=axis, anchor="w", fill="#344054", font=("Segoe UI", 8, "bold"))
+            legend_x += 52
+        if not samples:
+            canvas.create_text(
+                (left + right) / 2,
+                (top + bottom) / 2,
+                text="Waiting for wristband data",
+                fill="#98a2b3",
+                font=("Segoe UI", 11),
+            )
+            return
+
+        latest_s = samples[-1][0]
+        for line_index, value_index in enumerate(value_indices):
+            points: list[float] = []
+            for timestamp_s, sample_values in samples:
+                age_s = timestamp_s - latest_s
+                x = right + (age_s / max(0.1, window_s)) * plot_width
+                value = sample_values[value_index]
+                y = bottom - ((value - y_min) / span) * plot_height
+                points.extend((x, y))
+            if len(points) >= 4:
+                canvas.create_line(*points, fill=legend[line_index][1], width=2, smooth=False)
+
+    def _render_wristband_capture_image(
+        self,
+        samples: list[tuple[float, tuple[float, float, float, float, float, float]]],
+    ) -> Image.Image:
+        image = Image.new("RGB", (1600, 1120), "#f6f7f9")
+        draw = ImageDraw.Draw(image)
+        title_font = ImageFont.truetype("arial.ttf", 28) if os.name == "nt" else ImageFont.load_default()
+        body_font = ImageFont.truetype("arial.ttf", 16) if os.name == "nt" else ImageFont.load_default()
+        draw.text((60, 34), "AirTrixx Wristband Visualisation", fill="#101828", font=title_font)
+        draw.text(
+            (60, 78),
+            f"Capture window: {self.wristband_visualizer_capture_duration_s:g} s  |  Samples: {len(samples)}  |  "
+            f"Created: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            fill="#475467",
+            font=body_font,
+        )
+        self._draw_wristband_plot_image(
+            draw,
+            samples,
+            (0, 1, 2),
+            (60, 125, 1540, 585),
+            "Acceleration (m/s^2)",
+            self.wristband_visualizer_capture_duration_s,
+            body_font,
+        )
+        self._draw_wristband_plot_image(
+            draw,
+            samples,
+            (3, 4, 5),
+            (60, 625, 1540, 1085),
+            "Gyroscope (deg/s)",
+            self.wristband_visualizer_capture_duration_s,
+            body_font,
+        )
+        return image
+
+    @staticmethod
+    def _draw_wristband_plot_image(
+        draw: ImageDraw.ImageDraw,
+        samples: list[tuple[float, tuple[float, float, float, float, float, float]]],
+        value_indices: tuple[int, int, int],
+        bounds: tuple[int, int, int, int],
+        title: str,
+        window_s: float,
+        font: Any,
+    ) -> None:
+        left, top, right, bottom = bounds
+        plot_left, plot_top, plot_right, plot_bottom = left + 82, top + 48, right - 24, bottom - 48
+        plot_width = plot_right - plot_left
+        plot_height = plot_bottom - plot_top
+        draw.rounded_rectangle(bounds, radius=8, fill="#ffffff", outline="#d0d5dd", width=2)
+        draw.text((left + 20, top + 15), title, fill="#101828", font=font)
+        values = [sample[1][index] for sample in samples for index in value_indices]
+        if values:
+            minimum, maximum = min(values), max(values)
+            center = (minimum + maximum) / 2.0
+            span = max(20.0, (maximum - minimum) * 1.25)
+        else:
+            center, span = 0.0, 20.0
+        y_min, y_max = center - span / 2.0, center + span / 2.0
+        for tick in range(5):
+            fraction = tick / 4.0
+            x = plot_left + int(plot_width * fraction)
+            y = plot_top + int(plot_height * fraction)
+            draw.line((x, plot_top, x, plot_bottom), fill="#eef2f6", width=1)
+            draw.line((plot_left, y, plot_right, y), fill="#eef2f6", width=1)
+            draw.text((x - 25, plot_bottom + 10), f"{-window_s + window_s * fraction:.1f}s", fill="#667085", font=font)
+            draw.text((left + 10, y - 8), f"{y_max - span * fraction:.1f}", fill="#667085", font=font)
+        draw.rectangle((plot_left, plot_top, plot_right, plot_bottom), outline="#98a2b3", width=2)
+        legend = (("X", "#dc2626"), ("Y", "#16a34a"), ("Z", "#2563eb"))
+        legend_x = plot_left + 12
+        for axis, color in legend:
+            draw.line((legend_x, plot_top + 16, legend_x + 28, plot_top + 16), fill=color, width=4)
+            draw.text((legend_x + 36, plot_top + 6), axis, fill="#344054", font=font)
+            legend_x += 85
+        if not samples:
+            draw.text((plot_left + 30, plot_top + plot_height // 2), "No wristband samples captured", fill="#98a2b3", font=font)
+            return
+        latest_s = samples[-1][0]
+        for line_index, value_index in enumerate(value_indices):
+            points: list[tuple[int, int]] = []
+            for timestamp_s, sample_values in samples:
+                x = plot_right + int(((timestamp_s - latest_s) / max(0.1, window_s)) * plot_width)
+                y = plot_bottom - int(((sample_values[value_index] - y_min) / span) * plot_height)
+                points.append((x, y))
+            if len(points) >= 2:
+                draw.line(points, fill=legend[line_index][1], width=3)
+
+    def _build_wrist_rules_page(self, page: ttk.Frame) -> None:
+        self._build_page_header(page, "Wrist Rules", "Live rule-based wrist return detection and mapper output.")
+        body = self._scrollable_body(page)
+        body.columnconfigure(0, weight=1)
+
+        live_box = ttk.LabelFrame(body, text="Live Detector", padding=10)
+        live_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        live_box.columnconfigure(1, weight=1)
+        ttk.Label(live_box, text="wrist_rule_value").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=4)
+        ttk.Label(live_box, textvariable=self.wrist_rule_value_var, style="Value.TLabel").grid(row=0, column=1, sticky="w", pady=4)
+        for row, variable in enumerate(
+            (
+                self.wrist_rule_state_var,
+                self.wrist_rule_gyro_var,
+                self.wrist_rule_metrics_var,
+                self.wrist_rule_last_event_var,
+                self.wrist_rule_rejection_var,
+            ),
+            start=1,
+        ):
+            ttk.Label(live_box, textvariable=variable).grid(row=row, column=0, columnspan=2, sticky="w", pady=3)
+
+        settings_box = ttk.LabelFrame(body, text="Detector Settings", padding=10)
+        settings_box.grid(row=1, column=0, sticky="ew")
+        settings_box.columnconfigure(1, weight=1)
+        ttk.Checkbutton(
+            settings_box,
+            text="Enabled",
+            variable=self.wrist_rule_enabled_var,
+            command=self._apply_wrist_rule_settings,
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        labels = {
+            "first_peak_dps": "First peak (deg/s)",
+            "second_peak_dps": "Opposite peak (deg/s)",
+            "neutral_dps": "Neutral threshold (deg/s)",
+            "max_other_axis_dps": "Maximum X/Z (deg/s)",
+            "dominance_ratio": "Y dominance ratio",
+            "opposite_timeout_s": "Opposite peak timeout (s)",
+            "min_duration_s": "Minimum duration (s)",
+            "max_duration_s": "Maximum duration (s)",
+            "neutral_hold_s": "Neutral hold (s)",
+            "cooldown_s": "Cooldown (s)",
+            "min_total_rotation_deg": "Minimum total rotation (deg)",
+            "max_signed_rotation_deg": "Maximum signed rotation (deg)",
+        }
+        for row, (key, label) in enumerate(labels.items(), start=1):
+            ttk.Label(settings_box, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=3)
+            ttk.Entry(settings_box, textvariable=self.wrist_rule_setting_vars[key], width=12).grid(
+                row=row, column=1, sticky="w", pady=3
+            )
+        actions = ttk.Frame(settings_box)
+        actions.grid(row=len(labels) + 1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Button(actions, text="Apply Settings", command=self._apply_wrist_rule_settings, style="Accent.TButton").grid(
+            row=0, column=0, sticky="w", padx=(0, 6)
+        )
+        ttk.Button(actions, text="Reset State", command=self._reset_wrist_rule_detector, style="Secondary.TButton").grid(
+            row=0, column=1, sticky="w"
+        )
+
+    def _apply_wrist_rule_settings(self) -> None:
+        try:
+            values = {key: float(variable.get()) for key, variable in self.wrist_rule_setting_vars.items()}
+        except ValueError:
+            self.wrist_rule_rejection_var.set("Settings: values must be numbers")
+            return
+        if any(value <= 0 for value in values.values()):
+            self.wrist_rule_rejection_var.set("Settings: values must be greater than zero")
+            return
+        if values["min_duration_s"] >= values["max_duration_s"]:
+            self.wrist_rule_rejection_var.set("Settings: minimum duration must be below maximum duration")
+            return
+        config = self.wrist_rule_detector.config
+        config.enabled = bool(self.wrist_rule_enabled_var.get())
+        for key, value in values.items():
+            setattr(config, key, value)
+        self.wrist_rule_detector.reset()
+        self.wrist_rule_rejection_var.set("Settings applied")
+
+    def _reset_wrist_rule_detector(self) -> None:
+        self.wrist_rule_detector.reset()
+        self._update_wrist_rule_live_view(self.wrist_rule_detector.output(time.monotonic()))
+
+    def _update_wrist_rule_live_view(self, output: dict[str, Any]) -> None:
+        self.wrist_rule_value_var.set(str(output.get("value", "none")))
+        self.wrist_rule_state_var.set(
+            f"State: {output.get('state', 'idle')} | Direction: {output.get('direction', 'none')}"
+        )
+        self.wrist_rule_gyro_var.set(
+            "Corrected gyro X/Y/Z: "
+            f"{float(output.get('gyro_x', 0.0)):.1f} / "
+            f"{float(output.get('gyro_y', 0.0)):.1f} / "
+            f"{float(output.get('gyro_z', 0.0)):.1f} deg/s"
+        )
+        self.wrist_rule_metrics_var.set(
+            f"Rotation signed/total: {float(output.get('signed_rotation_deg', 0.0)):.1f} / "
+            f"{float(output.get('total_rotation_deg', 0.0)):.1f} deg | "
+            f"Peaks: {float(output.get('first_peak_dps', 0.0)):.1f}, "
+            f"{float(output.get('second_peak_dps', 0.0)):.1f} deg/s"
+        )
+        self.wrist_rule_last_event_var.set(f"Last event: {output.get('last_event', 'none')}")
+        rejection = str(output.get("rejection_reason", "") or "none")
+        self.wrist_rule_rejection_var.set(f"Rejected: {rejection}")
+
+    def _on_wristband_capture_status(self, status: str) -> None:
+        try:
+            self.root.after(0, lambda message=status: self._set_wristband_capture_status(message))
+        except tk.TclError:
+            pass
+
+    def _set_wristband_capture_status(self, status: str) -> None:
+        self.wristband_capture_status_var.set(f"Capture: {status}")
+        self.log(status)
+        self._sync_wristband_controls()
+
+    def _sync_wristband_controls(self) -> None:
+        if hasattr(self, "wristband_start_button") and self.wristband_start_button.winfo_exists():
+            self.wristband_start_button.configure(state="disabled" if self.wristband_capture.is_recording else "normal")
+        if hasattr(self, "wristband_stop_button") and self.wristband_stop_button.winfo_exists():
+            self.wristband_stop_button.configure(state="normal" if self.wristband_capture.is_recording else "disabled")
+        entry_state = "disabled" if self.wristband_capture.is_recording else "normal"
+        for entry_name in ("wristband_capture_green_label_entry", "wristband_capture_red_label_entry"):
+            entry = getattr(self, entry_name, None)
+            if entry is not None and entry.winfo_exists():
+                entry.configure(state=entry_state)
+
+    def wristband_start_capture(self) -> None:
+        green_label = sanitize_label(self.wristband_capture_green_label_var.get())
+        red_label = sanitize_label(self.wristband_capture_red_label_var.get())
+        self.wristband_capture_green_label_var.set(green_label)
+        self.wristband_capture_red_label_var.set(red_label)
+        if self.wristband_capture.start(green_label, red_label):
+            self.wristband_capture_count_var.set("Samples: 0 | Rows: 0")
+            self._draw_wristband_capture_timer()
+            self._sync_wristband_controls()
+
+    def wristband_stop_capture(self) -> None:
+        paths = self.wristband_capture.stop()
+        self._sync_wristband_controls()
+        if paths:
+            self._refresh_wristband_capture_files()
+        self.wristband_capture_count_var.set(f"Saved samples: {len(paths)}")
+        self._draw_wristband_capture_timer()
+
+    def wristband_export_dataset(self) -> None:
+        self.config.exports_dir.mkdir(parents=True, exist_ok=True)
+        default_name = f"wristband_training_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        selected = filedialog.asksaveasfilename(
+            title="Export wristband training CSV",
+            initialdir=str(self.config.exports_dir),
+            initialfile=default_name,
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not selected:
+            return
+        count = export_combined_csv(self.config.wristband_data_dir, Path(selected))
+        self.log(f"Exported {count} wristband training row(s) to {selected}.")
+        self.wristband_capture_status_var.set(f"Capture: exported {count} row(s)")
+
+    def wristband_open_folder(self) -> None:
+        self._open_path(self.config.wristband_data_dir, "wristband data folder")
+
+    def open_wristband_model_folder(self) -> None:
+        self._open_path(self.config.wristband_model_dir, "wristband model folder")
+
+    def import_wristband_model(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Import wristband TFLite model",
+            filetypes=[("TensorFlow Lite models", "*.tflite"), ("All files", "*.*")],
+        )
+        if not selected:
+            return
+        model_path = Path(selected)
+        labels_path = find_companion_labels(model_path)
+        if labels_path is None:
+            optional = filedialog.askopenfilename(
+                title="Optional labels file",
+                filetypes=[("Label files", "*.txt *.json"), ("All files", "*.*")],
+            )
+            labels_path = Path(optional) if optional else None
+        labels = install_model_files(
+            model_path,
+            self.config.wristband_model_path,
+            labels_path,
+            self.config.wristband_labels_path,
+        )
+        self.log(f"Imported wristband TFLite model from {model_path}.")
+        if labels:
+            self.log("Imported wristband labels: " + ", ".join(labels))
+        else:
+            self.log("Imported wristband model without labels; numeric classes will display as class_0, class_1, ...")
+        self.reload_wristband_model()
+
+    def reload_wristband_model(self) -> None:
+        try:
+            confidence = float(self.wristband_confidence_var.get())
+        except ValueError:
+            confidence = DEFAULT_MIN_CONFIDENCE
+            self.wristband_confidence_var.set(f"{confidence:.2f}")
+        self.wristband_model.min_confidence = max(0.0, min(1.0, confidence))
+        loaded = self.wristband_model.reload()
+        self.wristband_model_status_var.set(f"Model: {self.wristband_model.status}")
+        self.wristband_model_value_var.set("disabled")
+        if self.wristband_model.labels:
+            self.wristband_labels_var.set("Labels: " + ", ".join(self.wristband_model.labels))
+        else:
+            self.wristband_labels_var.set("Labels: none")
+        if hasattr(self, "testing_tree"):
+            self._refresh_testing_list()
+        self.log(f"Wristband model {'loaded' if loaded else 'not loaded'}: {self.wristband_model.status}")
+
+    def _wristband_csv_sample_count(self, path: Path) -> int:
+        try:
+            with path.open("r", newline="", encoding="utf-8-sig") as f:
+                return sum(1 for _row in csv.DictReader(f))
+        except Exception:
+            return 0
+
+    def _refresh_wristband_capture_files(self) -> None:
+        if not hasattr(self, "wristband_capture_tree"):
+            return
+        for item_id in self.wristband_capture_tree.get_children():
+            self.wristband_capture_tree.delete(item_id)
+        self.config.wristband_data_dir.mkdir(parents=True, exist_ok=True)
+        files = sorted(self.config.wristband_data_dir.glob("*.csv"), key=lambda path: path.stat().st_mtime, reverse=True)
+        total_samples = 0
+        for path in files[:50]:
+            count = self._wristband_csv_sample_count(path)
+            total_samples += 1
+            label = infer_label_from_sample_filename(path)
+            self.wristband_capture_tree.insert("", "end", values=(label, count, path.name))
+        if self.wristband_capture.is_recording:
+            self._update_wristband_capture_count()
+        else:
+            self.wristband_capture_count_var.set(f"Samples: {total_samples}")
+
+    def _update_wristband_capture_count(self) -> None:
+        self.wristband_capture_count_var.set(
+            f"Samples: {self.wristband_capture.sample_count} | Rows: {self.wristband_capture.row_count}"
+        )
+
+    def _draw_wristband_capture_timer(self) -> None:
+        if not hasattr(self, "wristband_capture_timer_canvas"):
+            return
+        canvas = self.wristband_capture_timer_canvas
+        width = int(canvas.cget("width"))
+        height = int(canvas.cget("height"))
+        pad = 10
+        canvas.delete("all")
+        now_s = time.monotonic()
+        active = self.wristband_capture.is_recording
+        phase = self.wristband_capture.phase if active else "idle"
+        fraction = self.wristband_capture.phase_fraction_remaining(now_s) if active else 1.0
+        remaining_s = self.wristband_capture.phase_remaining_s(now_s) if active else self.wristband_capture.phase_seconds
+        color = "#22c55e" if phase == "record" else "#ef4444" if phase == "rest" else "#d0d5dd"
+        label = (
+            self.wristband_capture.label
+            if phase == "record"
+            else self.wristband_capture.red_label
+            if phase == "rest"
+            else "IDLE"
+        )
+        canvas.create_oval(pad, pad, width - pad, height - pad, fill="#ffffff", outline="#d0d5dd", width=2)
+        if fraction > 0:
+            canvas.create_arc(
+                pad,
+                pad,
+                width - pad,
+                height - pad,
+                start=90,
+                extent=-360 * fraction,
+                fill=color,
+                outline=color,
+                style="pieslice",
+            )
+        canvas.create_oval(pad, pad, width - pad, height - pad, outline="#101828", width=1)
+        seconds = max(0, int(remaining_s + 0.999))
+        canvas.create_text(
+            width // 2,
+            height // 2 - 8,
+            text=f"00:{seconds:02d}",
+            fill="#101828",
+            font=("Segoe UI Semibold", 26),
+        )
+        canvas.create_text(
+            width // 2,
+            height // 2 + 30,
+            text=label.upper(),
+            fill="#101828",
+            font=("Segoe UI Semibold", 11),
+        )
+        if active:
+            phase_text = f"Green: recording {self.wristband_capture.label}" if phase == "record" else f"Red: recording {self.wristband_capture.red_label}"
+            self.wristband_capture_phase_var.set(f"{phase_text} ({remaining_s:.1f}s)")
+        else:
+            self.wristband_capture_phase_var.set("Timer: idle")
+
+    def _update_wristband_live_view(self, serial_state: dict[str, Any]) -> None:
+        sample = extract_wristband_imu_sample(serial_state, label="")
+        if sample is None:
+            self.wristband_live_imu_var.set("IMU: waiting")
+        else:
+            self.wristband_live_imu_var.set(
+                "IMU: "
+                f"acc {sample['accX']:.3f}, {sample['accY']:.3f}, {sample['accZ']:.3f} | "
+                f"gyro {sample['gyroX']:.3f}, {sample['gyroY']:.3f}, {sample['gyroZ']:.3f}"
+            )
+        self.wristband_model_value_var.set("disabled")
+        self.wristband_model_status_var.set(f"Model: {self.wristband_model.status}")
+        if self.wristband_capture.is_recording:
+            self._update_wristband_capture_count()
+        self._draw_wristband_capture_timer()
+        self._sync_wristband_controls()
 
     def _ensure_keyboard_typing_mapping(self, *, save: bool) -> None:
         profile = self.input_mapper.config.active()
@@ -1381,10 +2329,11 @@ class AirTrixxGUI:
         self.mapping_profile_combo.grid(row=0, column=1, sticky="ew", padx=(0, 8))
         self.mapping_profile_combo.bind("<<ComboboxSelected>>", self.on_mapping_profile_changed)
         ttk.Button(profile_box, text="New", command=self.new_mapping_profile).grid(row=0, column=2, sticky="ew", padx=(0, 6))
-        ttk.Button(profile_box, text="Save", command=self.save_input_mappings).grid(row=0, column=3, sticky="ew", padx=(0, 6))
-        ttk.Button(profile_box, text="Load", command=self.load_input_mappings).grid(row=0, column=4, sticky="ew", padx=(0, 6))
-        ttk.Button(profile_box, text="Import", command=self.import_input_mappings).grid(row=0, column=5, sticky="ew", padx=(0, 6))
-        ttk.Button(profile_box, text="Export", command=self.export_input_mappings).grid(row=0, column=6, sticky="ew")
+        ttk.Button(profile_box, text="Delete", command=self.delete_mapping_profile).grid(row=0, column=3, sticky="ew", padx=(0, 6))
+        ttk.Button(profile_box, text="Save", command=self.save_input_mappings).grid(row=0, column=4, sticky="ew", padx=(0, 6))
+        ttk.Button(profile_box, text="Load", command=self.load_input_mappings).grid(row=0, column=5, sticky="ew", padx=(0, 6))
+        ttk.Button(profile_box, text="Import", command=self.import_input_mappings).grid(row=0, column=6, sticky="ew", padx=(0, 6))
+        ttk.Button(profile_box, text="Export", command=self.export_input_mappings).grid(row=0, column=7, sticky="ew")
 
         split = ttk.Frame(body)
         split.grid(row=2, column=0, sticky="nsew")
@@ -2005,51 +2954,6 @@ class AirTrixxGUI:
                 conditions=[MappingCondition(source="hands.right.gesture", comparator="eq", threshold="closed_fist")],
             ),
             self._testing_raw_rule(
-                "raw:wrist_roll_right",
-                "Wrist roll right",
-                "Wristband",
-                "fused.wrist_roll_right_detected",
-                "truthy",
-                True,
-                debounce_ms=120,
-            ),
-            self._testing_raw_rule(
-                "raw:wrist_roll_left",
-                "Wrist roll left",
-                "Wristband",
-                "fused.wrist_roll_left_detected",
-                "truthy",
-                True,
-                debounce_ms=120,
-            ),
-            self._testing_raw_rule(
-                "raw:wrist_roll_right_then_neutral",
-                "Wrist roll right then neutral",
-                "Wristband",
-                "fused.wrist_roll_right_then_neutral_detected",
-                "truthy",
-                True,
-                debounce_ms=120,
-            ),
-            self._testing_raw_rule(
-                "raw:wrist_pitch_up",
-                "Wrist pitch up",
-                "Wristband",
-                "fused.wrist_pitch_up_detected",
-                "truthy",
-                True,
-                debounce_ms=120,
-            ),
-            self._testing_raw_rule(
-                "raw:wrist_pitch_down",
-                "Wrist pitch down",
-                "Wristband",
-                "fused.wrist_pitch_down_detected",
-                "truthy",
-                True,
-                debounce_ms=120,
-            ),
-            self._testing_raw_rule(
                 "raw:right_hand_close",
                 "Right hand close to ToF",
                 "ToF",
@@ -2108,6 +3012,28 @@ class AirTrixxGUI:
                 debounce_ms=0,
             ),
         ]
+
+        model_labels = list(self.wristband_model.labels) if hasattr(self, "wristband_model") else []
+        if not model_labels:
+            model_labels = ["rotate_right", "rotate_left", "flick", "wrist_circle"]
+        seen_model_labels: set[str] = set()
+        for label in model_labels:
+            raw_label = str(label).strip()
+            clean_label = sanitize_label(raw_label)
+            if not raw_label or raw_label.lower() == "none" or raw_label.lower() in seen_model_labels:
+                continue
+            seen_model_labels.add(raw_label.lower())
+            entries.append(
+                self._testing_raw_rule(
+                    f"raw:model_{clean_label}",
+                    f"Wristband model: {raw_label}",
+                    "Wristband",
+                    "fused.model_value",
+                    "eq",
+                    raw_label,
+                    debounce_ms=120,
+                )
+            )
 
         for rule in self.input_mapper.active_rules():
             if not rule.enabled or not rule.source:
@@ -2265,20 +3191,11 @@ class AirTrixxGUI:
             f"R gesture {value('hands.right.gesture')}",
             f"L z {value('hands.left.z_mm')} mm",
             f"R z {value('hands.right.z_mm')} mm",
+            f"model {value('fused.model_value')}",
             f"pitch {value('fused.wrist_pitch')}",
             f"roll {value('fused.wrist_roll')}",
-            f"pitch d {value('fused.wrist_pitch_delta')}",
-            f"roll d {value('fused.wrist_roll_delta')}",
-            f"pitch v {value('fused.wrist_pitch_velocity_dps')}",
-            f"roll v {value('fused.wrist_roll_velocity_dps')}",
-            f"roll profile {value('fused.wrist_roll_velocity_profile')}",
-            f"roll guard {value('fused.wrist_roll_candidate_active')}",
-            f"roll cooldown {value('fused.wrist_roll_event_cooldown_active')}",
-            f"roll blocked {value('fused.wrist_roll_event_blocked')}",
-            f"pitch up {value('fused.wrist_pitch_up_detected')}",
-            f"pitch down {value('fused.wrist_pitch_down_detected')}",
-            f"dominant {value('fused.wrist_dominant_axis')}",
-            f"motion {value('fused.wrist_motion')}",
+            f"accX {value('fused.wrist_accel_x')}",
+            f"gyroX {value('fused.wrist_gyro_x')}",
         ]
         self.testing_live_values_var.set("Live values: " + ", ".join(parts))
 
@@ -2644,7 +3561,9 @@ class AirTrixxGUI:
         self.log(f"Saved app settings to {self.config.calibration_path}.")
 
     def open_user_data_dir(self) -> None:
-        path = self.config.user_data_dir
+        self._open_path(self.config.user_data_dir, "app data folder")
+
+    def _open_path(self, path: Path, label: str) -> None:
         path.mkdir(parents=True, exist_ok=True)
         try:
             if platform.system() == "Darwin":
@@ -2654,7 +3573,7 @@ class AirTrixxGUI:
             else:
                 subprocess.run(["xdg-open", str(path)], check=False)
         except Exception as exc:
-            self.log(f"Could not open app data folder: {exc}")
+            self.log(f"Could not open {label}: {exc}")
 
     def toggle_input_mapper(self) -> None:
         self.input_mapper.set_enabled(self.mapping_enabled_var.get())
@@ -2707,6 +3626,25 @@ class AirTrixxGUI:
         self._refresh_mapping_table()
         self._refresh_testing_list()
         self._update_mapping_status()
+
+    def delete_mapping_profile(self) -> None:
+        name = self.mapping_profile_var.get()
+        if len(self.input_mapper.config.profiles) <= 1:
+            self.log("Cannot delete the only input mapping profile.")
+            return
+        if not messagebox.askyesno("Delete profile", f'Delete the input mapping profile "{name}"?'):
+            return
+        self.input_mapper.release_all()
+        if not self.input_mapper.config.remove_profile(name):
+            self.log(f'Could not delete input mapping profile "{name}".')
+            return
+        self.mapping_profile_var.set(self.input_mapper.config.active_profile)
+        save_mapping_config(self.input_mapper.config, self.mapping_config_path)
+        self._refresh_mapping_profile_combo()
+        self._refresh_mapping_table()
+        self._refresh_testing_list()
+        self._update_mapping_status()
+        self.log(f'Deleted input mapping profile "{name}".')
 
     def save_input_mappings(self) -> None:
         self._sync_mapping_start_enabled()
@@ -3516,10 +4454,12 @@ class AirTrixxGUI:
         page.tkraise()
         for name, button in self.nav_buttons.items():
             button.configure(style="NavActive.TButton" if name == page_name else "Nav.TButton")
-        if page_name in {"Dashboard", "Signals", "Mappings", "Testing", "Data / Logs"}:
+        if page_name in {"Dashboard", "Signals", "Keyboard", "Wristband", "Mappings", "Testing", "Data / Logs"}:
             self._schedule_text_update(10)
         if page_name == "Camera & Servo":
             self._update_preview(force=True)
+        if page_name == "Visualiser":
+            self._draw_wristband_visualizer()
 
     def _register_scroll_target(self, widget: tk.Widget, target: tk.Widget) -> None:
         self._scroll_targets[str(widget)] = target
@@ -4161,6 +5101,22 @@ class AirTrixxGUI:
         self.mirror_button.configure(text=f"Mirror: {'On' if mirrored else 'Off'}")
         self.log(f"Camera mirroring {'enabled' if mirrored else 'disabled'}.")
 
+    def toggle_camera_power(self) -> None:
+        self.camera_enabled = not self.camera_enabled
+        if self.camera_enabled:
+            self.hand_tracker.start()
+            self.camera_power_button.configure(text="Camera Off")
+            self.log("Camera enabled.")
+        else:
+            self.camera_centering_active = False
+            self.hand_tracker.stop()
+            self._close_camera_popup()
+            self.camera_power_button.configure(text="Camera On")
+            self.camera_chip_var.set("Camera: off")
+            if hasattr(self, "camera_centering_status_var"):
+                self.camera_centering_status_var.set("Camera centering: camera is off.")
+            self.log("Camera disabled and released.")
+
     def toggle_fans(self) -> None:
         if not self.serial_bridge.is_connected:
             self.log("Connect to the Antenna serial port before controlling fans.")
@@ -4216,6 +5172,10 @@ class AirTrixxGUI:
         )
 
     def start_camera_centering(self) -> None:
+        if not self.camera_enabled:
+            self.camera_centering_status_var.set("Camera centering: turn the camera on first.")
+            self.log("Camera centering requires the camera to be on.")
+            return
         if self._apply_calibration_entries() is None:
             return
         self.centering_bracket = None
@@ -4620,7 +5580,7 @@ class AirTrixxGUI:
         if not self.hand_calibration_active:
             return
 
-        hands = self.hand_tracker.get_latest_hands()
+        hands = self.hand_tracker.get_latest_hands() if self.camera_enabled else {}
         visible_hands = self._visible_session_calibration_hands(hands)
         if visible_hands is None:
             self.hand_calibration_status_var.set(
@@ -4882,6 +5842,8 @@ class AirTrixxGUI:
         self._close_camera_popup()
         self._stop_ota_server()
         self.recorder.stop()
+        if self.wristband_capture.is_recording:
+            self.wristband_capture.stop()
         self.servo_controller.disable_all()
         self.hand_tracker.stop()
         self.keyboard_bridge.disconnect()
@@ -4921,10 +5883,34 @@ class AirTrixxGUI:
             self._update_hand_calibration(hands, serial_state)
         if self.centering_bracket is None and not camera_centering_claimed_servo and not self.hand_calibration_active:
             self.servo_controller.send_for_hands(hands, serial_state)
-        self._latest_snapshot = self.fusion_state.build_snapshot(serial_state, hands)
+        now_s = time.monotonic()
+        self._update_wristband_visualizer_capture(now_s)
+        wristband_states = self.serial_bridge.drain_wristband_states()
+        if not wristband_states:
+            wristband_states = [serial_state]
+        for wristband_state in wristband_states:
+            wristband_state = self._serial_state_with_audio_dock_overlay(wristband_state)
+            self._add_wristband_visualizer_state(wristband_state)
+            self.wrist_rule_detector.process_serial_state(wristband_state, now_s=now_s)
+            self.wristband_capture.add_serial_state(wristband_state)
+        wrist_rule_output = self.wrist_rule_detector.output(now_s)
+        self._update_wrist_rule_live_view(wrist_rule_output)
+        if self.active_page == "Visualiser":
+            self._draw_wristband_visualizer()
+        if hasattr(self, "wristband_capture_timer_canvas"):
+            self._draw_wristband_capture_timer()
+        self.wristband_model_value_var.set("disabled")
+        self._latest_snapshot = self.fusion_state.build_snapshot(
+            serial_state,
+            hands,
+            now_s=now_s,
+            model_value="none",
+            wrist_rule_value=str(wrist_rule_output["value"]),
+            wrist_rotate_left_return=bool(wrist_rule_output["rotate_left_return"]),
+            wrist_rotate_right_return=bool(wrist_rule_output["rotate_right_return"]),
+        )
         self._apply_audio_dock_snapshot_fields(self._latest_snapshot)
         self._latest_snapshot["face_state"] = self.hand_tracker.get_latest_face()
-        now_s = time.monotonic()
         self.keyboard_bridge.tick(now_s=now_s)
         testing_suppressed = bool(self.testing_active and self.testing_output_suppressed_var.get())
         mapper_suppressed = self._focus_is_text_input() or self.mapping_recording_shortcut or testing_suppressed
@@ -4975,11 +5961,14 @@ class AirTrixxGUI:
         if self.input_mapper.has_held_outputs:
             mapper_state += ", holding"
         self.mapper_chip_var.set(f"Mapper: {mapper_state}")
-        frame_state = "live" if self.hand_tracker.has_latest_frame() else "no frame"
-        self.camera_chip_var.set(
-            f"Camera: {frame_state} {self.config.camera_width}x{self.config.camera_height}, "
-            f"preview {self.config.preview_fps} FPS"
-        )
+        if self.camera_enabled:
+            frame_state = "live" if self.hand_tracker.has_latest_frame() else "no frame"
+            self.camera_chip_var.set(
+                f"Camera: {frame_state} {self.config.camera_width}x{self.config.camera_height}, "
+                f"preview {self.config.preview_fps} FPS"
+            )
+        else:
+            self.camera_chip_var.set("Camera: off")
         self.permissions_status_var.set(f"App data: {self.config.user_data_dir}")
 
     def _home_brackets_on_connect(self) -> None:
@@ -5450,6 +6439,9 @@ class AirTrixxGUI:
             self._update_keyboard_grid(serial_state)
             self._sync_keyboard_controls()
             return
+        if page == "Wristband":
+            self._update_wristband_live_view(serial_state)
+            return
         if page == "Mappings":
             self._update_mapping_live_views()
             return
@@ -5573,6 +6565,8 @@ class AirTrixxGUI:
             add("Wristband", f"gyro_{axis}", wrist_gyro.get(axis))
         for field in ("pitch", "roll"):
             add("Wristband", field, wrist.get(field) if isinstance(wrist, dict) else None)
+        add("Wristband", "model_value", "none")
+        add("Wristband", "model_loaded", self.wristband_model.model_loaded)
 
         add("Cam Dock", "status", camdock.get("status") if isinstance(camdock, dict) else None)
         add("Cam Dock", "sequence", camdock.get("sequence") if isinstance(camdock, dict) else None)
@@ -5679,6 +6673,7 @@ class AirTrixxGUI:
         add("Audio Dock", "input", audio_input)
 
         input_dict["audiodock_input"] = audio_input
+        input_dict["model_value"] = "none"
 
         for field in FIELD_ORDER:
             add("Fused Input", field, input_dict.get(field))
@@ -5751,8 +6746,16 @@ class AirTrixxGUI:
 
     def _snapshot_provider(self) -> dict[str, Any]:
         serial_state = self._serial_state_with_audio_dock_overlay(self.serial_bridge.get_latest_state())
-        hand_state = self.hand_tracker.get_latest_hands()
-        snapshot = self.fusion_state.build_snapshot(serial_state, hand_state)
+        hand_state = self.hand_tracker.get_latest_hands() if self.camera_enabled else {}
+        rule_output = self.wrist_rule_detector.output(time.monotonic())
+        snapshot = self.fusion_state.build_snapshot(
+            serial_state,
+            hand_state,
+            model_value="none",
+            wrist_rule_value=str(rule_output["value"]),
+            wrist_rotate_left_return=bool(rule_output["rotate_left_return"]),
+            wrist_rotate_right_return=bool(rule_output["rotate_right_return"]),
+        )
         self._apply_audio_dock_snapshot_fields(snapshot)
         return snapshot
 

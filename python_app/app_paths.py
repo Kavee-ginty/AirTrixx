@@ -22,6 +22,8 @@ class AppPaths:
     exports_dir: Path
     gesture_data_dir: Path
     keyboard_data_dir: Path
+    wristband_data_dir: Path
+    wristband_model_dir: Path
     audio_training_dir: Path
     calibration_path: Path
     mapping_path: Path
@@ -30,6 +32,8 @@ class AppPaths:
     keyboard_dataset_path: Path
     keyboard_model_path: Path
     keyboard_words_path: Path
+    wristband_model_path: Path
+    wristband_labels_path: Path
 
 
 def is_frozen() -> bool:
@@ -74,6 +78,8 @@ def build_app_paths(app_name: str = APP_NAME) -> AppPaths:
     exports_dir = user_data_dir / "exports"
     gesture_data_dir = user_data_dir / "gestures"
     keyboard_data_dir = user_data_dir / "keyboard"
+    wristband_data_dir = user_data_dir / "wristband"
+    wristband_model_dir = wristband_data_dir / "model"
     audio_training_dir = user_data_dir / "audio_training"
     return AppPaths(
         user_data_dir=user_data_dir,
@@ -83,6 +89,8 @@ def build_app_paths(app_name: str = APP_NAME) -> AppPaths:
         exports_dir=exports_dir,
         gesture_data_dir=gesture_data_dir,
         keyboard_data_dir=keyboard_data_dir,
+        wristband_data_dir=wristband_data_dir,
+        wristband_model_dir=wristband_model_dir,
         audio_training_dir=audio_training_dir,
         calibration_path=config_dir / "calibration.json",
         mapping_path=config_dir / "input_mappings.json",
@@ -91,6 +99,8 @@ def build_app_paths(app_name: str = APP_NAME) -> AppPaths:
         keyboard_dataset_path=keyboard_data_dir / "raw_samples.csv",
         keyboard_model_path=keyboard_data_dir / "word_knn_model.npz",
         keyboard_words_path=keyboard_data_dir / "current_training_words.txt",
+        wristband_model_path=wristband_model_dir / "wristband_gesture_model.tflite",
+        wristband_labels_path=wristband_model_dir / "labels.txt",
     )
 
 
@@ -103,6 +113,8 @@ def ensure_app_paths(paths: AppPaths) -> None:
         paths.exports_dir,
         paths.gesture_data_dir,
         paths.keyboard_data_dir,
+        paths.wristband_data_dir,
+        paths.wristband_model_dir,
         paths.audio_training_dir,
     ):
         directory.mkdir(parents=True, exist_ok=True)
