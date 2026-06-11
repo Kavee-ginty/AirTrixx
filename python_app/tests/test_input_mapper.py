@@ -12,17 +12,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from input_backend import FakeInputBackend
 from input_mapper import (
     GESTURE_COOLDOWN_SEC,
+    GTA_VICE_CITY_PROFILE_NAME,
     InputMapper,
     MappingAction,
     MappingCondition,
     MappingConfig,
+    MappingProfile,
     MappingRule,
     SignalCatalog,
     TAB_SWITCH_PROFILE_NAME,
+    VIEWER_3D_PROFILE_NAME,
     default_mapping_config,
     evaluate_condition,
     load_mapping_config,
     save_mapping_config,
+    gta_vice_city_profile,
+    viewer_3d_profile,
     wrist_tab_switching_profile,
 )
 
@@ -513,9 +518,32 @@ class MappingConfigTests(unittest.TestCase):
     def test_default_config_includes_wrist_tab_switching_profile(self) -> None:
         config = default_mapping_config()
         self.assertIn(TAB_SWITCH_PROFILE_NAME, config.profile_names())
+        self.assertIn(GTA_VICE_CITY_PROFILE_NAME, config.profile_names())
+        self.assertIn(VIEWER_3D_PROFILE_NAME, config.profile_names())
+
+    def test_gta_profile_uses_wrist_rules_for_weapon_swaps(self) -> None:
+        rules = {rule.id: rule for rule in gta_vice_city_profile().mappings}
+        self.assertEqual(rules["gta_swap_weapon_next"].source, "fused.wrist_rule_value")
+        self.assertEqual(rules["gta_swap_weapon_next"].threshold, "rotate_right_return")
+        self.assertEqual(rules["gta_swap_weapon_previous"].threshold, "rotate_left_return")
+
+    def test_3d_viewer_profile_has_orbit_pan_pointer_and_zoom(self) -> None:
+        profile = viewer_3d_profile()
+        rule_ids = {rule.id for rule in profile.mappings}
+        self.assertTrue(
+            {
+                "viewer_orbit_hold",
+                "viewer_orbit_follow",
+                "viewer_pan_hold",
+                "viewer_pan_follow",
+                "viewer_pointer_follow",
+                "viewer_zoom_in",
+                "viewer_zoom_out",
+            }.issubset(rule_ids)
+        )
 
     def test_remove_profile_falls_back_and_protects_last_profile(self) -> None:
-        config = default_mapping_config()
+        config = MappingConfig(profiles=[MappingProfile(), wrist_tab_switching_profile()])
         config.active_profile = TAB_SWITCH_PROFILE_NAME
         self.assertTrue(config.remove_profile(TAB_SWITCH_PROFILE_NAME))
         self.assertEqual(config.active_profile, "Default")

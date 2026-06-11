@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import csv
 import statistics
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 
@@ -14,12 +17,12 @@ class WristRuleConfig:
     neutral_dps: float = 35.0
     max_other_axis_dps: float = 110.0
     dominance_ratio: float = 1.8
-    opposite_timeout_s: float = 0.9
+    opposite_timeout_s: float = 1.5
     min_duration_s: float = 0.3
     max_duration_s: float = 1.4
-    neutral_hold_s: float = 0.15
+    neutral_hold_s: float = 0.10
     cooldown_s: float = 0.7
-    min_total_rotation_deg: float = 90.0
+    min_total_rotation_deg: float = 75.0
     max_signed_rotation_deg: float = 80.0
     pulse_s: float = 0.25
     bias_quiet_dps: float = 30.0
@@ -117,7 +120,9 @@ class WristReturnRuleDetector:
         self.signed_rotation_deg += gy * dt_s
         self.total_rotation_deg += abs(gy) * dt_s
         elapsed_s = packet_s - self.event_start_s
-        if abs(gx) > self.config.max_other_axis_dps or abs(gz) > self.config.max_other_axis_dps:
+        if self.state == "wait_opposite" and (
+            abs(gx) > self.config.max_other_axis_dps or abs(gz) > self.config.max_other_axis_dps
+        ):
             self._reject(packet_s, "other axis too large")
             return None
 
@@ -182,6 +187,22 @@ class WristReturnRuleDetector:
             "rejection_reason": self.rejection_reason,
         }
 
+    def diagnostics(self, packet_s: float, now_s: float) -> dict[str, Any]:
+        output = self.output(now_s)
+        elapsed_s = packet_s - self.event_start_s if self.state not in {"idle", "cooldown"} else 0.0
+        neutral_elapsed_s = packet_s - self.neutral_since_s if self.neutral_since_s is not None else 0.0
+        output.update(
+            {
+                "bias_x": self.bias[0],
+                "bias_y": self.bias[1],
+                "bias_z": self.bias[2],
+                "event_elapsed_s": max(0.0, elapsed_s),
+                "neutral_elapsed_s": max(0.0, neutral_elapsed_s),
+                "cooldown_remaining_s": max(0.0, self.cooldown_until_s - packet_s),
+            }
+        )
+        return output
+
     def _median_filter(self, gyro_x: float, gyro_y: float, gyro_z: float) -> list[float]:
         values = (gyro_x, gyro_y, gyro_z)
         for history, value in zip(self._gyro_history, values):
@@ -201,3 +222,118 @@ class WristReturnRuleDetector:
         self.state = "cooldown"
         self.cooldown_until_s = packet_s + self.config.cooldown_s
         self.rejection_reason = reason
+
+
+class WristRuleDiagnosticLogger:
+    BASE_FIELDS = [
+        "recorded_at",
+        "elapsed_s",
+        "packet_ms",
+        "sequence",
+        "raw_gyro_x",
+        "raw_gyro_y",
+        "raw_gyro_z",
+        "bias_x",
+        "bias_y",
+        "bias_z",
+        "gyro_x",
+        "gyro_y",
+        "gyro_z",
+        "state_before",
+        "state",
+        "state_transition",
+        "direction",
+        "event_emitted",
+        "value",
+        "rotate_left_return",
+        "rotate_right_return",
+        "last_event",
+        "rejection_reason",
+        "event_elapsed_s",
+        "neutral_elapsed_s",
+        "cooldown_remaining_s",
+        "signed_rotation_deg",
+        "total_rotation_deg",
+        "first_peak_dps",
+        "second_peak_dps",
+    ]
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = Path(directory)
+        self.path: Path | None = None
+        self.row_count = 0
+        self._file: Any = None
+        self._writer: csv.DictWriter | None = None
+        self._started_s = 0.0
+        self._last_packet_key: tuple[Any, Any] | None = None
+
+    @property
+    def is_recording(self) -> bool:
+        return self._writer is not None
+
+    def start(self, now_s: float) -> Path:
+        self.stop()
+        self.directory.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.path = self.directory / f"wrist_rule_diagnostic_{timestamp}.csv"
+        self._file = self.path.open("w", newline="", encoding="utf-8")
+        config_fields = [f"config_{key}" for key in asdict(WristRuleConfig())]
+        self._writer = csv.DictWriter(self._file, fieldnames=self.BASE_FIELDS + config_fields)
+        self._writer.writeheader()
+        self._file.flush()
+        self._started_s = now_s
+        self._last_packet_key = None
+        self.row_count = 0
+        return self.path
+
+    def stop(self) -> Path | None:
+        path = self.path
+        if self._file is not None:
+            self._file.flush()
+            self._file.close()
+        self._file = None
+        self._writer = None
+        return path
+
+    def record(
+        self,
+        serial_state: dict[str, Any],
+        detector: WristReturnRuleDetector,
+        *,
+        now_s: float,
+        state_before: str,
+        event: str | None,
+    ) -> bool:
+        if self._writer is None or self._file is None:
+            return False
+        devices = serial_state.get("devices", {}) if isinstance(serial_state, dict) else {}
+        wrist = devices.get("wristband", {}) if isinstance(devices, dict) else {}
+        gyro = wrist.get("gyro", {}) if isinstance(wrist, dict) else {}
+        packet_ms = wrist.get("t_ms") if isinstance(wrist, dict) else None
+        sequence = wrist.get("sequence") if isinstance(wrist, dict) else None
+        if not isinstance(gyro, dict) or not isinstance(packet_ms, (int, float)):
+            return False
+        packet_key = (sequence, packet_ms)
+        if packet_key == self._last_packet_key:
+            return False
+        self._last_packet_key = packet_key
+
+        diagnostic = detector.diagnostics(float(packet_ms) / 1000.0, now_s)
+        row = {
+            "recorded_at": datetime.now().isoformat(timespec="milliseconds"),
+            "elapsed_s": max(0.0, now_s - self._started_s),
+            "packet_ms": packet_ms,
+            "sequence": sequence,
+            "raw_gyro_x": gyro.get("x"),
+            "raw_gyro_y": gyro.get("y"),
+            "raw_gyro_z": gyro.get("z"),
+            "state_before": state_before,
+            "state_transition": f"{state_before}->{diagnostic['state']}" if state_before != diagnostic["state"] else "",
+            "event_emitted": event or "",
+            **diagnostic,
+        }
+        row.update({f"config_{key}": value for key, value in asdict(detector.config).items()})
+        self._writer.writerow(row)
+        self._file.flush()
+        self.row_count += 1
+        return True

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import csv
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from wrist_rule_detector import WristReturnRuleDetector
+from wrist_rule_detector import WristReturnRuleDetector, WristRuleDiagnosticLogger
 
 
 class WristReturnRuleDetectorTests(unittest.TestCase):
@@ -53,6 +55,34 @@ class WristReturnRuleDetectorTests(unittest.TestCase):
         assert event_time is not None
         self.assertEqual(detector.output(event_time)["value"], "rotate_right_return")
         self.assertEqual(detector.output(event_time + detector.config.pulse_s + 0.01)["value"], "none")
+
+    def test_diagnostic_logger_records_transitions_and_deduplicates_packets(self) -> None:
+        detector = WristReturnRuleDetector()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logger = WristRuleDiagnosticLogger(Path(tmpdir))
+            path = logger.start(1.0)
+            serial_state = {
+                "devices": {
+                    "wristband": {
+                        "status": "connected",
+                        "sequence": 7,
+                        "t_ms": 100,
+                        "gyro": {"x": 5.0, "y": 230.0, "z": 4.0},
+                    }
+                }
+            }
+            before = detector.state
+            event = detector.process_serial_state(serial_state, now_s=1.0)
+            self.assertTrue(logger.record(serial_state, detector, now_s=1.0, state_before=before, event=event))
+            self.assertFalse(logger.record(serial_state, detector, now_s=1.1, state_before=detector.state, event=None))
+            logger.stop()
+
+            with path.open(newline="", encoding="utf-8") as file:
+                rows = list(csv.DictReader(file))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["state_transition"], "idle->wait_opposite")
+            self.assertEqual(rows[0]["raw_gyro_y"], "230.0")
+            self.assertEqual(rows[0]["config_first_peak_dps"], "180.0")
 
 
 if __name__ == "__main__":

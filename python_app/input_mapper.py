@@ -588,6 +588,8 @@ class MappingConfig:
 
 
 TAB_SWITCH_PROFILE_NAME = "Wrist Tab Switching"
+GTA_VICE_CITY_PROFILE_NAME = "GTA Vice City"
+VIEWER_3D_PROFILE_NAME = "3D Viewer"
 
 
 def wrist_tab_switching_profile() -> MappingProfile:
@@ -629,8 +631,181 @@ def wrist_tab_switching_profile() -> MappingProfile:
     )
 
 
+def gta_vice_city_profile() -> MappingProfile:
+    return MappingProfile(
+        name=GTA_VICE_CITY_PROFILE_NAME,
+        mappings=[
+            MappingRule(
+                id="gta_run_forward",
+                name="Run forward",
+                source="hands.right.z_mm",
+                comparator="lt",
+                threshold=430,
+                debounce_ms=100,
+                action=MappingAction(type="keyboard_hold", keys=["w", "space"]),
+            ),
+            MappingRule(
+                id="gta_walk_reverse",
+                name="Walk reverse",
+                source="hands.right.z_mm",
+                comparator="gt",
+                threshold=720,
+                debounce_ms=100,
+                action=MappingAction(type="keyboard_hold", keys=["s"]),
+            ),
+            MappingRule(
+                id="gta_turn_right",
+                name="Turn right",
+                source="hands.left.x",
+                comparator="gt",
+                threshold=0.68,
+                debounce_ms=100,
+                conditions=[MappingCondition(source="hands.left.gesture", comparator="eq", threshold="open_palm")],
+                action=MappingAction(type="keyboard_hold", keys=["d"]),
+            ),
+            MappingRule(
+                id="gta_turn_left",
+                name="Turn left",
+                source="hands.left.x",
+                comparator="lt",
+                threshold=0.32,
+                debounce_ms=100,
+                conditions=[MappingCondition(source="hands.left.gesture", comparator="eq", threshold="open_palm")],
+                action=MappingAction(type="keyboard_hold", keys=["a"]),
+            ),
+            MappingRule(
+                id="gta_jump",
+                name="Jump",
+                source="hands.right.y",
+                comparator="gt",
+                threshold=0.78,
+                debounce_ms=120,
+                action=MappingAction(type="keyboard_tap", keys=["ctrl"]),
+            ),
+            MappingRule(
+                id="gta_swap_weapon_next",
+                name="Swap weapon next",
+                source="fused.wrist_rule_value",
+                comparator="eq",
+                threshold="rotate_right_return",
+                recognition_label="Next weapon",
+                action=MappingAction(type="mouse_scroll", scroll_y=1),
+            ),
+            MappingRule(
+                id="gta_swap_weapon_previous",
+                name="Swap weapon previous",
+                source="fused.wrist_rule_value",
+                comparator="eq",
+                threshold="rotate_left_return",
+                recognition_label="Previous weapon",
+                action=MappingAction(type="mouse_scroll", scroll_y=-1),
+            ),
+        ],
+    )
+
+
+def viewer_3d_profile() -> MappingProfile:
+    left_fist = MappingCondition(source="hands.left.gesture", comparator="eq", threshold="closed_fist")
+    right_fist = MappingCondition(source="hands.right.gesture", comparator="eq", threshold="closed_fist")
+    return MappingProfile(
+        name=VIEWER_3D_PROFILE_NAME,
+        mappings=[
+            MappingRule(
+                id="viewer_orbit_hold",
+                name="Orbit: hold left mouse",
+                source="hands.left.gesture",
+                comparator="eq",
+                threshold="closed_fist",
+                conditions=[MappingCondition(source="hands.right.x", comparator="present")],
+                action=MappingAction(type="mouse_hold", button="left"),
+            ),
+            MappingRule(
+                id="viewer_orbit_follow",
+                name="Orbit: follow right hand",
+                source="hands.right.x",
+                comparator="present",
+                conditions=[left_fist],
+                action=MappingAction(
+                    type="mouse_absolute",
+                    continuous=True,
+                    absolute_x_source="hands.right.x",
+                    absolute_y_source="hands.right.y",
+                    absolute_x_invert=True,
+                    absolute_deadband=0.015,
+                    absolute_smoothing_alpha=0.45,
+                ),
+            ),
+            MappingRule(
+                id="viewer_pan_hold",
+                name="Pan: hold middle mouse",
+                source="hands.right.gesture",
+                comparator="eq",
+                threshold="closed_fist",
+                action=MappingAction(type="mouse_hold", button="middle"),
+            ),
+            MappingRule(
+                id="viewer_pan_follow",
+                name="Pan: follow right hand",
+                source="hands.right.x",
+                comparator="present",
+                conditions=[right_fist],
+                action=MappingAction(
+                    type="mouse_absolute",
+                    continuous=True,
+                    absolute_x_source="hands.right.x",
+                    absolute_y_source="hands.right.y",
+                    absolute_x_invert=True,
+                    absolute_deadband=0.015,
+                    absolute_smoothing_alpha=0.45,
+                ),
+            ),
+            MappingRule(
+                id="viewer_pointer_follow",
+                name="Point: follow right index finger",
+                source="hands.right.gesture",
+                comparator="eq",
+                threshold="index_finger_up",
+                action=MappingAction(
+                    type="mouse_absolute",
+                    continuous=True,
+                    absolute_x_source="hands.right.x",
+                    absolute_y_source="hands.right.y",
+                    absolute_x_invert=True,
+                    absolute_deadband=0.015,
+                    absolute_smoothing_alpha=0.45,
+                ),
+            ),
+            MappingRule(
+                id="viewer_zoom_in",
+                name="Zoom in",
+                source="fused.wrist_rule_value",
+                comparator="eq",
+                threshold="rotate_right_return",
+                recognition_label="3D viewer zoom in",
+                action=MappingAction(type="mouse_scroll", scroll_y=1),
+            ),
+            MappingRule(
+                id="viewer_zoom_out",
+                name="Zoom out",
+                source="fused.wrist_rule_value",
+                comparator="eq",
+                threshold="rotate_left_return",
+                recognition_label="3D viewer zoom out",
+                action=MappingAction(type="mouse_scroll", scroll_y=-1),
+            ),
+        ],
+    )
+
+
 def default_mapping_config() -> MappingConfig:
-    return MappingConfig(profiles=[MappingProfile(), wrist_tab_switching_profile()])
+    return MappingConfig(
+        profiles=[
+            MappingProfile(),
+            wrist_tab_switching_profile(),
+            gta_vice_city_profile(),
+            viewer_3d_profile(),
+        ]
+    )
 
 
 def load_mapping_config(path: Path = DEFAULT_MAPPING_PATH) -> tuple[MappingConfig, str | None]:

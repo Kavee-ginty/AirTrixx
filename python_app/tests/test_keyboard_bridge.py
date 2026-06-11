@@ -85,6 +85,26 @@ class KeyboardBridgeAntennaTests(unittest.TestCase):
             self.assertTrue(bridge.arm_next_training_sample())
             self.assertEqual(bridge.training_status, "Swipe 'hello' (1/1)")
 
+    def test_disarming_training_sample_requeues_it_for_next_green_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bridge = self._bridge(tmpdir)
+            bridge.ingest_antenna_device(
+                {
+                    "status": "ok",
+                    "sequence": 1,
+                    "tof": {f"sensor_{index}_mm": 260 for index in range(1, 5)},
+                    "valid": {f"sensor_{index}": True for index in range(1, 5)},
+                }
+            )
+
+            self.assertTrue(bridge.start_training(["hello"], repetitions=1, include_command_words=False))
+            self.assertTrue(bridge.arm_next_training_sample())
+            self.assertTrue(bridge.training_capture_active)
+            self.assertTrue(bridge.disarm_training_sample(requeue=True))
+            self.assertFalse(bridge.training_capture_active)
+            self.assertTrue(bridge.arm_next_training_sample())
+            self.assertEqual(bridge.training_status, "Swipe 'hello' (1/1)")
+
 
 if __name__ == "__main__":
     unittest.main()

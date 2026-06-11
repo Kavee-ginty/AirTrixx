@@ -368,6 +368,31 @@ class KeyboardBridge:
         self._log(f"Armed keyboard sample {sample_id}.")
         return True
 
+    @property
+    def has_training_plan(self) -> bool:
+        with self._training_lock:
+            return self._training_session is not None
+
+    @property
+    def training_capture_active(self) -> bool:
+        with self._training_lock:
+            return self._training_capture is not None
+
+    def disarm_training_sample(self, *, requeue: bool = True) -> bool:
+        with self._training_lock:
+            capture = self._training_capture
+            if capture is None:
+                return False
+            self._training_capture = None
+            if requeue and self._training_session:
+                self._training_session.index = max(0, self._training_session.index - 1)
+            self._training_status = f"Ready to retry {capture.sample_id}." if requeue else f"Cancelled {capture.sample_id}."
+        if self.is_connected:
+            self.send_command("label live")
+        self._emit_training()
+        self._log(f"Disarmed keyboard sample {capture.sample_id}.")
+        return True
+
     def cancel_training(self) -> None:
         with self._training_lock:
             self._training_capture = None

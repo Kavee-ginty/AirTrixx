@@ -64,7 +64,7 @@ from wristband_model import (
     install_model_files,
     sanitize_label,
 )
-from wrist_rule_detector import WristReturnRuleDetector
+from wrist_rule_detector import WristReturnRuleDetector, WristRuleDiagnosticLogger
 
 
 SERVO_BRACKETS = {
@@ -336,6 +336,12 @@ class AirTrixxGUI:
         self.keyboard_confidence_var = tk.StringVar(value="-")
         self.keyboard_model_var = tk.StringVar(value="Model: loading")
         self.keyboard_training_status_var = tk.StringVar(value="Training: idle")
+        self.keyboard_training_timer_status_var = tk.StringVar(value="Timer: idle")
+        self.keyboard_training_timer_active = False
+        self.keyboard_training_timer_phase = "idle"
+        self.keyboard_training_timer_phase_started_s = 0.0
+        self.keyboard_training_timer_phase_seconds = 3.0
+        self.keyboard_training_timer_seconds_var = tk.StringVar(value="3")
         self.keyboard_words_var = tk.StringVar(value="hello, world")
         self.keyboard_repetitions_var = tk.StringVar(value="3")
         self.keyboard_include_commands_var = tk.BooleanVar(value=True)
@@ -386,6 +392,8 @@ class AirTrixxGUI:
         self.wrist_rule_metrics_var = tk.StringVar(value="Rotation: -")
         self.wrist_rule_last_event_var = tk.StringVar(value="Last event: none")
         self.wrist_rule_rejection_var = tk.StringVar(value="Rejected: none")
+        self.wrist_rule_log_status_var = tk.StringVar(value="Detailed log: stopped")
+        self.wrist_rule_logger = WristRuleDiagnosticLogger(self.config.exports_dir / "wrist_rule_logs")
         self.wrist_rule_setting_vars = {
             key: tk.StringVar(value=f"{getattr(self.wrist_rule_detector.config, key):g}")
             for key in (
@@ -1268,23 +1276,41 @@ class AirTrixxGUI:
         ttk.Checkbutton(train_box, text="Replace dataset", variable=self.keyboard_reset_dataset_var).grid(
             row=1, column=3, sticky="w", padx=(12, 0), pady=4
         )
+        ttk.Label(train_box, text="Capture seconds").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(train_box, textvariable=self.keyboard_training_timer_seconds_var, width=10).grid(
+            row=2, column=1, sticky="w", pady=4
+        )
         actions = ttk.Frame(train_box)
-        actions.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
-        for column in range(4):
+        actions.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        for column in range(6):
             actions.columnconfigure(column, weight=1)
         ttk.Button(actions, text="Start Plan", command=self.keyboard_start_training).grid(row=0, column=0, sticky="ew", padx=(0, 4))
         ttk.Button(actions, text="Record Next", command=self.keyboard_record_next_sample).grid(row=0, column=1, sticky="ew", padx=4)
-        ttk.Button(actions, text="Train Model", command=self.keyboard_train_model).grid(row=0, column=2, sticky="ew", padx=4)
-        ttk.Button(actions, text="Cancel", command=self.keyboard_cancel_training).grid(row=0, column=3, sticky="ew", padx=(4, 0))
+        ttk.Button(actions, text="Start Timer", command=self.keyboard_start_training_timer).grid(row=0, column=2, sticky="ew", padx=4)
+        ttk.Button(actions, text="Stop Timer", command=self.keyboard_stop_training_timer).grid(row=0, column=3, sticky="ew", padx=4)
+        ttk.Button(actions, text="Train Model", command=self.keyboard_train_model).grid(row=0, column=4, sticky="ew", padx=4)
+        ttk.Button(actions, text="Cancel", command=self.keyboard_cancel_training).grid(row=0, column=5, sticky="ew", padx=(4, 0))
 
         train_status = ttk.LabelFrame(training_body, text="Training Status", padding=10)
         train_status.grid(row=1, column=0, sticky="ew")
         train_status.columnconfigure(0, weight=1)
-        ttk.Label(train_status, textvariable=self.keyboard_training_status_var, wraplength=900).grid(row=0, column=0, sticky="ew")
+        ttk.Label(train_status, textvariable=self.keyboard_training_status_var, wraplength=700).grid(row=0, column=0, sticky="ew")
         self.keyboard_training_progress = ttk.Progressbar(train_status, mode="determinate", maximum=1)
         self.keyboard_training_progress.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         ttk.Label(train_status, text=f"Dataset: {self.config.keyboard_dataset_path}").grid(row=2, column=0, sticky="w", pady=(8, 0))
         ttk.Label(train_status, text=f"Model: {self.config.keyboard_model_path}").grid(row=3, column=0, sticky="w")
+        ttk.Label(train_status, textvariable=self.keyboard_training_timer_status_var, style="Value.TLabel").grid(
+            row=4, column=0, sticky="w", pady=(8, 0)
+        )
+        self.keyboard_training_timer_canvas = tk.Canvas(
+            train_status,
+            width=178,
+            height=178,
+            bg="#ffffff",
+            highlightthickness=0,
+        )
+        self.keyboard_training_timer_canvas.grid(row=0, column=1, rowspan=5, sticky="ne", padx=(14, 0))
+        self._draw_keyboard_training_timer()
 
         log_tab.rowconfigure(0, weight=1)
         log_tab.columnconfigure(0, weight=1)
@@ -1852,6 +1878,40 @@ class AirTrixxGUI:
             row=0, column=1, sticky="w"
         )
 
+        log_box = ttk.LabelFrame(body, text="Detailed Diagnostic Log", padding=10)
+        log_box.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        log_box.columnconfigure(0, weight=1)
+        ttk.Label(log_box, textvariable=self.wrist_rule_log_status_var, wraplength=850).grid(
+            row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8)
+        )
+        ttk.Button(log_box, text="Start Detailed Log", command=self._start_wrist_rule_log, style="Accent.TButton").grid(
+            row=1, column=0, sticky="w", padx=(0, 6)
+        )
+        ttk.Button(log_box, text="Stop Log", command=self._stop_wrist_rule_log, style="Secondary.TButton").grid(
+            row=1, column=1, sticky="w", padx=(0, 6)
+        )
+        ttk.Button(log_box, text="Open Log Folder", command=self._open_wrist_rule_log_folder, style="Secondary.TButton").grid(
+            row=1, column=2, sticky="w"
+        )
+
+    def _start_wrist_rule_log(self) -> None:
+        self.wrist_rule_detector.reset()
+        path = self.wrist_rule_logger.start(time.monotonic())
+        self.wrist_rule_log_status_var.set(f"Detailed log: recording 0 rows | {path}")
+        self.log(f"Started wrist rule diagnostic log: {path}")
+
+    def _stop_wrist_rule_log(self) -> None:
+        rows = self.wrist_rule_logger.row_count
+        path = self.wrist_rule_logger.stop()
+        if path is None:
+            self.wrist_rule_log_status_var.set("Detailed log: stopped")
+            return
+        self.wrist_rule_log_status_var.set(f"Detailed log: stopped | {rows} rows | {path}")
+        self.log(f"Stopped wrist rule diagnostic log with {rows} rows: {path}")
+
+    def _open_wrist_rule_log_folder(self) -> None:
+        self._open_path(self.wrist_rule_logger.directory, "wrist rule log folder")
+
     def _apply_wrist_rule_settings(self) -> None:
         try:
             values = {key: float(variable.get()) for key, variable in self.wrist_rule_setting_vars.items()}
@@ -2192,6 +2252,7 @@ class AirTrixxGUI:
         self._sync_keyboard_controls()
 
     def keyboard_start_training(self) -> None:
+        self.keyboard_stop_training_timer()
         words = [
             part.strip()
             for chunk in self.keyboard_words_var.get().replace("\n", ",").split(",")
@@ -2214,10 +2275,95 @@ class AirTrixxGUI:
     def keyboard_record_next_sample(self) -> None:
         self.keyboard_bridge.arm_next_training_sample()
 
+    def keyboard_start_training_timer(self) -> None:
+        if not self.keyboard_bridge.has_training_plan:
+            self.keyboard_training_timer_status_var.set("Timer: start a training plan first")
+            return
+        try:
+            self.keyboard_training_timer_phase_seconds = max(
+                0.5,
+                min(60.0, float(self.keyboard_training_timer_seconds_var.get())),
+            )
+        except ValueError:
+            self.keyboard_training_timer_phase_seconds = 3.0
+        self.keyboard_training_timer_seconds_var.set(f"{self.keyboard_training_timer_phase_seconds:g}")
+        self.keyboard_bridge.disarm_training_sample(requeue=True)
+        self.keyboard_training_timer_active = True
+        self.keyboard_training_timer_phase = "green"
+        self.keyboard_training_timer_phase_started_s = time.monotonic()
+        if not self.keyboard_bridge.arm_next_training_sample():
+            self.keyboard_stop_training_timer()
+            return
+        self._draw_keyboard_training_timer()
+
+    def keyboard_stop_training_timer(self) -> None:
+        self.keyboard_training_timer_active = False
+        self.keyboard_training_timer_phase = "idle"
+        self.keyboard_bridge.disarm_training_sample(requeue=True)
+        self._draw_keyboard_training_timer()
+
+    def _update_keyboard_training_timer(self, now_s: float) -> None:
+        if not self.keyboard_training_timer_active:
+            self._draw_keyboard_training_timer()
+            return
+        phase_seconds = self.keyboard_training_timer_phase_seconds
+        while now_s - self.keyboard_training_timer_phase_started_s >= phase_seconds:
+            self.keyboard_training_timer_phase_started_s += phase_seconds
+            self.keyboard_bridge.disarm_training_sample(requeue=True)
+            if not self.keyboard_bridge.arm_next_training_sample():
+                self.keyboard_stop_training_timer()
+                return
+        self._draw_keyboard_training_timer()
+
+    def _draw_keyboard_training_timer(self) -> None:
+        if not hasattr(self, "keyboard_training_timer_canvas"):
+            return
+        canvas = self.keyboard_training_timer_canvas
+        width = int(canvas.cget("width"))
+        height = int(canvas.cget("height"))
+        pad = 10
+        canvas.delete("all")
+        active = self.keyboard_training_timer_active
+        phase = self.keyboard_training_timer_phase if active else "idle"
+        elapsed_s = max(0.0, time.monotonic() - self.keyboard_training_timer_phase_started_s) if active else 0.0
+        remaining_s = max(0.0, self.keyboard_training_timer_phase_seconds - elapsed_s) if active else self.keyboard_training_timer_phase_seconds
+        fraction = remaining_s / self.keyboard_training_timer_phase_seconds if active else 1.0
+        color = "#22c55e" if phase == "green" else "#d0d5dd"
+        label = "RECORD" if phase == "green" else "IDLE"
+        canvas.create_oval(pad, pad, width - pad, height - pad, fill="#ffffff", outline="#d0d5dd", width=2)
+        canvas.create_arc(
+            pad,
+            pad,
+            width - pad,
+            height - pad,
+            start=90,
+            extent=-360 * fraction,
+            fill=color,
+            outline=color,
+            style="pieslice",
+        )
+        canvas.create_oval(pad, pad, width - pad, height - pad, outline="#101828", width=1)
+        canvas.create_text(
+            width // 2,
+            height // 2 - 8,
+            text=f"00:{max(0, int(remaining_s + 0.999)):02d}",
+            fill="#101828",
+            font=("Segoe UI Semibold", 26),
+        )
+        canvas.create_text(width // 2, height // 2 + 30, text=label, fill="#101828", font=("Segoe UI Semibold", 11))
+        if active:
+            self.keyboard_training_timer_status_var.set(
+                f"Green: perform the prompted swipe ({remaining_s:.1f}s)"
+            )
+        else:
+            self.keyboard_training_timer_status_var.set("Timer: idle")
+
     def keyboard_train_model(self) -> None:
+        self.keyboard_stop_training_timer()
         self.keyboard_bridge.train_model_async()
 
     def keyboard_cancel_training(self) -> None:
+        self.keyboard_stop_training_timer()
         self.keyboard_bridge.cancel_training()
 
     def _on_keyboard_log(self, message: str) -> None:
@@ -5844,6 +5990,7 @@ class AirTrixxGUI:
         self.recorder.stop()
         if self.wristband_capture.is_recording:
             self.wristband_capture.stop()
+        self.wrist_rule_logger.stop()
         self.servo_controller.disable_all()
         self.hand_tracker.stop()
         self.keyboard_bridge.disconnect()
@@ -5891,7 +6038,18 @@ class AirTrixxGUI:
         for wristband_state in wristband_states:
             wristband_state = self._serial_state_with_audio_dock_overlay(wristband_state)
             self._add_wristband_visualizer_state(wristband_state)
-            self.wrist_rule_detector.process_serial_state(wristband_state, now_s=now_s)
+            wrist_rule_state_before = self.wrist_rule_detector.state
+            wrist_rule_event = self.wrist_rule_detector.process_serial_state(wristband_state, now_s=now_s)
+            if self.wrist_rule_logger.record(
+                wristband_state,
+                self.wrist_rule_detector,
+                now_s=now_s,
+                state_before=wrist_rule_state_before,
+                event=wrist_rule_event,
+            ) and self.wrist_rule_logger.row_count % 10 == 0:
+                self.wrist_rule_log_status_var.set(
+                    f"Detailed log: recording {self.wrist_rule_logger.row_count} rows | {self.wrist_rule_logger.path}"
+                )
             self.wristband_capture.add_serial_state(wristband_state)
         wrist_rule_output = self.wrist_rule_detector.output(now_s)
         self._update_wrist_rule_live_view(wrist_rule_output)
@@ -5912,6 +6070,7 @@ class AirTrixxGUI:
         self._apply_audio_dock_snapshot_fields(self._latest_snapshot)
         self._latest_snapshot["face_state"] = self.hand_tracker.get_latest_face()
         self.keyboard_bridge.tick(now_s=now_s)
+        self._update_keyboard_training_timer(now_s)
         testing_suppressed = bool(self.testing_active and self.testing_output_suppressed_var.get())
         mapper_suppressed = self._focus_is_text_input() or self.mapping_recording_shortcut or testing_suppressed
         try:
