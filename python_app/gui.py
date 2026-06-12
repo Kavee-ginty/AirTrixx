@@ -106,8 +106,16 @@ SERIAL_PORT_FAIL_COOLDOWN_S = 8.0
 LIVE_DATA_HISTORY_ROWS = 10
 KEYBOARD_DISTANCE_ROWS = 30
 KEYBOARD_DISTANCE_BAND_MM = 10
+KEYBOARD_CANVAS_ROWS = (
+    ("Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"),
+    ("A", "S", "D", "F", "G", "H", "J", "K", "L"),
+    ("SHIFT", "Z", "X", "C", "V", "B", "N", "M", "BACKSPACE"),
+    ("?123", "SPACE", "RETURN"),
+)
 SERVO_DEBUG_INTERVAL_S = 0.2
 SERVO_DEBUG_LOG_LIMIT = 600
+STATUS_UPDATE_INTERVAL_S = 0.25
+RUNTIME_TICK_MS = 16
 WRISTBAND_FIRMWARE_DIR = project_resource_path("firmware", "wristband_esp32c3")
 WRISTBAND_FIRMWARE_BIN = WRISTBAND_FIRMWARE_DIR / ".pio" / "build" / "esp32c3_supermini" / "firmware.bin"
 FANS_FIRMWARE_DIR = project_resource_path("firmware", "fan_controller_esp32c3")
@@ -283,7 +291,12 @@ class AirTrixxGUI:
         self.nav_buttons: dict[str, ttk.Button] = {}
         self.pages: dict[str, ttk.Frame] = {}
         self.dashboard_battery_cards: dict[str, dict[str, Any]] = {}
-        self.keyboard_cells: list[list[tk.Label]] = []
+        self.keyboard_canvas: tk.Canvas | None = None
+        self.keyboard_canvas_keys: dict[str, tuple[int, int]] = {}
+        self._last_keyboard_sequence: Any = object()
+        self._last_keyboard_active_keys: set[str] = set()
+        self._last_status_update_s = 0.0
+        self._last_connect_button_state: tuple[str, str] | None = None
         self.keyboard_status_var = tk.StringVar(value="Keyboard: waiting for ToF data.")
         self.keyboard_connection_var = tk.StringVar(value="Antenna ESP-NOW: waiting")
         self.hub_status_var = tk.StringVar(value="Hub: disconnected")
@@ -753,18 +766,7 @@ class AirTrixxGUI:
         return body
 
     def _build_signals_page(self, page: ttk.Frame) -> None:
-        self._build_page_header(page, "Signals", "Live device readings, ToF lanes, and fused input state.")
-        notebook = ttk.Notebook(page)
-        notebook.grid(row=1, column=0, sticky="nsew")
-        for title, builder in (
-            ("ToF Keyboard", self._build_keyboard_page),
-            ("Live Inputs", self._build_live_data_page),
-        ):
-            tab = ttk.Frame(notebook)
-            tab.rowconfigure(1, weight=1)
-            tab.columnconfigure(0, weight=1)
-            notebook.add(tab, text=title)
-            builder(tab)
+        self._build_live_data_page(page)
 
     def _build_camera_servo_page(self, page: ttk.Frame) -> None:
         self._build_page_header(page, "Camera & Servo", "Camera feed, centering, and servo controls.")
@@ -994,7 +996,7 @@ class AirTrixxGUI:
     def _battery_status_style(level: float | None, status: str) -> tuple[str, str, str, str]:
         normalized = status.strip().lower().replace("_", " ")
         if normalized in {"not connected", "disconnected", "tbd", "offline"}:
-            return "Offline", "#f2f4f7", "#475467", "#98a2b3"
+            return "Offline", "#fef3f2", "#b42318", "#ef4444"
         if level is None:
             if normalized in {
                 "ok",
@@ -1033,6 +1035,8 @@ class AirTrixxGUI:
     def _audio_dock_input_value(self, device: dict[str, Any] | None = None) -> Any:
         if self.audio_dock_bridge.latest_transcript:
             return self.audio_dock_bridge.latest_transcript
+        if self.audio_dock_bridge.is_connected:
+            return "TBD"
         device_input = device.get("input") if isinstance(device, dict) else None
         return device_input if device_input not in (None, "") else "TBD"
 
@@ -1073,13 +1077,12 @@ class AirTrixxGUI:
         return state
 
     def _serial_state_with_audio_dock_overlay(self, serial_state: dict[str, Any]) -> dict[str, Any]:
-        state = copy.deepcopy(serial_state) if isinstance(serial_state, dict) else {}
+        state = dict(serial_state) if isinstance(serial_state, dict) else {}
         if not state and not self.serial_bridge.is_connected and not self.keyboard_bridge.source_ready:
             return state
-        devices = state.get("devices")
-        if not isinstance(devices, dict):
-            devices = {}
-            state["devices"] = devices
+        source_devices = state.get("devices")
+        devices = dict(source_devices) if isinstance(source_devices, dict) else {}
+        state["devices"] = devices
         keyboard_device = devices.get("keyboard")
         self.keyboard_bridge.ingest_antenna_device(keyboard_device if isinstance(keyboard_device, dict) else None)
         devices["keyboard"] = self._keyboard_device_state(devices.get("keyboard"))
@@ -1231,34 +1234,13 @@ class AirTrixxGUI:
             row=4, column=2, sticky="e", padx=(8, 0)
         )
 
-        grid_box = ttk.LabelFrame(live_body, text="ToF Distance Grid", padding=10)
+        grid_box = ttk.LabelFrame(live_body, text="ToF Keyboard", padding=10)
         grid_box.grid(row=2, column=0, sticky="ew")
-        for col in range(5):
-            grid_box.columnconfigure(col, weight=1 if col > 0 else 0)
-
-        header_style = {"bg": "#e7edf7", "fg": "#1f2d3d", "font": ("Segoe UI", 10, "bold")}
-        cell_style = {"bg": "#f8fafc", "fg": "#1f2d3d", "font": ("Segoe UI", 10), "relief": "solid", "bd": 1}
-        tk.Label(grid_box, text="Band", padx=8, pady=8, **header_style).grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
-        for col in range(4):
-            tk.Label(grid_box, text=f"Sensor {col + 1}", padx=8, pady=8, **header_style).grid(
-                row=0, column=col + 1, sticky="nsew", padx=1, pady=1
-            )
-
-        self.keyboard_cells = []
-        for row in range(KEYBOARD_DISTANCE_ROWS):
-            start_mm = row * KEYBOARD_DISTANCE_BAND_MM
-            end_mm = start_mm + KEYBOARD_DISTANCE_BAND_MM - 1
-            if row == KEYBOARD_DISTANCE_ROWS - 1:
-                end_mm = start_mm + KEYBOARD_DISTANCE_BAND_MM
-            tk.Label(grid_box, text=f"{start_mm}-{end_mm} mm", padx=8, pady=7, **cell_style).grid(
-                row=row + 1, column=0, sticky="nsew", padx=1, pady=1
-            )
-            cells: list[tk.Label] = []
-            for col in range(4):
-                label = tk.Label(grid_box, text="", width=14, padx=8, pady=7, **cell_style)
-                label.grid(row=row + 1, column=col + 1, sticky="nsew", padx=1, pady=1)
-                cells.append(label)
-            self.keyboard_cells.append(cells)
+        grid_box.columnconfigure(0, weight=1)
+        self.keyboard_canvas = tk.Canvas(grid_box, height=220, bg="#ffffff", highlightthickness=0)
+        self.keyboard_canvas.grid(row=0, column=0, sticky="ew")
+        self.keyboard_canvas.bind("<Configure>", lambda _event: self._draw_keyboard_canvas())
+        self._draw_keyboard_canvas()
 
         training_body = self._scrollable_body(training_tab)
         training_body.columnconfigure(0, weight=1)
@@ -3649,7 +3631,8 @@ class AirTrixxGUI:
 
     def _set_audio_dock_status(self, status: str) -> None:
         self.audio_dock_status_var.set(status)
-        self._sync_audio_dock_controls()
+        if self.active_page == "Audio Dock":
+            self._sync_audio_dock_controls()
         self._schedule_text_update()
 
     def _on_audio_dock_training(self, status: str) -> None:
@@ -6007,7 +5990,7 @@ class AirTrixxGUI:
                 self.log(message)
         finally:
             try:
-                self.root.after(33, self._tick)
+                self.root.after(RUNTIME_TICK_MS, self._tick)
             except tk.TclError:
                 pass
 
@@ -6022,8 +6005,6 @@ class AirTrixxGUI:
             self.audio_dock_bridge.disconnect()
         self._sync_audio_dock_controls()
         serial_state = self._serial_state_with_audio_dock_overlay(self.serial_bridge.get_latest_state())
-        if self.active_page in {"Keyboard", "Signals"}:
-            self._update_keyboard_grid(serial_state)
         camera_centering_claimed_servo = False
         if self.centering_bracket is None and self.camera_centering_active:
             camera_centering_claimed_servo = self._update_camera_centering()
@@ -6032,13 +6013,15 @@ class AirTrixxGUI:
         if self.centering_bracket is None and not camera_centering_claimed_servo and not self.hand_calibration_active:
             self.servo_controller.send_for_hands(hands, serial_state)
         now_s = time.monotonic()
-        self._update_wristband_visualizer_capture(now_s)
+        if self.wristband_visualizer_capture_phase in {"ready", "capturing"}:
+            self._update_wristband_visualizer_capture(now_s)
         wristband_states = self.serial_bridge.drain_wristband_states()
         if not wristband_states:
             wristband_states = [serial_state]
         for wristband_state in wristband_states:
             wristband_state = self._serial_state_with_audio_dock_overlay(wristband_state)
-            self._add_wristband_visualizer_state(wristband_state)
+            if self.active_page == "Visualiser" or self.wristband_visualizer_capture_phase == "capturing":
+                self._add_wristband_visualizer_state(wristband_state)
             wrist_rule_state_before = self.wrist_rule_detector.state
             wrist_rule_event = self.wrist_rule_detector.process_serial_state(wristband_state, now_s=now_s)
             if self.wrist_rule_logger.record(
@@ -6051,14 +6034,15 @@ class AirTrixxGUI:
                 self.wrist_rule_log_status_var.set(
                     f"Detailed log: recording {self.wrist_rule_logger.row_count} rows | {self.wrist_rule_logger.path}"
                 )
-            self.wristband_capture.add_serial_state(wristband_state)
+            if self.wristband_capture.is_recording:
+                self.wristband_capture.add_serial_state(wristband_state)
         wrist_rule_output = self.wrist_rule_detector.output(now_s)
-        self._update_wrist_rule_live_view(wrist_rule_output)
+        if self.active_page == "Wrist Rules":
+            self._update_wrist_rule_live_view(wrist_rule_output)
         if self.active_page == "Visualiser":
             self._draw_wristband_visualizer()
-        if hasattr(self, "wristband_capture_timer_canvas"):
+        if self.active_page == "Wristband" and hasattr(self, "wristband_capture_timer_canvas"):
             self._draw_wristband_capture_timer()
-        self.wristband_model_value_var.set("disabled")
         self._latest_snapshot = self.fusion_state.build_snapshot(
             serial_state,
             hands,
@@ -6070,8 +6054,10 @@ class AirTrixxGUI:
         )
         self._apply_audio_dock_snapshot_fields(self._latest_snapshot)
         self._latest_snapshot["face_state"] = self.hand_tracker.get_latest_face()
+        self._latest_snapshot["_signal_sequence"] = self._mapping_signal_sequence(self._latest_snapshot)
         self.keyboard_bridge.tick(now_s=now_s)
-        self._update_keyboard_training_timer(now_s)
+        if self.keyboard_training_timer_active:
+            self._update_keyboard_training_timer(now_s)
         testing_suppressed = bool(self.testing_active and self.testing_output_suppressed_var.get())
         mapper_suppressed = self._focus_is_text_input() or self.mapping_recording_shortcut or testing_suppressed
         try:
@@ -6093,23 +6079,27 @@ class AirTrixxGUI:
             if message != self._last_tick_error:
                 self._last_tick_error = message
                 self.log(message)
-        self._update_servo_debug_console()
+        if self.active_page == "Data / Logs":
+            self._update_servo_debug_console()
         self._update_preview()
         if self._text_update_after_id is None and now_s - self._last_text_update_s >= 0.2:
             self._last_text_update_s = now_s
             self._update_text_views()
 
-        if self.serial_connect_in_progress:
-            self.connect_button.configure(text="Connecting...", state="disabled")
-        else:
-            self.connect_button.configure(
-                text="Disconnect" if self.serial_bridge.is_connected else "Connect",
-                state="normal",
-            )
-        self.record_button.configure(text="Recording..." if self.recorder.is_recording else "Record Gesture")
-        self._update_gesture_recording_progress()
-        self._update_fan_controls()
-        self._update_status_strip()
+        connect_button_state = (
+            ("Connecting...", "disabled")
+            if self.serial_connect_in_progress
+            else ("Disconnect" if self.serial_bridge.is_connected else "Connect", "normal")
+        )
+        if connect_button_state != self._last_connect_button_state:
+            self.connect_button.configure(text=connect_button_state[0], state=connect_button_state[1])
+            self._last_connect_button_state = connect_button_state
+        if self.active_page == "Gesture Recorder" or self.recorder.is_recording:
+            self.record_button.configure(text="Recording..." if self.recorder.is_recording else "Record Gesture")
+            self._update_gesture_recording_progress()
+        if now_s - self._last_status_update_s >= STATUS_UPDATE_INTERVAL_S:
+            self._last_status_update_s = now_s
+            self._update_status_strip()
 
     def _update_status_strip(self) -> None:
         if self.serial_bridge.is_connected:
@@ -6592,7 +6582,6 @@ class AirTrixxGUI:
             self._update_dashboard_text(serial_state)
             return
         if page == "Signals":
-            self._update_keyboard_grid(serial_state)
             self._update_data_table(serial_state, input_dict)
             return
         if page == "Keyboard":
@@ -6637,40 +6626,87 @@ class AirTrixxGUI:
     def _update_dashboard_text(self, serial_state: dict[str, Any]) -> None:
         devices = serial_state.get("devices", {}) if isinstance(serial_state, dict) else {}
         self._update_dashboard_battery_cards(devices if isinstance(devices, dict) else {})
+        self._update_fan_controls()
+
+    def _draw_keyboard_canvas(self) -> None:
+        canvas = self.keyboard_canvas
+        if canvas is None:
+            return
+        canvas.delete("all")
+        self.keyboard_canvas_keys.clear()
+        width = max(640, canvas.winfo_width())
+        row_height = 48
+        gap = 5
+        top = 5
+        for row_index, keys in enumerate(KEYBOARD_CANVAS_ROWS):
+            key_width = (width - gap * (len(keys) + 1)) / len(keys)
+            y1 = top + row_index * (row_height + gap)
+            y2 = y1 + row_height
+            for key_index, key in enumerate(keys):
+                x1 = gap + key_index * (key_width + gap)
+                x2 = x1 + key_width
+                rect = canvas.create_rectangle(
+                    x1, y1, x2, y2, fill="#f8fafc", outline="#d0d5dd", width=1
+                )
+                text = canvas.create_text(
+                    (x1 + x2) / 2,
+                    (y1 + y2) / 2,
+                    text=key,
+                    fill="#1f2d3d",
+                    font=("Segoe UI Semibold", 9),
+                )
+                self.keyboard_canvas_keys[key] = (rect, text)
+        for key in self._last_keyboard_active_keys:
+            self._set_keyboard_canvas_key_active(key, True)
+
+    def _set_keyboard_canvas_key_active(self, key: str, active: bool) -> None:
+        canvas = self.keyboard_canvas
+        items = self.keyboard_canvas_keys.get(key)
+        if canvas is None or items is None:
+            return
+        rect, text = items
+        canvas.itemconfigure(rect, fill="#22c55e" if active else "#f8fafc")
+        canvas.itemconfigure(text, fill="#052e16" if active else "#1f2d3d")
 
     def _update_keyboard_grid(self, serial_state: dict[str, Any]) -> None:
-        if not self.keyboard_cells:
+        if self.keyboard_canvas is None or self.active_page != "Keyboard":
             return
-
         devices = serial_state.get("devices", {}) if isinstance(serial_state, dict) else {}
         keyboard = devices.get("keyboard", {}) if isinstance(devices, dict) else {}
+        sequence = keyboard.get("sequence") if isinstance(keyboard, dict) else None
+        if sequence == self._last_keyboard_sequence:
+            return
+        self._last_keyboard_sequence = sequence
         tof = keyboard.get("tof", {}) if isinstance(keyboard, dict) else {}
         valid = keyboard.get("valid", {}) if isinstance(keyboard, dict) else {}
         status = keyboard.get("status", "not_connected") if isinstance(keyboard, dict) else "not_connected"
         battery_level = keyboard.get("battery_level") if isinstance(keyboard, dict) else None
         battery_voltage = keyboard.get("battery_voltage") if isinstance(keyboard, dict) else None
 
-        inactive_bg = "#f8fafc"
-        active_bg = "#22c55e"
-        active_fg = "#052e16"
-        inactive_fg = "#1f2d3d"
-        for row_cells in self.keyboard_cells:
-            for cell in row_cells:
-                cell.configure(bg=inactive_bg, fg=inactive_fg, text="")
-
+        active_keys: set[str] = set()
         distance_text: list[str] = []
-        for index in range(4):
-            sensor_key = f"sensor_{index + 1}"
+        for row_index, keys in enumerate(KEYBOARD_CANVAS_ROWS):
+            sensor_index = len(KEYBOARD_CANVAS_ROWS) - row_index
+            sensor_key = f"sensor_{sensor_index}"
             distance = tof.get(f"{sensor_key}_mm") if isinstance(tof, dict) else None
             is_valid = bool(valid.get(sensor_key)) if isinstance(valid, dict) else distance is not None
-            distance_text.append(f"S{index + 1}: {self._format_table_value(distance)} mm")
+            distance_text.append(f"S{sensor_index}: {self._format_table_value(distance)} mm")
             if str(status).lower() in {"not_connected", "disconnected", "tbd"} or not is_valid or not isinstance(distance, (int, float)):
                 continue
             if distance < 0 or distance > KEYBOARD_DISTANCE_ROWS * KEYBOARD_DISTANCE_BAND_MM:
                 continue
-            row = min(KEYBOARD_DISTANCE_ROWS - 1, int(distance // KEYBOARD_DISTANCE_BAND_MM))
-            cell = self.keyboard_cells[row][index]
-            cell.configure(bg=active_bg, fg=active_fg, text=f"{distance:.0f} mm")
+            distance_index = min(
+                len(keys) - 1,
+                int(distance / (KEYBOARD_DISTANCE_ROWS * KEYBOARD_DISTANCE_BAND_MM) * len(keys)),
+            )
+            key_index = len(keys) - 1 - distance_index
+            active_keys.add(keys[key_index])
+
+        for key in self._last_keyboard_active_keys - active_keys:
+            self._set_keyboard_canvas_key_active(key, False)
+        for key in active_keys - self._last_keyboard_active_keys:
+            self._set_keyboard_canvas_key_active(key, True)
+        self._last_keyboard_active_keys = active_keys
 
         if battery_level not in (None, ""):
             battery_text = f"Battery: {self._format_table_value(battery_level)}%"
@@ -6918,6 +6954,37 @@ class AirTrixxGUI:
         )
         self._apply_audio_dock_snapshot_fields(snapshot)
         return snapshot
+
+    @staticmethod
+    def _mapping_signal_sequence(snapshot: dict[str, Any]) -> tuple[Any, ...]:
+        raw_state = snapshot.get("raw_device_state", {})
+        devices = raw_state.get("devices", {}) if isinstance(raw_state, dict) else {}
+        input_dict = snapshot.get("input_dict", {})
+        hands = snapshot.get("hand_state", {})
+        face = snapshot.get("face_state", {})
+        device_fields: list[tuple[Any, ...]] = []
+        if isinstance(devices, dict):
+            for name in sorted(devices):
+                device = devices.get(name)
+                if isinstance(device, dict):
+                    device_fields.append(
+                        (
+                            name,
+                            device.get("sequence"),
+                            device.get("status"),
+                            device.get("input"),
+                            device.get("battery_level"),
+                            device.get("clap_detected"),
+                            device.get("clap_type"),
+                        )
+                    )
+        return (
+            raw_state.get("sequence") if isinstance(raw_state, dict) else None,
+            tuple(device_fields),
+            tuple((key, input_dict.get(key)) for key in FIELD_ORDER) if isinstance(input_dict, dict) else (),
+            repr(hands),
+            repr(face),
+        )
 
     def _apply_runtime_performance_settings(self) -> None:
         width = self._calibration_int("camera_width", self.config.camera_width, 160, 1920)

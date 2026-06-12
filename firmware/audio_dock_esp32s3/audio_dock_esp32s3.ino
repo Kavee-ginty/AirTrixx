@@ -18,7 +18,7 @@
  */
 
 #define EIDSP_QUANTIZE_FILTERBANK   0
-#include <ESP32-S3-Clap-Sensor_inferencing.h>
+#include <final_double_clap_model_inferencing.h>
 #include <driver/i2s.h>
 #include <SPI.h>
 #include <SD.h>
@@ -50,17 +50,18 @@
 #define RECORD_SECONDS 3
 #define RECORD_GAIN 32
 #define SPEAK_DELAY_MS 900
-#define CLAP_INFERENCE_GAIN 16
-#define CLAP_LABEL_THRESHOLD 0.55f
-#define CLAP_SECONDARY_THRESHOLD 0.40f
-#define CLAP_NOISE_MARGIN 0.25f
-#define CLAP_AUDIO_PEAK_THRESHOLD 2500
-#define CLAP_PEAK_EVENT_THRESHOLD 2500
+#define CLAP_INFERENCE_GAIN 1
+#define CLAP_LABEL_THRESHOLD 0.30f
+#define CLAP_SECONDARY_THRESHOLD 0.75f
+#define CLAP_NOISE_MARGIN 0.35f
+#define CLAP_AUDIO_PEAK_THRESHOLD 1200
+#define CLAP_PEAK_EVENT_THRESHOLD 1200
 #define CLAP_PEAK_EVENT_GAP_MS 120
 #define CLAP_PEAK_EVENT_GAP_SAMPLES ((SAMPLE_RATE * CLAP_PEAK_EVENT_GAP_MS) / 1000)
 #define CLAP_REARM_DELAY_MS 2000
 #define CLAP_INFERENCE_TIMEOUT_MS 4000
 #define PRINT_CLAP_SCORES true
+#define AUDIO_DOCK_CHUNK_DELAY_MS 10
 #define WAV_HEADER_BYTES 44
 #define AUDIO_DATA_BYTES (RECORD_SECONDS * SAMPLE_RATE * sizeof(int16_t))
 #define AUDIO_TOTAL_BYTES (WAV_HEADER_BYTES + AUDIO_DATA_BYTES)
@@ -68,8 +69,8 @@
 static const int8_t WIFI_TX_POWER_QDBM = 34;  // 8.5 dBm in 0.25 dBm units.
 static const uint8_t BATTERY_ADC_PIN = 2;
 static const uint8_t BATTERY_ADC_SAMPLES = 8;
-static const float BATTERY_DIVIDER_RATIO = 147.0f / 47.0f;
-static const float BATTERY_EMPTY_V = 3.30f;
+static const float BATTERY_DIVIDER_RATIO = 22.0f / 22.0f;
+static const float BATTERY_EMPTY_V = 3.0f;
 static const float BATTERY_FULL_V = 4.20f;
 static const float BATTERY_VALID_MIN_V = 2.50f;
 static const uint32_t BATTERY_REPORT_INTERVAL_MS = 20UL * 1000UL;
@@ -90,7 +91,7 @@ static uint32_t trainingBatchSizes[TRAINING_BATCH_MAX];
 #define SPEAKER_DIN_PIN 1
 #define SPEAKER_I2S_PORT I2S_NUM_1
 #define SPEAKER_SAMPLE_RATE 22050
-#define SPEAKER_VOLUME 20000
+#define SPEAKER_VOLUME 8000
 
 // -------------------- LCD Setup --------------------
 #define I2C_SDA 41
@@ -103,7 +104,7 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 #define LED_RING_BRIGHTNESS 32
 #define LED_RING_STATUS_SEGMENTS 8
 #define COMPONENT_STATUS_SEGMENTS 6
-#define COMPONENT_STATUS_STALE_MS 2000
+#define COMPONENT_STATUS_STALE_MS 5000
 #define AUDIODOCK_HEARTBEAT_INTERVAL_MS 500
 Adafruit_NeoPixel ledRing(LED_RING_COUNT, LED_RING_PIN, NEO_GRB + NEO_KHZ800);
 static const uint8_t AUDIO_DOCK_RING_SEGMENTS = 8;
@@ -178,6 +179,7 @@ enum AudioDockState {
 };
 static AudioDockState currentState = STATE_INIT;
 static String lastTranscriptText = "";
+static String lastRecordError = "";
 static String lastRemoteCommandText = "";
 static uint32_t lastRemoteCommandMs = 0;
 static bool transcriptReceived = false;
@@ -190,7 +192,6 @@ static uint32_t nextClapArmMs = 0;
 static uint8_t componentStatusMask = 0;
 static bool componentStatusKnown = false;
 static uint32_t lastComponentStatusMs = 0;
-static uint32_t lastAudioDockHeartbeatMs = 0;
 static uint32_t lastBatteryReportMs = 0;
 static const uint32_t TRANSCRIPT_TIMEOUT_MS = 30000;
 
@@ -268,9 +269,9 @@ bool ringShowComponentStatus() {
     if (segment < COMPONENT_STATUS_SEGMENTS) {
       bool connected = (componentStatusMask & (1 << segment)) != 0;
       if (connected) {
-        ringSetStatusSegment(segment, 0, 48, 0);
+        ringSetStatusSegment(segment, 0, 128, 0);
       } else {
-        ringSetStatusSegment(segment, 64, 0, 0);
+        ringSetStatusSegment(segment, 160, 0, 0);
       }
     } else {
       ringSetStatusSegment(segment, 0, 0, 5);
@@ -290,7 +291,6 @@ void ringShowReady() {
   if (!ringShowComponentStatus()) {
     ringFill(0, 0, 24);
   }
-}
 }
 
 void ringShowSuccess() {
@@ -450,10 +450,12 @@ void playSpeakerTone(uint16_t frequency, uint16_t durationMs) {
 }
 
 void playTranscriptionDoneSound() {
-  playSpeakerTone(880, 120);
-  playSpeakerSilence(50);
-  playSpeakerTone(1175, 180);
-  playSpeakerSilence(30);
+  playSpeakerTone(660, 55);
+  playSpeakerSilence(25);
+  playSpeakerTone(880, 55);
+  playSpeakerSilence(25);
+  playSpeakerTone(1320, 80);
+  playSpeakerSilence(20);
   deinitSpeakerI2S();
 }
 
@@ -511,7 +513,9 @@ void flushI2S() {
 }
 
 void resetMicI2SDriver() {
-  i2s_driver_uninstall(I2S_PORT);
+  if (i2sReady) {
+    i2s_driver_uninstall(I2S_PORT);
+  }
   i2sReady = false;
   delay(20);
 }
@@ -1015,6 +1019,14 @@ static bool microphone_inference_record(void) {
     delay(10);
   }
   inference.buf_ready = 0;
+
+  // Hand ownership of the completed window to Edge Impulse. The capture task must
+  // not write inference.buffer while run_classifier() is reading it.
+  record_status = false;
+  uint32_t timeout = millis() + 500;
+  while (taskRunning && millis() < timeout) {
+    delay(5);
+  }
   return true;
 }
 
@@ -1075,6 +1087,7 @@ bool handleComponentStatusText(const String &incoming) {
   String hexMask = incoming.substring(strlen(prefix));
   hexMask.trim();
   componentStatusMask = (uint8_t)(strtoul(hexMask.c_str(), nullptr, 16) & 0x3F);
+  componentStatusMask |= (1 << 4);  // The dock is alive if it can receive the Antenna status mask.
   componentStatusKnown = true;
   lastComponentStatusMs = millis();
   return true;
@@ -1191,7 +1204,7 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
 bool sendEspNowToAntenna(const uint8_t *data, size_t len, uint8_t retries = 10) {
   esp_err_t result = ESP_FAIL;
   for (uint8_t attempt = 0; attempt <= retries; attempt++) {
-    result = esp_now_send(ESPNOW_BROADCAST_MAC, data, len);
+    result = esp_now_send(ANTENNA_MAC_PLACEHOLDER, data, len);
     if (result == ESP_OK) {
       return true;
     }
@@ -1307,7 +1320,7 @@ bool sendAudioDockChunk(const uint8_t *data, uint16_t len, uint32_t chunkIndex) 
   chunkPacket.chunk_index = chunkIndex;
   chunkPacket.chunk_len = len > 200 ? 200 : len;
   memcpy(chunkPacket.data, data, chunkPacket.chunk_len);
-  return sendEspNowToAntenna(reinterpret_cast<const uint8_t *>(&chunkPacket), sizeof(chunkPacket));
+  return sendEspNowToAntenna(reinterpret_cast<const uint8_t *>(&chunkPacket), sizeof(chunkPacket), 30);
 }
 
 bool recordAndStreamWavToAntenna(uint8_t triggerType, uint32_t *wavBytes) {
@@ -1385,6 +1398,7 @@ bool recordAndStreamWavToAntenna(uint8_t triggerType, uint32_t *wavBytes) {
       lastRecordError = "Chunk failed";
       return false;
     }
+    delay(AUDIO_DOCK_CHUNK_DELAY_MS);
 
     samplesWritten += samples;
     if (millis() - lastRingUpdate >= 120 || samplesWritten >= totalSamples) {
@@ -1456,7 +1470,7 @@ bool streamWavFilePathToAntenna(const char *wavPath, uint8_t triggerType, uint32
       lastRingUpdate = millis();
     }
 
-    delay(20);
+    delay(AUDIO_DOCK_CHUNK_DELAY_MS);
   }
 
   file.close();
@@ -1648,6 +1662,11 @@ void loop() {
 
         EI_IMPULSE_ERROR r = run_classifier(&signal, &result, debug_nn);
         if (r != EI_IMPULSE_OK) {
+          microphone_inference_end();
+          if (!microphone_inference_start(EI_CLASSIFIER_RAW_SAMPLE_COUNT)) {
+            detectorFault = true;
+            break;
+          }
           continue;
         }
 
@@ -1728,6 +1747,14 @@ void loop() {
                         (unsigned int)peakEvents,
                         (unsigned int)multiPeakClap);
           clapDetected = true;
+        }
+
+        if (!clapDetected) {
+          microphone_inference_end();
+          if (!microphone_inference_start(EI_CLASSIFIER_RAW_SAMPLE_COUNT)) {
+            detectorFault = true;
+            break;
+          }
         }
       }
 

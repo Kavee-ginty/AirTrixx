@@ -134,7 +134,9 @@ static const float DOCK_LEFT_PAN_OFFSET_DEG   = -6.93f;
 static const float DOCK_LEFT_TILT_OFFSET_DEG  = 0.0f;
 
 // Runtime timing.
-static const uint16_t ANTENNA_JSON_HZ = 30;
+// Slow aggregate/status snapshot. Mapping-critical fields are emitted
+// immediately as compact device_delta messages.
+static const uint16_t ANTENNA_JSON_HZ = 10;
 static const uint16_t CAMDOCK_REPORT_HZ = 30;
 static const uint16_t WRISTBAND_REPORT_HZ = 50;
 static const uint16_t FANS_REPORT_HZ = 2;
