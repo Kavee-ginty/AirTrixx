@@ -6,6 +6,7 @@ import hashlib
 import http.server
 import io
 import json
+import math
 import os
 import platform
 import queue
@@ -45,6 +46,10 @@ from input_mapper import (
     MappingProfile,
     MappingRule,
     SignalCatalog,
+    WRIST_CURSOR_PROFILE_NAME,
+    WRISTBAND_MOUSE_CURSOR_PROFILE_NAME,
+    wrist_cursor_profile,
+    wristband_mouse_cursor_profile,
     load_mapping_config,
     save_mapping_config,
 )
@@ -122,6 +127,8 @@ FANS_FIRMWARE_DIR = project_resource_path("firmware", "fan_controller_esp32c3")
 FANS_FIRMWARE_BIN = FANS_FIRMWARE_DIR / ".pio" / "build" / "esp32c3_supermini" / "firmware.bin"
 CAMDOCK_FIRMWARE_DIR = project_resource_path("firmware", "camdock_esp32s3")
 CAMDOCK_FIRMWARE_BIN = CAMDOCK_FIRMWARE_DIR / ".pio" / "build" / "esp32s3_camdock" / "firmware.bin"
+WRIST_CAMERA_ALIGNMENT_READY_S = 3.0
+WRIST_CAMERA_ALIGNMENT_EXPORT_DIRNAME = "wrist_camera_alignment"
 HAND_CALIBRATION_POINTS = [
     ("top_left", "top left", 0.15, 0.18),
     ("top_right", "top right", 0.85, 0.18),
@@ -242,6 +249,75 @@ FLOAT_CALIBRATION_KEYS = {
     "l_pan_angle_offset_deg",
     "l_tilt_angle_offset_deg",
 }
+
+WRIST_MOUSE_CALIBRATION_READY_S = 3.0
+WRIST_MOUSE_CALIBRATION_EXPORT_DIRNAME = "wrist_mouse_calibration"
+WRIST_MOUSE_CALIBRATION_PATTERNS = [
+    {
+        "id": "still",
+        "name": "1. Hold still",
+        "instruction": "Keep your wrist steady for a few seconds to measure noise and drift.",
+        "shape": "still",
+        "duration_s": 4.0,
+        "first_direction": "still",
+    },
+    {
+        "id": "horizontal",
+        "name": "2. Horizontal line",
+        "instruction": "Move right, then left, in a smooth straight line. Repeat the stroke until capture ends.",
+        "shape": "horizontal",
+        "duration_s": 6.0,
+        "first_direction": "right",
+    },
+    {
+        "id": "vertical",
+        "name": "3. Vertical line",
+        "instruction": "Move up, then down, in a smooth straight line. Repeat until capture ends.",
+        "shape": "vertical",
+        "duration_s": 6.0,
+        "first_direction": "up",
+    },
+    {
+        "id": "diag_down",
+        "name": "4. Diagonal down-right",
+        "instruction": "Draw a diagonal from top-left to bottom-right repeatedly.",
+        "shape": "diag_down",
+        "duration_s": 6.0,
+        "first_direction": "down_right",
+    },
+    {
+        "id": "diag_up",
+        "name": "5. Diagonal up-right",
+        "instruction": "Draw a diagonal from bottom-left to top-right repeatedly.",
+        "shape": "diag_up",
+        "duration_s": 6.0,
+        "first_direction": "up_right",
+    },
+    {
+        "id": "circle_cw",
+        "name": "6. Circle clockwise",
+        "instruction": "Draw medium clockwise circles. Keep the speed smooth and consistent.",
+        "shape": "circle_cw",
+        "duration_s": 7.0,
+        "first_direction": "clockwise",
+    },
+    {
+        "id": "circle_ccw",
+        "name": "7. Circle counter-clockwise",
+        "instruction": "Draw medium counter-clockwise circles with the same size and speed.",
+        "shape": "circle_ccw",
+        "duration_s": 7.0,
+        "first_direction": "counter_clockwise",
+    },
+    {
+        "id": "spiral_out",
+        "name": "8. Spiral out",
+        "instruction": "Start small in the center and spiral outward to test combined motion range.",
+        "shape": "spiral_out",
+        "duration_s": 7.0,
+        "first_direction": "spiral_out",
+    },
+]
 
 MAPPING_COMPARATOR_OPTIONS = tuple(sorted(COMPARATORS))
 MAPPING_ACTION_OPTIONS = (
@@ -397,6 +473,59 @@ class AirTrixxGUI:
         self.wristband_visualizer_capture_duration_s = 10.0
         self.wristband_visualizer_capture_samples: list[tuple[float, tuple[float, float, float, float, float, float]]] = []
         self.wristband_visualizer_last_capture: list[tuple[float, tuple[float, float, float, float, float, float]]] = []
+        self.wrist_mouse_calibration_pattern_index = 0
+        self.wrist_mouse_calibration_phase = "idle"
+        self.wrist_mouse_calibration_started_s = 0.0
+        self.wrist_mouse_calibration_duration_s = float(WRIST_MOUSE_CALIBRATION_PATTERNS[0]["duration_s"])
+        self.wrist_mouse_calibration_last_sequence: Any = None
+        self.wrist_mouse_calibration_samples: list[dict[str, float]] = []
+        self.wrist_mouse_calibration_records: dict[str, list[dict[str, float]]] = {}
+        self.wrist_mouse_calibration_status_var = tk.StringVar(
+            value="Select a pattern, capture it, then apply the calibration to the mouse profile."
+        )
+        self.wrist_mouse_calibration_pattern_var = tk.StringVar(value=WRIST_MOUSE_CALIBRATION_PATTERNS[0]["name"])
+        self.wrist_mouse_calibration_instruction_var = tk.StringVar(
+            value=str(WRIST_MOUSE_CALIBRATION_PATTERNS[0]["instruction"])
+        )
+        self.wrist_mouse_calibration_capture_var = tk.StringVar(value="Idle")
+        self.wrist_mouse_calibration_summary_var = tk.StringVar(value="Awaiting captures.")
+        self.wrist_cursor_status_var = tk.StringVar(
+            value="TechTalkies-style gyro cursor: horizontal from wrist gyro Z, vertical from wrist gyro X."
+        )
+        self.wrist_cursor_live_var = tk.StringVar(value="Waiting for wristband gyro data.")
+        self.wrist_cursor_summary_var = tk.StringVar(value="Profile not synced yet.")
+        self.wrist_cursor_x_axis_var = tk.StringVar(value="z")
+        self.wrist_cursor_y_axis_var = tk.StringVar(value="x")
+        self.wrist_cursor_speed_x_var = tk.StringVar(value="12")
+        self.wrist_cursor_speed_y_var = tk.StringVar(value="12")
+        self.wrist_cursor_deadband_var = tk.StringVar(value="2.0")
+        self.wrist_cursor_smoothing_var = tk.StringVar(value="0.18")
+        self.wrist_cursor_y_neutral_var = tk.StringVar(value="0.0")
+        self.wrist_cursor_invert_x_var = tk.BooleanVar(value=True)
+        self.wrist_cursor_invert_y_var = tk.BooleanVar(value=True)
+        self.wrist_cursor_auto_calibration_phase = "idle"
+        self.wrist_cursor_auto_calibration_started_s = 0.0
+        self.wrist_cursor_auto_calibration_samples_x: list[float] = []
+        self.wrist_cursor_auto_calibration_samples_y: list[float] = []
+        self.wrist_cursor_wristband_connected = False
+        self.wrist_cursor_click_distance_mm = 450.0
+        self.wrist_cursor_tap_max_s = 0.35
+        self.wrist_cursor_hold_activate_s = 0.18
+        self.wrist_cursor_right_phase = "idle"
+        self.wrist_cursor_right_fist_started_s: float | None = None
+        self.wrist_cursor_right_hold_active = False
+        self.wrist_cursor_left_phase = "idle"
+        self.wrist_cursor_left_fist_started_s: float | None = None
+        self.wrist_camera_alignment_capture_duration_var = tk.StringVar(value="12")
+        self.wrist_camera_alignment_status_var = tk.StringVar(
+            value="Capture paired camera + wristband motion, save it to CSV, then fit the wrist cursor profile from that log."
+        )
+        self.wrist_camera_alignment_capture_var = tk.StringVar(value="Idle")
+        self.wrist_camera_alignment_summary_var = tk.StringVar(value="Awaiting paired capture.")
+        self.wrist_camera_alignment_phase = "idle"
+        self.wrist_camera_alignment_started_s = 0.0
+        self.wrist_camera_alignment_duration_s = 12.0
+        self.wrist_camera_alignment_samples: list[dict[str, Any]] = []
         self.wrist_rule_detector = WristReturnRuleDetector()
         self.wrist_rule_enabled_var = tk.BooleanVar(value=True)
         self.wrist_rule_value_var = tk.StringVar(value="none")
@@ -501,6 +630,7 @@ class AirTrixxGUI:
         self.testing_last_seen_s = 0.0
         self._last_runtime_perf_settings: tuple[int, int, int, bool] | None = None
         self._ensure_keyboard_typing_mapping(save=True)
+        self._load_wrist_cursor_profile_into_vars()
         if mapping_error:
             self.log(f"Input mappings reset because config could not be loaded: {mapping_error}")
         if self.input_backend.error:
@@ -509,7 +639,7 @@ class AirTrixxGUI:
             self.log(warning)
 
         self.root.title("AirTrixx")
-        self.root.minsize(960, 620)
+        self.root.minsize(1280, 760)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self._fit_root_to_work_area()
 
@@ -542,10 +672,10 @@ class AirTrixxGUI:
             except Exception:
                 pass
 
-        available_width = max(960, right - left)
-        available_height = max(620, bottom - top)
-        width = min(1280, available_width)
-        height = min(860, available_height)
+        available_width = max(1280, right - left)
+        available_height = max(760, bottom - top)
+        width = min(1560, available_width)
+        height = min(980, available_height)
         x = left + max(0, (available_width - width) // 2)
         y = top + max(0, (available_height - height) // 2)
         self.root.maxsize(available_width, available_height)
@@ -678,6 +808,7 @@ class AirTrixxGUI:
             "Signals",
             "Keyboard",
             "Wristband",
+            "Wrist Cursor",
             "Visualiser",
             "Wrist Rules",
             "Mappings",
@@ -722,6 +853,7 @@ class AirTrixxGUI:
         self._build_signals_page(self.pages["Signals"])
         self._build_keyboard_page(self.pages["Keyboard"])
         self._build_wristband_page(self.pages["Wristband"])
+        self._build_wrist_cursor_page(self.pages["Wrist Cursor"])
         self._build_visualiser_page(self.pages["Visualiser"])
         self._build_wrist_rules_page(self.pages["Wrist Rules"])
         self._build_mappings_page(self.pages["Mappings"])
@@ -1305,7 +1437,23 @@ class AirTrixxGUI:
         notebook.add(log_tab, text="Log")
 
     def _build_wristband_page(self, page: ttk.Frame) -> None:
-        self._build_page_header(page, "Wristband", "Live IMU capture and optional TFLite model management.")
+        self._build_page_header(page, "Wristband", "Live IMU capture, model tools, and wrist-mouse calibration.")
+        notebook = ttk.Notebook(page)
+        notebook.grid(row=1, column=0, sticky="nsew")
+        training_tab = ttk.Frame(notebook)
+        calibration_tab = ttk.Frame(notebook)
+        alignment_tab = ttk.Frame(notebook)
+        for tab in (training_tab, calibration_tab, alignment_tab):
+            tab.rowconfigure(1, weight=1)
+            tab.columnconfigure(0, weight=1)
+        notebook.add(training_tab, text="Training")
+        notebook.add(calibration_tab, text="Mouse Calibration")
+        notebook.add(alignment_tab, text="Camera Align")
+        self._build_wristband_training_tab(training_tab)
+        self._build_wristband_mouse_calibration_tab(calibration_tab)
+        self._build_wristband_camera_alignment_tab(alignment_tab)
+
+    def _build_wristband_training_tab(self, page: ttk.Frame) -> None:
         body = self._scrollable_body(page)
         body.columnconfigure(0, weight=1)
 
@@ -1434,6 +1582,1546 @@ class AirTrixxGUI:
         self._refresh_wristband_capture_files()
         self._sync_wristband_controls()
         self._draw_wristband_capture_timer()
+
+    def _build_wristband_mouse_calibration_tab(self, page: ttk.Frame) -> None:
+        body = self._scrollable_body(page)
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+
+        intro_box = ttk.LabelFrame(body, text="Workflow", padding=10)
+        intro_box.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        intro_box.columnconfigure(0, weight=1)
+        ttk.Label(
+            intro_box,
+            text=(
+                "Capture the guided wrist patterns below. We use stillness to estimate noise, "
+                "horizontal and vertical strokes to measure cursor sensitivity and direction, "
+                "and diagonal/circular patterns to make the analog follow mapping more robust."
+            ),
+            wraplength=900,
+        ).grid(row=0, column=0, sticky="ew")
+        ttk.Label(intro_box, textvariable=self.wrist_mouse_calibration_status_var, wraplength=900).grid(
+            row=1, column=0, sticky="ew", pady=(8, 0)
+        )
+
+        pattern_box = ttk.LabelFrame(body, text="Patterns", padding=10)
+        pattern_box.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(0, 10))
+        pattern_box.columnconfigure(0, weight=1)
+        pattern_box.rowconfigure(1, weight=1)
+        ttk.Label(pattern_box, textvariable=self.wrist_mouse_calibration_pattern_var, style="Value.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        self.wrist_mouse_calibration_tree = ttk.Treeview(
+            pattern_box,
+            columns=("status", "samples"),
+            show="tree headings",
+            height=10,
+        )
+        self.wrist_mouse_calibration_tree.heading("#0", text="Pattern")
+        self.wrist_mouse_calibration_tree.heading("status", text="Status")
+        self.wrist_mouse_calibration_tree.heading("samples", text="Samples")
+        self.wrist_mouse_calibration_tree.column("#0", width=220, stretch=True)
+        self.wrist_mouse_calibration_tree.column("status", width=120, stretch=False)
+        self.wrist_mouse_calibration_tree.column("samples", width=90, stretch=False)
+        self.wrist_mouse_calibration_tree.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        self.wrist_mouse_calibration_tree.bind("<<TreeviewSelect>>", self._on_wrist_mouse_calibration_pattern_selected)
+
+        instruction_box = ttk.LabelFrame(body, text="Instruction", padding=10)
+        instruction_box.grid(row=1, column=1, sticky="nsew", pady=(0, 10))
+        instruction_box.columnconfigure(0, weight=1)
+        ttk.Label(instruction_box, textvariable=self.wrist_mouse_calibration_instruction_var, wraplength=420).grid(
+            row=0, column=0, sticky="ew"
+        )
+        ttk.Label(instruction_box, textvariable=self.wrist_mouse_calibration_capture_var, style="Value.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(8, 0)
+        )
+        self.wrist_mouse_calibration_canvas = tk.Canvas(
+            instruction_box,
+            width=420,
+            height=240,
+            bg="#ffffff",
+            highlightthickness=1,
+            highlightbackground="#d0d5dd",
+        )
+        self.wrist_mouse_calibration_canvas.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        self.wrist_mouse_calibration_canvas.bind(
+            "<Configure>",
+            lambda _event: self._draw_wrist_mouse_calibration_pattern(),
+        )
+
+        actions_box = ttk.LabelFrame(body, text="Actions", padding=10)
+        actions_box.grid(row=2, column=0, columnspan=2, sticky="ew")
+        for column in range(5):
+            actions_box.columnconfigure(column, weight=1)
+        ttk.Button(
+            actions_box,
+            text="Capture Selected Pattern",
+            command=self.start_wrist_mouse_calibration_capture,
+            style="Accent.TButton",
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(
+            actions_box,
+            text="Next Pattern",
+            command=self.next_wrist_mouse_calibration_pattern,
+            style="Secondary.TButton",
+        ).grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(
+            actions_box,
+            text="Clear Selected",
+            command=self.clear_wrist_mouse_calibration_pattern,
+            style="Secondary.TButton",
+        ).grid(row=0, column=2, sticky="ew", padx=4)
+        ttk.Button(
+            actions_box,
+            text="Clear All",
+            command=self.clear_all_wrist_mouse_calibration_patterns,
+            style="Secondary.TButton",
+        ).grid(row=0, column=3, sticky="ew", padx=4)
+        ttk.Button(
+            actions_box,
+            text="Apply To Mouse Profile",
+            command=self.apply_wrist_mouse_calibration_to_profile,
+            style="Accent.TButton",
+        ).grid(row=0, column=4, sticky="ew", padx=(4, 0))
+        ttk.Label(actions_box, textvariable=self.wrist_mouse_calibration_summary_var, wraplength=900).grid(
+            row=1, column=0, columnspan=5, sticky="ew", pady=(8, 0)
+        )
+
+        self._refresh_wrist_mouse_calibration_tree()
+        self._draw_wrist_mouse_calibration_pattern()
+
+    def _current_wrist_mouse_calibration_pattern(self) -> dict[str, Any]:
+        return WRIST_MOUSE_CALIBRATION_PATTERNS[
+            max(0, min(len(WRIST_MOUSE_CALIBRATION_PATTERNS) - 1, self.wrist_mouse_calibration_pattern_index))
+        ]
+
+    def _refresh_wrist_mouse_calibration_tree(self) -> None:
+        if not hasattr(self, "wrist_mouse_calibration_tree"):
+            return
+        tree = self.wrist_mouse_calibration_tree
+        selected_id = self._current_wrist_mouse_calibration_pattern()["id"]
+        for item in tree.get_children():
+            tree.delete(item)
+        for pattern in WRIST_MOUSE_CALIBRATION_PATTERNS:
+            samples = self.wrist_mouse_calibration_records.get(str(pattern["id"]), [])
+            status = "captured" if samples else "pending"
+            tree.insert(
+                "",
+                "end",
+                iid=str(pattern["id"]),
+                text=str(pattern["name"]),
+                values=(status, len(samples)),
+            )
+        if tree.exists(selected_id):
+            tree.selection_set(selected_id)
+            tree.see(selected_id)
+
+    def _on_wrist_mouse_calibration_pattern_selected(self, _event: tk.Event | None = None) -> None:
+        if not hasattr(self, "wrist_mouse_calibration_tree"):
+            return
+        selection = self.wrist_mouse_calibration_tree.selection()
+        if not selection:
+            return
+        selected_id = str(selection[0])
+        for index, pattern in enumerate(WRIST_MOUSE_CALIBRATION_PATTERNS):
+            if str(pattern["id"]) == selected_id:
+                self.wrist_mouse_calibration_pattern_index = index
+                break
+        pattern = self._current_wrist_mouse_calibration_pattern()
+        self.wrist_mouse_calibration_pattern_var.set(str(pattern["name"]))
+        self.wrist_mouse_calibration_instruction_var.set(str(pattern["instruction"]))
+        self._draw_wrist_mouse_calibration_pattern()
+
+    def next_wrist_mouse_calibration_pattern(self) -> None:
+        self.wrist_mouse_calibration_pattern_index = (
+            self.wrist_mouse_calibration_pattern_index + 1
+        ) % len(WRIST_MOUSE_CALIBRATION_PATTERNS)
+        self._refresh_wrist_mouse_calibration_tree()
+        self._on_wrist_mouse_calibration_pattern_selected()
+
+    def clear_wrist_mouse_calibration_pattern(self) -> None:
+        pattern = self._current_wrist_mouse_calibration_pattern()
+        self.wrist_mouse_calibration_records.pop(str(pattern["id"]), None)
+        self.wrist_mouse_calibration_summary_var.set(f'Cleared capture for "{pattern["name"]}".')
+        self._refresh_wrist_mouse_calibration_tree()
+
+    def clear_all_wrist_mouse_calibration_patterns(self) -> None:
+        self.wrist_mouse_calibration_records.clear()
+        self.wrist_mouse_calibration_samples = []
+        self.wrist_mouse_calibration_phase = "idle"
+        self.wrist_mouse_calibration_capture_var.set("Idle")
+        self.wrist_mouse_calibration_summary_var.set("Cleared all calibration captures.")
+        self._refresh_wrist_mouse_calibration_tree()
+
+    def _draw_wrist_mouse_calibration_pattern(self) -> None:
+        if not hasattr(self, "wrist_mouse_calibration_canvas"):
+            return
+        canvas = self.wrist_mouse_calibration_canvas
+        canvas.delete("all")
+        width = max(260, canvas.winfo_width())
+        height = max(180, canvas.winfo_height())
+        cx = width / 2
+        cy = height / 2
+        color = "#2563eb"
+        accent = "#dc2626"
+        canvas.create_text(cx, 18, text="Follow this motion with your wristband", fill="#344054", font=("Segoe UI", 10, "bold"))
+        pattern = self._current_wrist_mouse_calibration_pattern()
+        shape = str(pattern["shape"])
+
+        def arrow(x1: float, y1: float, x2: float, y2: float, *, fill: str = color) -> None:
+            canvas.create_line(x1, y1, x2, y2, fill=fill, width=4, arrow=tk.LAST, arrowshape=(14, 16, 6))
+
+        if shape == "still":
+            canvas.create_oval(cx - 36, cy - 36, cx + 36, cy + 36, outline="#98a2b3", width=3)
+            canvas.create_text(cx, cy, text="Hold\nStill", fill="#667085", font=("Segoe UI", 16, "bold"))
+        elif shape == "horizontal":
+            arrow(70, cy, width - 70, cy)
+            arrow(width - 70, cy + 26, 70, cy + 26, fill=accent)
+        elif shape == "vertical":
+            arrow(cx, height - 45, cx, 55)
+            arrow(cx + 26, 55, cx + 26, height - 45, fill=accent)
+        elif shape == "diag_down":
+            arrow(80, 60, width - 80, height - 60)
+            arrow(width - 100, height - 80, 100, 80, fill=accent)
+        elif shape == "diag_up":
+            arrow(80, height - 60, width - 80, 60)
+            arrow(width - 100, 80, 100, height - 80, fill=accent)
+        elif shape == "circle_cw":
+            canvas.create_oval(cx - 70, cy - 70, cx + 70, cy + 70, outline=color, width=4)
+            arrow(cx + 50, cy - 46, cx + 70, cy - 10)
+            canvas.create_text(cx, cy + 95, text="Clockwise", fill="#667085", font=("Segoe UI", 11))
+        elif shape == "circle_ccw":
+            canvas.create_oval(cx - 70, cy - 70, cx + 70, cy + 70, outline=color, width=4)
+            arrow(cx - 50, cy - 46, cx - 70, cy - 10)
+            canvas.create_text(cx, cy + 95, text="Counter-clockwise", fill="#667085", font=("Segoe UI", 11))
+        elif shape == "spiral_out":
+            points: list[tuple[float, float]] = []
+            turns = 3.2
+            for step in range(120):
+                t = turns * 2.0 * math.pi * (step / 119.0)
+                radius = 10 + 65 * (step / 119.0)
+                points.append((cx + math.cos(t) * radius, cy + math.sin(t) * radius))
+            for start, end in zip(points, points[1:]):
+                canvas.create_line(start[0], start[1], end[0], end[1], fill=color, width=3)
+            arrow(points[-8][0], points[-8][1], points[-1][0], points[-1][1], fill=accent)
+        canvas.create_text(
+            cx,
+            height - 16,
+            text=f'{pattern["duration_s"]:g}s capture after {WRIST_MOUSE_CALIBRATION_READY_S:g}s ready countdown',
+            fill="#667085",
+            font=("Segoe UI", 9),
+        )
+
+    def start_wrist_mouse_calibration_capture(self) -> None:
+        if self.wrist_mouse_calibration_phase in {"ready", "capturing"}:
+            return
+        pattern = self._current_wrist_mouse_calibration_pattern()
+        self.wrist_mouse_calibration_duration_s = float(pattern["duration_s"])
+        self.wrist_mouse_calibration_started_s = time.monotonic()
+        self.wrist_mouse_calibration_phase = "ready"
+        self.wrist_mouse_calibration_last_sequence = None
+        self.wrist_mouse_calibration_samples = []
+        self.wrist_mouse_calibration_capture_var.set(f'Ready: {WRIST_MOUSE_CALIBRATION_READY_S:.1f}s')
+        self.wrist_mouse_calibration_status_var.set(f'Starting "{pattern["name"]}" capture.')
+
+    def _update_wrist_mouse_calibration_capture(self, now_s: float) -> None:
+        phase = self.wrist_mouse_calibration_phase
+        if phase == "ready":
+            remaining_s = max(0.0, WRIST_MOUSE_CALIBRATION_READY_S - (now_s - self.wrist_mouse_calibration_started_s))
+            self.wrist_mouse_calibration_capture_var.set(f"Ready: {remaining_s:.1f}s")
+            if remaining_s <= 0.0:
+                self.wrist_mouse_calibration_phase = "capturing"
+                self.wrist_mouse_calibration_started_s = now_s
+                self.wrist_mouse_calibration_samples = []
+                self.wrist_mouse_calibration_status_var.set("Capturing wrist motion pattern.")
+        elif phase == "capturing":
+            remaining_s = max(0.0, self.wrist_mouse_calibration_duration_s - (now_s - self.wrist_mouse_calibration_started_s))
+            self.wrist_mouse_calibration_capture_var.set(
+                f"Capturing: {remaining_s:.1f}s | {len(self.wrist_mouse_calibration_samples)} samples"
+            )
+            if remaining_s <= 0.0:
+                self._finish_wrist_mouse_calibration_capture()
+
+    def _extract_wrist_mouse_calibration_sample(self, serial_state: dict[str, Any]) -> dict[str, float] | None:
+        devices = serial_state.get("devices", {}) if isinstance(serial_state, dict) else {}
+        wrist = devices.get("wristband", {}) if isinstance(devices, dict) else {}
+        if not isinstance(wrist, dict):
+            return None
+        status = str(wrist.get("status", "")).lower()
+        if status in {"not_connected", "disconnected", "tbd"}:
+            return None
+        accel = wrist.get("accel", {})
+        calibrated = wrist.get("calibrated_accel", {})
+        gyro = wrist.get("gyro", {})
+        packet_ms = wrist.get("t_ms")
+        if not isinstance(accel, dict) or not isinstance(gyro, dict) or not isinstance(packet_ms, (int, float)):
+            return None
+
+        def number(value: Any) -> float | None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        acc_x = number(accel.get("x"))
+        acc_y = number(accel.get("y"))
+        acc_z = number(accel.get("z"))
+        gyro_x = number(gyro.get("x"))
+        gyro_y = number(gyro.get("y"))
+        gyro_z = number(gyro.get("z"))
+        if None in {acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z}:
+            return None
+        return {
+            "timestamp_s": float(packet_ms) / 1000.0,
+            "acc_x": float(acc_x),
+            "acc_y": float(acc_y),
+            "acc_z": float(acc_z),
+            "gyro_x": float(gyro_x),
+            "gyro_y": float(gyro_y),
+            "gyro_z": float(gyro_z),
+            "cal_acc_x": float(number(calibrated.get("x")) or 0.0),
+            "cal_acc_y": float(number(calibrated.get("y")) or 0.0),
+            "cal_acc_z": float(number(calibrated.get("z")) or 0.0),
+            "has_calibrated": 1.0 if isinstance(calibrated, dict) and any(number(calibrated.get(axis)) is not None for axis in ("x", "y", "z")) else 0.0,
+        }
+
+    def _add_wrist_mouse_calibration_state(self, serial_state: dict[str, Any]) -> None:
+        if self.wrist_mouse_calibration_phase != "capturing":
+            return
+        devices = serial_state.get("devices", {}) if isinstance(serial_state, dict) else {}
+        wrist = devices.get("wristband", {}) if isinstance(devices, dict) else {}
+        if not isinstance(wrist, dict):
+            return
+        sequence = wrist.get("sequence")
+        if sequence is not None and sequence == self.wrist_mouse_calibration_last_sequence:
+            return
+        sample = self._extract_wrist_mouse_calibration_sample(serial_state)
+        if sample is None:
+            return
+        self.wrist_mouse_calibration_last_sequence = sequence
+        self.wrist_mouse_calibration_samples.append(sample)
+
+    def _finish_wrist_mouse_calibration_capture(self) -> None:
+        pattern = self._current_wrist_mouse_calibration_pattern()
+        pattern_id = str(pattern["id"])
+        self.wrist_mouse_calibration_phase = "complete"
+        self.wrist_mouse_calibration_records[pattern_id] = list(self.wrist_mouse_calibration_samples)
+        export_path = self._save_wrist_mouse_calibration_capture(pattern, self.wrist_mouse_calibration_samples)
+        self.wrist_mouse_calibration_capture_var.set(
+            f'Captured {len(self.wrist_mouse_calibration_samples)} samples for "{pattern["name"]}"'
+        )
+        if export_path is not None:
+            self.wrist_mouse_calibration_status_var.set(
+                f'Finished "{pattern["name"]}". Saved samples to {export_path.name}.'
+            )
+        else:
+            self.wrist_mouse_calibration_status_var.set(f'Finished "{pattern["name"]}".')
+        self.wrist_mouse_calibration_summary_var.set(self._wrist_mouse_calibration_overview())
+        self._refresh_wrist_mouse_calibration_tree()
+        if self.wrist_mouse_calibration_pattern_index < len(WRIST_MOUSE_CALIBRATION_PATTERNS) - 1:
+            self.wrist_mouse_calibration_pattern_index += 1
+            self._refresh_wrist_mouse_calibration_tree()
+            self._on_wrist_mouse_calibration_pattern_selected()
+        self.wrist_mouse_calibration_phase = "idle"
+
+    def _wrist_mouse_calibration_overview(self) -> str:
+        captured = [
+            pattern["name"]
+            for pattern in WRIST_MOUSE_CALIBRATION_PATTERNS
+            if self.wrist_mouse_calibration_records.get(str(pattern["id"]))
+        ]
+        return f"Captured {len(captured)}/{len(WRIST_MOUSE_CALIBRATION_PATTERNS)} patterns: " + (
+            ", ".join(captured) if captured else "none"
+        )
+
+    def _save_wrist_mouse_calibration_capture(
+        self,
+        pattern: dict[str, Any],
+        samples: list[dict[str, float]],
+    ) -> Path | None:
+        try:
+            export_dir = self.config.exports_dir / WRIST_MOUSE_CALIBRATION_EXPORT_DIRNAME
+            export_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            pattern_id = str(pattern.get("id", "pattern"))
+            export_path = export_dir / f"{timestamp}_{pattern_id}.json"
+            payload = {
+                "captured_at": timestamp,
+                "pattern": {
+                    "id": pattern_id,
+                    "name": str(pattern.get("name", pattern_id)),
+                    "duration_s": float(pattern.get("duration_s", 0.0)),
+                    "instruction": str(pattern.get("instruction", "")),
+                },
+                "sample_count": len(samples),
+                "samples": samples,
+            }
+            with export_path.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+            return export_path
+        except OSError as exc:
+            self.log(f"Failed to save wrist mouse calibration capture: {exc}")
+            return None
+
+    def _load_saved_wrist_mouse_calibration_records(self) -> dict[str, list[dict[str, float]]]:
+        export_dir = self.config.exports_dir / WRIST_MOUSE_CALIBRATION_EXPORT_DIRNAME
+        if not export_dir.exists():
+            return {}
+        latest_by_pattern: dict[str, tuple[float, list[dict[str, float]]]] = {}
+        for path in export_dir.glob("*.json"):
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+            except (OSError, json.JSONDecodeError):
+                continue
+            pattern = payload.get("pattern", {})
+            pattern_id = str(pattern.get("id", "")).strip()
+            samples = payload.get("samples")
+            if not pattern_id or not isinstance(samples, list):
+                continue
+            timestamp = path.stat().st_mtime
+            previous = latest_by_pattern.get(pattern_id)
+            if previous is None or timestamp >= previous[0]:
+                latest_by_pattern[pattern_id] = (timestamp, samples)
+        return {pattern_id: samples for pattern_id, (_timestamp, samples) in latest_by_pattern.items()}
+
+    @staticmethod
+    def _quantile(values: list[float], q: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        if len(ordered) == 1:
+            return ordered[0]
+        position = max(0.0, min(1.0, q)) * (len(ordered) - 1)
+        low = int(math.floor(position))
+        high = int(math.ceil(position))
+        if low == high:
+            return ordered[low]
+        weight = position - low
+        return ordered[low] * (1.0 - weight) + ordered[high] * weight
+
+    def _wrist_mouse_axis_values(
+        self,
+        samples: list[dict[str, float]],
+        axis: str,
+        *,
+        use_calibrated: bool,
+        baseline: float = 0.0,
+    ) -> list[float]:
+        key = f'{"cal_acc" if use_calibrated else "acc"}_{axis}'
+        return [float(sample.get(key, 0.0)) - baseline for sample in samples]
+
+    def _first_peak_sign(self, values: list[float], threshold: float) -> int:
+        if threshold <= 0.0:
+            return 1
+        for value in values:
+            if abs(value) >= threshold:
+                return 1 if value >= 0.0 else -1
+        return 1
+
+    def apply_wrist_mouse_calibration_to_profile(self) -> None:
+        records = dict(self.wrist_mouse_calibration_records)
+        loaded_saved = False
+        saved_records = self._load_saved_wrist_mouse_calibration_records()
+        for pattern_id, samples in saved_records.items():
+            if not records.get(pattern_id):
+                records[pattern_id] = samples
+                loaded_saved = True
+
+        still = records.get("still", [])
+        horizontal = records.get("horizontal", [])
+        vertical = records.get("vertical", [])
+        if not still or not horizontal or not vertical:
+            self.wrist_mouse_calibration_status_var.set(
+                "Need at least Hold still, Horizontal line, and Vertical line before applying calibration."
+            )
+            return
+
+        use_calibrated = any(sample.get("has_calibrated") for sample in still + horizontal + vertical)
+        source_prefix = "wristband.calibrated_accel" if use_calibrated else "wristband.accel"
+
+        axis_stats: dict[str, dict[str, float | list[float]]] = {}
+        for axis in ("x", "y", "z"):
+            still_raw = self._wrist_mouse_axis_values(still, axis, use_calibrated=use_calibrated)
+            baseline = sum(still_raw) / max(1, len(still_raw))
+            still_values = [value - baseline for value in still_raw]
+            horizontal_values = self._wrist_mouse_axis_values(
+                horizontal,
+                axis,
+                use_calibrated=use_calibrated,
+                baseline=baseline,
+            )
+            vertical_values = self._wrist_mouse_axis_values(
+                vertical,
+                axis,
+                use_calibrated=use_calibrated,
+                baseline=baseline,
+            )
+            axis_stats[axis] = {
+                "baseline": baseline,
+                "still": still_values,
+                "horizontal": horizontal_values,
+                "vertical": vertical_values,
+                "noise": self._quantile([abs(value) for value in still_values], 0.95),
+                "horizontal_amp": max(0.1, self._quantile([abs(value) for value in horizontal_values], 0.90)),
+                "vertical_amp": max(0.1, self._quantile([abs(value) for value in vertical_values], 0.90)),
+            }
+
+        def choose_axis(primary_key: str, leakage_key: str, exclude: str | None = None) -> str:
+            best_axis = "x"
+            best_score = float("-inf")
+            for axis in ("x", "y", "z"):
+                if exclude and axis == exclude:
+                    continue
+                stats = axis_stats[axis]
+                primary_amp = float(stats[primary_key])
+                leakage_amp = float(stats[leakage_key])
+                noise = float(stats["noise"])
+                score = primary_amp / max(0.05, noise + (0.45 * leakage_amp))
+                if score > best_score:
+                    best_axis = axis
+                    best_score = score
+            return best_axis
+
+        x_axis = choose_axis("horizontal_amp", "vertical_amp")
+        y_axis = choose_axis("vertical_amp", "horizontal_amp", exclude=x_axis)
+        if x_axis == y_axis:
+            y_axis = choose_axis("vertical_amp", "horizontal_amp")
+
+        x_stats = axis_stats[x_axis]
+        y_stats = axis_stats[y_axis]
+        amplitude_x = float(x_stats["horizontal_amp"])
+        amplitude_y = float(y_stats["vertical_amp"])
+        noise_x = float(x_stats["noise"])
+        noise_y = float(y_stats["noise"])
+
+        target_speed = 900.0
+        x_values = list(x_stats["horizontal"])
+        y_values = list(y_stats["vertical"])
+        x_sign = self._first_peak_sign(x_values, amplitude_x * 0.55)
+        y_sign = self._first_peak_sign(y_values, amplitude_y * 0.55)
+        speed_x = (target_speed / amplitude_x) * float(x_sign)
+        speed_y = (target_speed / amplitude_y) * float(-y_sign)
+
+        move_deadband = max(0.20, min(3.5, max(noise_x, noise_y) * 1.35))
+        noise_ratio = max(noise_x / amplitude_x, noise_y / amplitude_y)
+        cross_talk = max(
+            float(x_stats["vertical_amp"]) / max(0.1, amplitude_x),
+            float(y_stats["horizontal_amp"]) / max(0.1, amplitude_y),
+        )
+        move_smoothing = max(0.10, min(0.34, 0.28 - (noise_ratio * 0.25) - (cross_talk * 0.06)))
+
+        profile = next(
+            (item for item in self.input_mapper.config.profiles if item.name == WRISTBAND_MOUSE_CURSOR_PROFILE_NAME),
+            None,
+        )
+        if profile is None:
+            profile = wristband_mouse_cursor_profile()
+            self.input_mapper.config.profiles.append(profile)
+        if not profile.mappings:
+            profile.mappings = wristband_mouse_cursor_profile().mappings
+        rule = next((item for item in profile.mappings if item.id == "wrist_mouse_follow_accel"), None)
+        if rule is None:
+            rule = wristband_mouse_cursor_profile().mappings[0]
+            profile.mappings = [rule]
+
+        rule.source = "wristband.sequence"
+        rule.comparator = "present"
+        rule.action.type = "mouse_move"
+        rule.action.speed_x = round(speed_x, 3)
+        rule.action.speed_y = round(speed_y, 3)
+        rule.action.speed_x_source = f"{source_prefix}_{x_axis}"
+        rule.action.speed_y_source = f"{source_prefix}_{y_axis}"
+        rule.action.speed_x_offset = round(float(x_stats["baseline"]), 3)
+        rule.action.speed_y_offset = round(float(y_stats["baseline"]), 3)
+        rule.action.move_deadband = round(move_deadband, 3)
+        rule.action.move_smoothing_alpha = round(move_smoothing, 3)
+
+        self.input_mapper.config.active_profile = WRISTBAND_MOUSE_CURSOR_PROFILE_NAME
+        self.mapping_profile_var.set(WRISTBAND_MOUSE_CURSOR_PROFILE_NAME)
+        self.input_mapper.set_active_profile(WRISTBAND_MOUSE_CURSOR_PROFILE_NAME)
+        save_mapping_config(self.input_mapper.config, self.mapping_config_path)
+        self._refresh_mapping_profile_combo()
+        self._refresh_mapping_table()
+        self.wrist_mouse_calibration_status_var.set("Updated the Wristband Mouse Cursor profile from captured calibration data.")
+        self.wrist_mouse_calibration_summary_var.set(
+            f"Applied x={source_prefix}_{x_axis}@{float(x_stats['baseline']):.2f}, y={source_prefix}_{y_axis}@{float(y_stats['baseline']):.2f}, "
+            f"speed_x={speed_x:.1f}, speed_y={speed_y:.1f}, "
+            f"deadband={move_deadband:.2f}, smoothing={move_smoothing:.2f}"
+        )
+        self.log(
+            "Updated Wristband Mouse Cursor mapping profile from wrist calibration: "
+            f"x_source={source_prefix}_{x_axis} offset={float(x_stats['baseline']):.2f}, "
+            f"y_source={source_prefix}_{y_axis} offset={float(y_stats['baseline']):.2f}, "
+            f"speed_x={speed_x:.1f}, speed_y={speed_y:.1f}, "
+            f"deadband={move_deadband:.2f}, smoothing={move_smoothing:.2f}"
+        )
+        if loaded_saved:
+            self.log("Loaded missing wrist mouse calibration patterns from saved captures before applying the mapping.")
+
+    def _build_wristband_camera_alignment_tab(self, page: ttk.Frame) -> None:
+        body = self._scrollable_body(page)
+        body.columnconfigure(0, weight=1)
+
+        intro_box = ttk.LabelFrame(body, text="Workflow", padding=10)
+        intro_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        intro_box.columnconfigure(0, weight=1)
+        ttk.Label(
+            intro_box,
+            text=(
+                "Record your right hand with the camera while wearing the wristband on the same hand. "
+                "The app saves paired samples to CSV with camera hand position and wristband IMU values, "
+                "then fits the Wristband Mouse Cursor profile from that capture using wrist acceleration only."
+            ),
+            wraplength=920,
+        ).grid(row=0, column=0, sticky="ew")
+        ttk.Label(intro_box, textvariable=self.wrist_camera_alignment_status_var, wraplength=920).grid(
+            row=1, column=0, sticky="ew", pady=(8, 0)
+        )
+
+        capture_box = ttk.LabelFrame(body, text="Paired Capture", padding=10)
+        capture_box.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        for column in range(5):
+            capture_box.columnconfigure(column, weight=1 if column >= 2 else 0)
+        ttk.Label(capture_box, text="Capture window").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(capture_box, textvariable=self.wrist_camera_alignment_capture_duration_var, width=8).grid(
+            row=0, column=1, sticky="w", pady=4
+        )
+        ttk.Label(capture_box, text="seconds").grid(row=0, column=2, sticky="w", pady=4)
+        ttk.Label(capture_box, textvariable=self.wrist_camera_alignment_capture_var, style="Value.TLabel").grid(
+            row=0, column=3, columnspan=2, sticky="w", padx=(12, 0), pady=4
+        )
+        instructions = (
+            "Suggested motion: move your right hand left/right, up/down, and diagonally across a comfortable range "
+            "for 10 to 15 seconds. Keep the hand visible in the camera while changing direction several times."
+        )
+        ttk.Label(capture_box, text=instructions, wraplength=900).grid(
+            row=1, column=0, columnspan=5, sticky="ew", pady=(0, 8)
+        )
+        actions = ttk.Frame(capture_box)
+        actions.grid(row=2, column=0, columnspan=5, sticky="ew")
+        for column in range(5):
+            actions.columnconfigure(column, weight=1)
+        ttk.Button(
+            actions,
+            text="Start Paired Capture",
+            command=self.start_wrist_camera_alignment_capture,
+            style="Accent.TButton",
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(
+            actions,
+            text="Stop Capture",
+            command=self.stop_wrist_camera_alignment_capture,
+            style="Secondary.TButton",
+        ).grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(
+            actions,
+            text="Apply Latest CSV",
+            command=self.apply_latest_wrist_camera_alignment_to_profile,
+            style="Accent.TButton",
+        ).grid(row=0, column=2, sticky="ew", padx=4)
+        ttk.Button(
+            actions,
+            text="Refresh Files",
+            command=self._refresh_wrist_camera_alignment_files,
+            style="Secondary.TButton",
+        ).grid(row=0, column=3, sticky="ew", padx=4)
+        ttk.Button(
+            actions,
+            text="Open Folder",
+            command=self.open_wrist_camera_alignment_folder,
+            style="Secondary.TButton",
+        ).grid(row=0, column=4, sticky="ew", padx=(4, 0))
+        ttk.Label(capture_box, textvariable=self.wrist_camera_alignment_summary_var, wraplength=900).grid(
+            row=3, column=0, columnspan=5, sticky="ew", pady=(8, 0)
+        )
+
+        files_box = ttk.LabelFrame(body, text="Saved CSV Captures", padding=10)
+        files_box.grid(row=2, column=0, sticky="ew")
+        files_box.columnconfigure(0, weight=1)
+        self.wrist_camera_alignment_tree = ttk.Treeview(
+            files_box,
+            columns=("rows", "duration", "updated"),
+            show="tree headings",
+            height=10,
+        )
+        self.wrist_camera_alignment_tree.heading("#0", text="File")
+        self.wrist_camera_alignment_tree.heading("rows", text="Rows")
+        self.wrist_camera_alignment_tree.heading("duration", text="Seconds")
+        self.wrist_camera_alignment_tree.heading("updated", text="Updated")
+        self.wrist_camera_alignment_tree.column("#0", width=380, stretch=True)
+        self.wrist_camera_alignment_tree.column("rows", width=90, stretch=False)
+        self.wrist_camera_alignment_tree.column("duration", width=90, stretch=False)
+        self.wrist_camera_alignment_tree.column("updated", width=180, stretch=False)
+        self.wrist_camera_alignment_tree.grid(row=0, column=0, sticky="ew")
+        file_actions = ttk.Frame(files_box)
+        file_actions.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        for column in range(2):
+            file_actions.columnconfigure(column, weight=1)
+        ttk.Button(
+            file_actions,
+            text="Apply Selected CSV",
+            command=self.apply_selected_wrist_camera_alignment_to_profile,
+            style="Accent.TButton",
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(
+            file_actions,
+            text="Refresh",
+            command=self._refresh_wrist_camera_alignment_files,
+            style="Secondary.TButton",
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+        self._refresh_wrist_camera_alignment_files()
+
+    def _wrist_camera_alignment_dir(self) -> Path:
+        return self.config.exports_dir / WRIST_CAMERA_ALIGNMENT_EXPORT_DIRNAME
+
+    def _refresh_wrist_camera_alignment_files(self) -> None:
+        if not hasattr(self, "wrist_camera_alignment_tree"):
+            return
+        tree = self.wrist_camera_alignment_tree
+        for item in tree.get_children():
+            tree.delete(item)
+        export_dir = self._wrist_camera_alignment_dir()
+        export_dir.mkdir(parents=True, exist_ok=True)
+        files = sorted(export_dir.glob("*.csv"), key=lambda path: path.stat().st_mtime, reverse=True)
+        for path in files[:50]:
+            rows = 0
+            duration = 0.0
+            try:
+                with path.open("r", encoding="utf-8", newline="") as handle:
+                    reader = csv.DictReader(handle)
+                    first_elapsed = None
+                    last_elapsed = None
+                    for row in reader:
+                        rows += 1
+                        try:
+                            elapsed = float(row.get("capture_elapsed_s", "") or 0.0)
+                        except ValueError:
+                            elapsed = 0.0
+                        if first_elapsed is None:
+                            first_elapsed = elapsed
+                        last_elapsed = elapsed
+                    if first_elapsed is not None and last_elapsed is not None:
+                        duration = max(0.0, last_elapsed - first_elapsed)
+            except OSError:
+                continue
+            updated = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(path.stat().st_mtime))
+            tree.insert("", "end", iid=str(path), text=path.name, values=(rows, f"{duration:.1f}", updated))
+        if files:
+            latest = str(files[0])
+            if tree.exists(latest):
+                tree.selection_set(latest)
+                tree.see(latest)
+
+    def start_wrist_camera_alignment_capture(self) -> None:
+        if self.wrist_camera_alignment_phase in {"ready", "capturing"}:
+            return
+        if not self.camera_enabled:
+            self.wrist_camera_alignment_status_var.set("Camera must be enabled to record paired alignment samples.")
+            return
+        try:
+            duration_s = float(self.wrist_camera_alignment_capture_duration_var.get())
+        except ValueError:
+            self.wrist_camera_alignment_status_var.set("Capture duration must be a number.")
+            return
+        if duration_s < 2.0 or duration_s > 120.0:
+            self.wrist_camera_alignment_status_var.set("Capture duration must be between 2 and 120 seconds.")
+            return
+        self.wrist_camera_alignment_duration_s = duration_s
+        self.wrist_camera_alignment_capture_duration_var.set(f"{duration_s:g}")
+        self.wrist_camera_alignment_samples = []
+        self.wrist_camera_alignment_started_s = time.monotonic()
+        self.wrist_camera_alignment_phase = "ready"
+        self.wrist_camera_alignment_capture_var.set(f"Ready: {WRIST_CAMERA_ALIGNMENT_READY_S:.1f}s")
+        self.wrist_camera_alignment_status_var.set("Starting paired camera + wristband capture.")
+
+    def stop_wrist_camera_alignment_capture(self) -> None:
+        if self.wrist_camera_alignment_phase not in {"ready", "capturing"}:
+            return
+        self._finish_wrist_camera_alignment_capture(cancelled=False)
+
+    def _update_wrist_camera_alignment_capture(self, now_s: float) -> None:
+        phase = self.wrist_camera_alignment_phase
+        if phase == "ready":
+            remaining_s = max(0.0, WRIST_CAMERA_ALIGNMENT_READY_S - (now_s - self.wrist_camera_alignment_started_s))
+            self.wrist_camera_alignment_capture_var.set(f"Ready: {remaining_s:.1f}s")
+            if remaining_s <= 0.0:
+                self.wrist_camera_alignment_phase = "capturing"
+                self.wrist_camera_alignment_started_s = now_s
+                self.wrist_camera_alignment_samples = []
+                self.wrist_camera_alignment_status_var.set("Capturing paired camera + wristband samples.")
+        elif phase == "capturing":
+            elapsed_s = now_s - self.wrist_camera_alignment_started_s
+            remaining_s = max(0.0, self.wrist_camera_alignment_duration_s - elapsed_s)
+            self.wrist_camera_alignment_capture_var.set(
+                f"Capturing: {remaining_s:.1f}s | {len(self.wrist_camera_alignment_samples)} rows"
+            )
+            if remaining_s <= 0.0:
+                self._finish_wrist_camera_alignment_capture(cancelled=False)
+
+    def _add_wrist_camera_alignment_sample(self, snapshot: dict[str, Any], now_s: float) -> None:
+        if self.wrist_camera_alignment_phase != "capturing":
+            return
+        input_dict = snapshot.get("input_dict", {}) if isinstance(snapshot, dict) else {}
+        raw_state = snapshot.get("raw_device_state", {}) if isinstance(snapshot, dict) else {}
+        devices = raw_state.get("devices", {}) if isinstance(raw_state, dict) else {}
+        wrist = devices.get("wristband", {}) if isinstance(devices, dict) else {}
+        hands = snapshot.get("hand_state", {}) if isinstance(snapshot, dict) else {}
+        right = hands.get("right", {}) if isinstance(hands, dict) else {}
+        accel = wrist.get("accel", {}) if isinstance(wrist, dict) else {}
+        calibrated = wrist.get("calibrated_accel", {}) if isinstance(wrist, dict) else {}
+        gyro = wrist.get("gyro", {}) if isinstance(wrist, dict) else {}
+        capture_elapsed_s = max(0.0, now_s - self.wrist_camera_alignment_started_s)
+        self.wrist_camera_alignment_samples.append(
+            {
+                "capture_elapsed_s": round(capture_elapsed_s, 6),
+                "host_time_s": round(now_s, 6),
+                "camera_visible": 1 if right.get("visible") else 0,
+                "camera_x": input_dict.get("right_hand_x"),
+                "camera_y_up": input_dict.get("right_hand_y"),
+                "camera_score": right.get("score"),
+                "camera_gesture": right.get("gesture"),
+                "wrist_status": wrist.get("status"),
+                "wrist_sequence": wrist.get("sequence"),
+                "wrist_t_ms": wrist.get("t_ms"),
+                "acc_x": accel.get("x"),
+                "acc_y": accel.get("y"),
+                "acc_z": accel.get("z"),
+                "cal_acc_x": calibrated.get("x"),
+                "cal_acc_y": calibrated.get("y"),
+                "cal_acc_z": calibrated.get("z"),
+                "gyro_x": gyro.get("x"),
+                "gyro_y": gyro.get("y"),
+                "gyro_z": gyro.get("z"),
+                "pitch": wrist.get("pitch"),
+                "roll": wrist.get("roll"),
+                "yaw": wrist.get("yaw"),
+            }
+        )
+
+    def _finish_wrist_camera_alignment_capture(self, *, cancelled: bool) -> None:
+        phase = self.wrist_camera_alignment_phase
+        if phase not in {"ready", "capturing"}:
+            return
+        self.wrist_camera_alignment_phase = "idle"
+        if cancelled or not self.wrist_camera_alignment_samples:
+            self.wrist_camera_alignment_capture_var.set("Idle")
+            self.wrist_camera_alignment_status_var.set("Paired capture cancelled." if cancelled else "No paired samples were captured.")
+            return
+        path = self._save_wrist_camera_alignment_capture(self.wrist_camera_alignment_samples)
+        row_count = len(self.wrist_camera_alignment_samples)
+        self.wrist_camera_alignment_capture_var.set(f"Captured {row_count} rows")
+        if path is not None:
+            self.wrist_camera_alignment_status_var.set(f"Saved paired capture to {path.name}.")
+            self.wrist_camera_alignment_summary_var.set(f"Latest paired capture: {path.name} | {row_count} rows")
+            self.log(f"Saved wrist camera alignment capture with {row_count} rows to {path}")
+        else:
+            self.wrist_camera_alignment_status_var.set("Paired capture finished, but the CSV could not be saved.")
+        self._refresh_wrist_camera_alignment_files()
+
+    def _save_wrist_camera_alignment_capture(self, samples: list[dict[str, Any]]) -> Path | None:
+        export_dir = self._wrist_camera_alignment_dir()
+        export_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        path = export_dir / f"{timestamp}_camera_wrist_alignment.csv"
+        fieldnames = [
+            "capture_elapsed_s",
+            "host_time_s",
+            "camera_visible",
+            "camera_x",
+            "camera_y_up",
+            "camera_score",
+            "camera_gesture",
+            "wrist_status",
+            "wrist_sequence",
+            "wrist_t_ms",
+            "acc_x",
+            "acc_y",
+            "acc_z",
+            "cal_acc_x",
+            "cal_acc_y",
+            "cal_acc_z",
+            "gyro_x",
+            "gyro_y",
+            "gyro_z",
+            "pitch",
+            "roll",
+            "yaw",
+        ]
+        try:
+            with path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(samples)
+            return path
+        except OSError as exc:
+            self.log(f"Failed to save wrist camera alignment CSV: {exc}")
+            return None
+
+    def open_wrist_camera_alignment_folder(self) -> None:
+        self._open_path(self._wrist_camera_alignment_dir(), "wrist camera alignment folder")
+
+    def _selected_wrist_camera_alignment_path(self) -> Path | None:
+        if not hasattr(self, "wrist_camera_alignment_tree"):
+            return None
+        selection = self.wrist_camera_alignment_tree.selection()
+        if not selection:
+            return None
+        return Path(str(selection[0]))
+
+    def _latest_wrist_camera_alignment_path(self) -> Path | None:
+        export_dir = self._wrist_camera_alignment_dir()
+        files = sorted(export_dir.glob("*.csv"), key=lambda path: path.stat().st_mtime, reverse=True)
+        return files[0] if files else None
+
+    @staticmethod
+    def _csv_float(row: dict[str, Any], key: str) -> float | None:
+        try:
+            value = row.get(key)
+            if value in (None, "", "None"):
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _csv_int(row: dict[str, Any], key: str) -> int | None:
+        value = row.get(key)
+        if value in (None, "", "None"):
+            return None
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+    def _load_wrist_camera_alignment_rows(self, path: Path) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                rows.append(dict(row))
+        return rows
+
+    def _fit_wrist_camera_alignment_capture(self, rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+        try:
+            import tkinter as tk
+
+            root = tk._default_root
+            screen_width = float(root.winfo_screenwidth()) if root is not None else 1920.0
+            screen_height = float(root.winfo_screenheight()) if root is not None else 1080.0
+        except Exception:
+            screen_width, screen_height = 1920.0, 1080.0
+
+        valid_rows = [row for row in rows if self._csv_int(row, "camera_visible") == 1]
+        aligned_samples: list[dict[str, float]] = []
+        previous_camera: tuple[float, float] | None = None
+        previous_time_s: float | None = None
+        segment_rows: list[dict[str, Any]] = []
+        for row in valid_rows:
+            time_s = self._csv_float(row, "capture_elapsed_s")
+            x = self._csv_float(row, "camera_x")
+            y_up = self._csv_float(row, "camera_y_up")
+            if time_s is None or x is None or y_up is None:
+                continue
+            if previous_camera is None:
+                previous_camera = (x, y_up)
+                previous_time_s = time_s
+                segment_rows = [row]
+                continue
+            segment_rows.append(row)
+            dx = x - previous_camera[0]
+            dy = y_up - previous_camera[1]
+            dt = time_s - previous_time_s if previous_time_s is not None else None
+            changed = abs(dx) > 1e-6 or abs(dy) > 1e-6
+            if dt is None or dt <= 0.0 or dt > 0.25:
+                previous_camera = (x, y_up)
+                previous_time_s = time_s
+                segment_rows = [row]
+                continue
+            if not changed:
+                continue
+            sample = {
+                "target_vx": (dx / dt) * screen_width,
+                "target_vy": (-(dy) / dt) * screen_height,
+            }
+            for prefix in ("acc", "cal_acc"):
+                for axis in ("x", "y", "z"):
+                    values = [
+                        self._csv_float(segment_row, f"{prefix}_{axis}")
+                        for segment_row in segment_rows
+                    ]
+                    filtered = [value for value in values if value is not None]
+                    sample[f"{prefix}_{axis}"] = sum(filtered) / len(filtered) if filtered else 0.0
+            aligned_samples.append(sample)
+            previous_camera = (x, y_up)
+            previous_time_s = time_s
+            segment_rows = [row]
+
+        if len(aligned_samples) < 8:
+            return None
+
+        def median(values: list[float]) -> float:
+            if not values:
+                return 0.0
+            ordered = sorted(values)
+            mid = len(ordered) // 2
+            if len(ordered) % 2:
+                return ordered[mid]
+            return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+        def correlation(xs: list[float], ys: list[float]) -> float:
+            if len(xs) != len(ys) or not xs:
+                return 0.0
+            mean_x = sum(xs) / len(xs)
+            mean_y = sum(ys) / len(ys)
+            num = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+            den_x = math.sqrt(sum((x - mean_x) ** 2 for x in xs))
+            den_y = math.sqrt(sum((y - mean_y) ** 2 for y in ys))
+            if den_x <= 1e-9 or den_y <= 1e-9:
+                return 0.0
+            return num / (den_x * den_y)
+
+        def regression_gain(xs: list[float], ys: list[float]) -> float:
+            denom = sum(x * x for x in xs)
+            if denom <= 1e-9:
+                return 0.0
+            return sum(x * y for x, y in zip(xs, ys)) / denom
+
+        target_speed_threshold = 90.0
+        prefix_candidates = ["acc", "cal_acc"]
+        best_fit: dict[str, Any] | None = None
+        for prefix in prefix_candidates:
+            non_zero = any(abs(float(sample.get(f"{prefix}_{axis}", 0.0))) > 1e-6 for sample in aligned_samples for axis in ("x", "y", "z"))
+            if prefix == "cal_acc" and not non_zero:
+                continue
+            baselines: dict[str, float] = {}
+            centered_by_axis: dict[str, list[float]] = {}
+            for axis in ("x", "y", "z"):
+                axis_values = [float(sample.get(f"{prefix}_{axis}", 0.0)) for sample in aligned_samples]
+                low_motion = [
+                    value
+                    for value, sample in zip(axis_values, aligned_samples)
+                    if max(abs(sample["target_vx"]), abs(sample["target_vy"])) < target_speed_threshold
+                ]
+                baseline = median(low_motion if low_motion else axis_values)
+                baselines[axis] = baseline
+                centered_by_axis[axis] = [value - baseline for value in axis_values]
+
+            target_vx = [sample["target_vx"] for sample in aligned_samples]
+            target_vy = [sample["target_vy"] for sample in aligned_samples]
+
+            def choose_axis(target: list[float], exclude: str | None = None) -> tuple[str, float]:
+                best_axis = "x"
+                best_corr = 0.0
+                for axis in ("x", "y", "z"):
+                    if exclude and axis == exclude:
+                        continue
+                    corr = correlation(centered_by_axis[axis], target)
+                    if abs(corr) > abs(best_corr):
+                        best_axis = axis
+                        best_corr = corr
+                return best_axis, best_corr
+
+            x_axis, corr_x = choose_axis(target_vx)
+            y_axis, corr_y = choose_axis(target_vy, exclude=x_axis)
+            if x_axis == y_axis:
+                y_axis, corr_y = choose_axis(target_vy)
+
+            axis_x_values = centered_by_axis[x_axis]
+            axis_y_values = centered_by_axis[y_axis]
+            gain_x = regression_gain(axis_x_values, target_vx)
+            gain_y = regression_gain(axis_y_values, target_vy)
+            noise_rows = [
+                index
+                for index, sample in enumerate(aligned_samples)
+                if max(abs(sample["target_vx"]), abs(sample["target_vy"])) < target_speed_threshold
+            ]
+            noise_x = [abs(axis_x_values[index]) for index in noise_rows] or [abs(value) for value in axis_x_values]
+            noise_y = [abs(axis_y_values[index]) for index in noise_rows] or [abs(value) for value in axis_y_values]
+            move_deadband = max(0.15, min(3.5, max(self._quantile(noise_x, 0.95), self._quantile(noise_y, 0.95)) * 1.2))
+            cross_x = abs(correlation(axis_x_values, target_vy))
+            cross_y = abs(correlation(axis_y_values, target_vx))
+            avg_corr = (abs(corr_x) + abs(corr_y)) / 2.0
+            move_smoothing = max(0.10, min(0.34, 0.33 - (avg_corr * 0.14) + ((cross_x + cross_y) * 0.05)))
+            score = abs(corr_x) + abs(corr_y) - (cross_x + cross_y)
+            candidate = {
+                "prefix": prefix,
+                "x_axis": x_axis,
+                "y_axis": y_axis,
+                "corr_x": corr_x,
+                "corr_y": corr_y,
+                "gain_x": gain_x,
+                "gain_y": gain_y,
+                "x_offset": baselines[x_axis],
+                "y_offset": baselines[y_axis],
+                "move_deadband": move_deadband,
+                "move_smoothing_alpha": move_smoothing,
+                "rows": len(aligned_samples),
+                "quality": avg_corr,
+                "score": score,
+            }
+            if best_fit is None or candidate["score"] > best_fit["score"]:
+                best_fit = candidate
+        return best_fit
+
+    def _apply_wrist_camera_alignment_fit(self, fit: dict[str, Any], source_label: str) -> None:
+        profile = next(
+            (item for item in self.input_mapper.config.profiles if item.name == WRISTBAND_MOUSE_CURSOR_PROFILE_NAME),
+            None,
+        )
+        if profile is None:
+            profile = wristband_mouse_cursor_profile()
+            self.input_mapper.config.profiles.append(profile)
+        if not profile.mappings:
+            profile.mappings = wristband_mouse_cursor_profile().mappings
+        rule = next((item for item in profile.mappings if item.id == "wrist_mouse_follow_accel"), None)
+        if rule is None:
+            rule = wristband_mouse_cursor_profile().mappings[0]
+            profile.mappings = [rule]
+
+        source_prefix = "wristband.calibrated_accel" if fit["prefix"] == "cal_acc" else "wristband.accel"
+        rule.source = "wristband.sequence"
+        rule.comparator = "present"
+        rule.action.type = "mouse_move"
+        rule.action.speed_x = round(float(fit["gain_x"]), 3)
+        rule.action.speed_y = round(float(fit["gain_y"]), 3)
+        rule.action.speed_x_source = f'{source_prefix}_{fit["x_axis"]}'
+        rule.action.speed_y_source = f'{source_prefix}_{fit["y_axis"]}'
+        rule.action.speed_x_offset = round(float(fit["x_offset"]), 3)
+        rule.action.speed_y_offset = round(float(fit["y_offset"]), 3)
+        rule.action.move_deadband = round(float(fit["move_deadband"]), 3)
+        rule.action.move_smoothing_alpha = round(float(fit["move_smoothing_alpha"]), 3)
+
+        self.input_mapper.config.active_profile = WRISTBAND_MOUSE_CURSOR_PROFILE_NAME
+        self.mapping_profile_var.set(WRISTBAND_MOUSE_CURSOR_PROFILE_NAME)
+        self.input_mapper.set_active_profile(WRISTBAND_MOUSE_CURSOR_PROFILE_NAME)
+        save_mapping_config(self.input_mapper.config, self.mapping_config_path)
+        self._refresh_mapping_profile_combo()
+        self._refresh_mapping_table()
+
+        self.wrist_camera_alignment_status_var.set(f"Updated the Wristband Mouse Cursor profile from {source_label}.")
+        self.wrist_camera_alignment_summary_var.set(
+            f'Applied x={rule.action.speed_x_source}@{float(fit["x_offset"]):.2f} ({fit["gain_x"]:.1f}, corr {fit["corr_x"]:.2f}), '
+            f'y={rule.action.speed_y_source}@{float(fit["y_offset"]):.2f} ({fit["gain_y"]:.1f}, corr {fit["corr_y"]:.2f}), '
+            f'deadband={fit["move_deadband"]:.2f}, smoothing={fit["move_smoothing_alpha"]:.2f}'
+        )
+        self.log(
+            "Updated Wristband Mouse Cursor mapping profile from paired camera alignment: "
+            f'source={source_label}, x={rule.action.speed_x_source} offset={float(fit["x_offset"]):.2f} gain={fit["gain_x"]:.1f} corr={fit["corr_x"]:.2f}, '
+            f'y={rule.action.speed_y_source} offset={float(fit["y_offset"]):.2f} gain={fit["gain_y"]:.1f} corr={fit["corr_y"]:.2f}, '
+            f'deadband={fit["move_deadband"]:.2f}, smoothing={fit["move_smoothing_alpha"]:.2f}'
+        )
+
+    def apply_latest_wrist_camera_alignment_to_profile(self) -> None:
+        path = self._latest_wrist_camera_alignment_path()
+        if path is None:
+            self.wrist_camera_alignment_status_var.set("No paired camera alignment CSV captures were found yet.")
+            return
+        self._apply_wrist_camera_alignment_csv(path)
+
+    def apply_selected_wrist_camera_alignment_to_profile(self) -> None:
+        path = self._selected_wrist_camera_alignment_path()
+        if path is None:
+            self.wrist_camera_alignment_status_var.set("Select a paired alignment CSV first.")
+            return
+        self._apply_wrist_camera_alignment_csv(path)
+
+    def _apply_wrist_camera_alignment_csv(self, path: Path) -> None:
+        try:
+            rows = self._load_wrist_camera_alignment_rows(path)
+        except OSError as exc:
+            self.wrist_camera_alignment_status_var.set(f"Could not read {path.name}: {exc}")
+            return
+        fit = self._fit_wrist_camera_alignment_capture(rows)
+        if fit is None:
+            self.wrist_camera_alignment_status_var.set(
+                "Not enough valid paired samples were found. Keep the right hand visible and record more motion."
+            )
+            return
+        if float(fit.get("quality", 0.0)) < 0.25:
+            self.wrist_camera_alignment_status_var.set(
+                f'Capture quality is too low to apply safely (avg corr {float(fit.get("quality", 0.0)):.2f}). '
+                "Record sharper left/right and up/down motion with more direction changes."
+            )
+            self.wrist_camera_alignment_summary_var.set(
+                f'Latest fit from {path.name} was rejected: x corr {float(fit.get("corr_x", 0.0)):.2f}, '
+                f'y corr {float(fit.get("corr_y", 0.0)):.2f}, rows {int(fit.get("rows", 0))}'
+            )
+            return
+        self._apply_wrist_camera_alignment_fit(fit, path.name)
+
+    def _build_wrist_cursor_page(self, page: ttk.Frame) -> None:
+        self._build_page_header(page, "Wrist Cursor", "Gyro-based air mouse control without changing the wristband firmware.")
+        body = self._scrollable_body(page)
+        body.columnconfigure(0, weight=1)
+
+        intro_box = ttk.LabelFrame(body, text="Overview", padding=10)
+        intro_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        intro_box.columnconfigure(0, weight=1)
+        ttk.Label(
+            intro_box,
+            text=(
+                "This follows the TechTalkies ESP32 Air Mouse idea on the PC side: horizontal cursor movement comes "
+                "from wrist gyro Z and vertical cursor movement comes from wrist gyro X. The wristband firmware stays unchanged. "
+                "The original repo also used hardware click buttons on the ESP32; this tab reproduces the gyro cursor part only."
+            ),
+            wraplength=920,
+        ).grid(row=0, column=0, sticky="ew")
+        ttk.Label(intro_box, textvariable=self.wrist_cursor_status_var, wraplength=920).grid(
+            row=1, column=0, sticky="ew", pady=(8, 0)
+        )
+        ttk.Label(intro_box, textvariable=self.wrist_cursor_live_var, style="Value.TLabel", wraplength=920).grid(
+            row=2, column=0, sticky="ew", pady=(8, 0)
+        )
+
+        controls_box = ttk.LabelFrame(body, text="Cursor Mapping", padding=10)
+        controls_box.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        controls_box.columnconfigure(1, weight=1)
+        controls_box.columnconfigure(3, weight=1)
+        axis_options = ("x", "y", "z")
+
+        ttk.Label(controls_box, text="Horizontal gyro axis").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Combobox(
+            controls_box,
+            textvariable=self.wrist_cursor_x_axis_var,
+            values=axis_options,
+            state="readonly",
+            width=12,
+        ).grid(row=0, column=1, sticky="w", pady=4)
+        ttk.Label(controls_box, text="Vertical gyro axis").grid(row=0, column=2, sticky="w", padx=(12, 8), pady=4)
+        ttk.Combobox(
+            controls_box,
+            textvariable=self.wrist_cursor_y_axis_var,
+            values=axis_options,
+            state="readonly",
+            width=12,
+        ).grid(row=0, column=3, sticky="w", pady=4)
+
+        ttk.Label(controls_box, text="X sensitivity").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(controls_box, textvariable=self.wrist_cursor_speed_x_var, width=16).grid(row=1, column=1, sticky="w", pady=4)
+        ttk.Label(controls_box, text="Y sensitivity").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=4)
+        ttk.Entry(controls_box, textvariable=self.wrist_cursor_speed_y_var, width=16).grid(row=1, column=3, sticky="w", pady=4)
+        ttk.Label(
+            controls_box,
+            text="Higher sensitivity makes the cursor move more for the same wrist rotation.",
+            wraplength=900,
+        ).grid(row=4, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+
+        ttk.Label(controls_box, text="Deadband (deg/s)").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(controls_box, textvariable=self.wrist_cursor_deadband_var, width=16).grid(row=2, column=1, sticky="w", pady=4)
+        ttk.Label(controls_box, text="Smoothing").grid(row=2, column=2, sticky="w", padx=(12, 8), pady=4)
+        ttk.Entry(controls_box, textvariable=self.wrist_cursor_smoothing_var, width=16).grid(row=2, column=3, sticky="w", pady=4)
+
+        ttk.Label(controls_box, text="Y neutral angle").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(controls_box, textvariable=self.wrist_cursor_y_neutral_var, width=16).grid(row=3, column=1, sticky="w", pady=4)
+        ttk.Label(
+            controls_box,
+            text="Use this to shift the vertical center point if the cursor drifts up or down when your wrist is resting.",
+            wraplength=420,
+        ).grid(row=3, column=2, columnspan=2, sticky="ew", pady=4)
+
+        ttk.Checkbutton(controls_box, text="Invert horizontal", variable=self.wrist_cursor_invert_x_var).grid(
+            row=4, column=1, sticky="w", pady=4
+        )
+        ttk.Checkbutton(controls_box, text="Invert vertical", variable=self.wrist_cursor_invert_y_var).grid(
+            row=4, column=3, sticky="w", pady=4
+        )
+
+        actions_box = ttk.LabelFrame(body, text="Actions", padding=10)
+        actions_box.grid(row=2, column=0, sticky="ew")
+        for column in range(4):
+            actions_box.columnconfigure(column, weight=1)
+        ttk.Button(
+            actions_box,
+            text="Use Repo Defaults",
+            command=self.reset_wrist_cursor_defaults,
+            style="Secondary.TButton",
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(
+            actions_box,
+            text="Apply Profile",
+            command=self.apply_wrist_cursor_profile,
+            style="Accent.TButton",
+        ).grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(
+            actions_box,
+            text="Activate Profile",
+            command=self.activate_wrist_cursor_profile,
+            style="Accent.TButton",
+        ).grid(row=0, column=2, sticky="ew", padx=4)
+        ttk.Button(
+            actions_box,
+            text="Reload From Profile",
+            command=self._load_wrist_cursor_profile_into_vars,
+            style="Secondary.TButton",
+        ).grid(row=0, column=3, sticky="ew", padx=(4, 0))
+        ttk.Label(actions_box, textvariable=self.wrist_cursor_summary_var, wraplength=920).grid(
+            row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0)
+        )
+
+    def reset_wrist_cursor_defaults(self) -> None:
+        self.wrist_cursor_x_axis_var.set("z")
+        self.wrist_cursor_y_axis_var.set("x")
+        self.wrist_cursor_speed_x_var.set("12")
+        self.wrist_cursor_speed_y_var.set("12")
+        self.wrist_cursor_deadband_var.set("2.0")
+        self.wrist_cursor_smoothing_var.set("0.18")
+        self.wrist_cursor_y_neutral_var.set("0.0")
+        self.wrist_cursor_invert_x_var.set(True)
+        self.wrist_cursor_invert_y_var.set(True)
+        self.wrist_cursor_status_var.set("Loaded TechTalkies-style defaults into the Wrist Cursor form.")
+
+    def _wrist_cursor_profile_rule(self) -> MappingRule | None:
+        profile = next((item for item in self.input_mapper.config.profiles if item.name == WRIST_CURSOR_PROFILE_NAME), None)
+        if profile is None:
+            return None
+        return next((item for item in profile.mappings if item.id == "wrist_cursor_follow_gyro"), None)
+
+    def _wrist_cursor_axes(self) -> tuple[str, str]:
+        x_axis = self.wrist_cursor_x_axis_var.get().strip().lower()
+        y_axis = self.wrist_cursor_y_axis_var.get().strip().lower()
+        if x_axis not in {"x", "y", "z"}:
+            x_axis = "z"
+        if y_axis not in {"x", "y", "z"}:
+            y_axis = "x"
+        return x_axis, y_axis
+
+    def _wrist_cursor_profile_active(self) -> bool:
+        return self.input_mapper.config.active_profile == WRIST_CURSOR_PROFILE_NAME
+
+    def _start_wrist_cursor_auto_calibration(self, now_s: float) -> None:
+        self.wrist_cursor_auto_calibration_phase = "calibrating"
+        self.wrist_cursor_auto_calibration_started_s = now_s
+        self.wrist_cursor_auto_calibration_samples_x = []
+        self.wrist_cursor_auto_calibration_samples_y = []
+        self.wrist_cursor_status_var.set("Wristband connected. Keep still for 3 seconds to calibrate the wrist cursor.")
+
+    def _maybe_update_wrist_cursor_connection_state(self, serial_state: dict[str, Any], now_s: float) -> None:
+        devices = serial_state.get("devices", {}) if isinstance(serial_state, dict) else {}
+        wrist = devices.get("wristband", {}) if isinstance(devices, dict) else {}
+        status = str(wrist.get("status", "")).strip().lower() if isinstance(wrist, dict) else ""
+        connected = status not in {"", "not_connected", "disconnected", "tbd", "offline"}
+        if connected and not self.wrist_cursor_wristband_connected:
+            self.wrist_cursor_wristband_connected = True
+            self._start_wrist_cursor_auto_calibration(now_s)
+        elif not connected and self.wrist_cursor_wristband_connected:
+            self.wrist_cursor_wristband_connected = False
+            self.wrist_cursor_auto_calibration_phase = "idle"
+            self.wrist_cursor_auto_calibration_samples_x = []
+            self.wrist_cursor_auto_calibration_samples_y = []
+
+    def _update_wrist_cursor_auto_calibration(self, serial_state: dict[str, Any], now_s: float) -> None:
+        if self.wrist_cursor_auto_calibration_phase != "calibrating":
+            return
+        devices = serial_state.get("devices", {}) if isinstance(serial_state, dict) else {}
+        wrist = devices.get("wristband", {}) if isinstance(devices, dict) else {}
+        gyro = wrist.get("gyro", {}) if isinstance(wrist, dict) else {}
+        if not isinstance(gyro, dict):
+            return
+        x_axis, y_axis = self._wrist_cursor_axes()
+        try:
+            x_value = float(gyro.get(x_axis))
+            y_value = float(gyro.get(y_axis))
+        except (TypeError, ValueError):
+            return
+        self.wrist_cursor_auto_calibration_samples_x.append(x_value)
+        self.wrist_cursor_auto_calibration_samples_y.append(y_value)
+        remaining_s = max(0.0, 3.0 - (now_s - self.wrist_cursor_auto_calibration_started_s))
+        self.wrist_cursor_status_var.set(f"Calibrating wrist cursor neutral. Keep still for {remaining_s:.1f}s.")
+        if remaining_s > 0.0:
+            return
+        x_neutral = sum(self.wrist_cursor_auto_calibration_samples_x) / max(1, len(self.wrist_cursor_auto_calibration_samples_x))
+        y_neutral = sum(self.wrist_cursor_auto_calibration_samples_y) / max(1, len(self.wrist_cursor_auto_calibration_samples_y))
+        rule = self._wrist_cursor_profile_rule()
+        if rule is None:
+            profile = next((item for item in self.input_mapper.config.profiles if item.name == WRIST_CURSOR_PROFILE_NAME), None)
+            if profile is None:
+                profile = wrist_cursor_profile()
+                self.input_mapper.config.profiles.append(profile)
+            if not profile.mappings:
+                profile.mappings = wrist_cursor_profile().mappings
+            rule = profile.mappings[0]
+        rule.action.speed_x_offset = x_neutral
+        rule.action.speed_y_offset = y_neutral
+        self.wrist_cursor_y_neutral_var.set(f"{y_neutral:.3f}".rstrip("0").rstrip(".") or "0")
+        save_mapping_config(self.input_mapper.config, self.mapping_config_path)
+        self._refresh_mapping_profile_combo()
+        self._refresh_mapping_table()
+        self.wrist_cursor_auto_calibration_phase = "ready"
+        self.wrist_cursor_summary_var.set(
+            f"Auto-calibrated neutral: x offset {x_neutral:.2f}, y offset {y_neutral:.2f}"
+        )
+        self.wrist_cursor_status_var.set("Wrist cursor calibrated. You can move now.")
+
+    def _wrist_cursor_output_suppressed(self) -> bool:
+        return self._wrist_cursor_profile_active() and self.wrist_cursor_auto_calibration_phase == "calibrating"
+
+    def _update_wrist_cursor_gesture_state(self, snapshot: dict[str, Any], now_s: float) -> dict[str, Any]:
+        input_dict = snapshot.get("input_dict", {}) if isinstance(snapshot, dict) else {}
+        hands = snapshot.get("hand_state", {}) if isinstance(snapshot, dict) else {}
+        right = hands.get("right", {}) if isinstance(hands, dict) else {}
+        left = hands.get("left", {}) if isinstance(hands, dict) else {}
+        right_z = input_dict.get("right_hand_z_mm") if isinstance(input_dict, dict) else None
+        enabled = isinstance(right_z, (int, float)) and float(right_z) < self.wrist_cursor_click_distance_mm
+
+        right_gesture = str(right.get("gesture", "") or "")
+        left_gesture = str(left.get("gesture", "") or "")
+        left_click = False
+        right_click = False
+
+        if not enabled:
+            self.wrist_cursor_right_phase = "idle"
+            self.wrist_cursor_right_fist_started_s = None
+            self.wrist_cursor_right_hold_active = False
+            self.wrist_cursor_left_phase = "idle"
+            self.wrist_cursor_left_fist_started_s = None
+        else:
+            if self.wrist_cursor_right_phase == "idle":
+                if right_gesture == "open_palm":
+                    self.wrist_cursor_right_phase = "armed"
+            elif self.wrist_cursor_right_phase == "armed":
+                if right_gesture == "closed_fist":
+                    self.wrist_cursor_right_phase = "pressing"
+                    self.wrist_cursor_right_fist_started_s = now_s
+                    self.wrist_cursor_right_hold_active = False
+                elif right_gesture != "open_palm":
+                    self.wrist_cursor_right_phase = "idle"
+            elif self.wrist_cursor_right_phase == "pressing":
+                if right_gesture == "closed_fist":
+                    fist_started = self.wrist_cursor_right_fist_started_s or now_s
+                    if now_s - fist_started >= self.wrist_cursor_hold_activate_s:
+                        self.wrist_cursor_right_hold_active = True
+                elif right_gesture == "open_palm":
+                    fist_started = self.wrist_cursor_right_fist_started_s or now_s
+                    held_s = now_s - fist_started
+                    if held_s <= self.wrist_cursor_tap_max_s and not self.wrist_cursor_right_hold_active:
+                        left_click = True
+                    self.wrist_cursor_right_phase = "armed"
+                    self.wrist_cursor_right_fist_started_s = None
+                    self.wrist_cursor_right_hold_active = False
+                else:
+                    self.wrist_cursor_right_phase = "idle"
+                    self.wrist_cursor_right_fist_started_s = None
+                    self.wrist_cursor_right_hold_active = False
+
+            if self.wrist_cursor_left_phase == "idle":
+                if left_gesture == "open_palm":
+                    self.wrist_cursor_left_phase = "armed"
+            elif self.wrist_cursor_left_phase == "armed":
+                if left_gesture == "closed_fist":
+                    self.wrist_cursor_left_phase = "pressing"
+                    self.wrist_cursor_left_fist_started_s = now_s
+                elif left_gesture != "open_palm":
+                    self.wrist_cursor_left_phase = "idle"
+            elif self.wrist_cursor_left_phase == "pressing":
+                if left_gesture == "open_palm":
+                    fist_started = self.wrist_cursor_left_fist_started_s or now_s
+                    held_s = now_s - fist_started
+                    if held_s <= self.wrist_cursor_tap_max_s:
+                        right_click = True
+                    self.wrist_cursor_left_phase = "armed"
+                    self.wrist_cursor_left_fist_started_s = None
+                elif left_gesture != "closed_fist":
+                    self.wrist_cursor_left_phase = "idle"
+                    self.wrist_cursor_left_fist_started_s = None
+
+        state = {
+            "enabled": bool(enabled),
+            "left_click": left_click,
+            "left_hold": bool(enabled and self.wrist_cursor_right_hold_active),
+            "right_click": right_click,
+        }
+        snapshot["wrist_cursor_state"] = state
+        return state
+
+    def _load_wrist_cursor_profile_into_vars(self) -> None:
+        rule = self._wrist_cursor_profile_rule()
+        if rule is None:
+            self.reset_wrist_cursor_defaults()
+            self.wrist_cursor_summary_var.set("Wrist Cursor profile not found yet. Defaults loaded.")
+            return
+        x_source = str(rule.action.speed_x_source or "wristband.gyro_z")
+        y_source = str(rule.action.speed_y_source or "wristband.gyro_x")
+        self.wrist_cursor_x_axis_var.set(x_source.rsplit("_", 1)[-1] if "_" in x_source else "z")
+        self.wrist_cursor_y_axis_var.set(y_source.rsplit("_", 1)[-1] if "_" in y_source else "x")
+        self.wrist_cursor_speed_x_var.set(f"{abs(float(rule.action.speed_x)):.3f}".rstrip("0").rstrip("."))
+        self.wrist_cursor_speed_y_var.set(f"{abs(float(rule.action.speed_y)):.3f}".rstrip("0").rstrip("."))
+        self.wrist_cursor_deadband_var.set(f"{float(rule.action.move_deadband):.3f}".rstrip("0").rstrip("."))
+        self.wrist_cursor_smoothing_var.set(f"{float(rule.action.move_smoothing_alpha):.3f}".rstrip("0").rstrip("."))
+        self.wrist_cursor_y_neutral_var.set(f"{float(rule.action.speed_y_offset):.3f}".rstrip("0").rstrip(".") or "0")
+        self.wrist_cursor_invert_x_var.set(float(rule.action.speed_x) < 0.0)
+        self.wrist_cursor_invert_y_var.set(float(rule.action.speed_y) < 0.0)
+        self.wrist_cursor_auto_calibration_phase = "idle"
+        self.wrist_cursor_summary_var.set(
+            f"Loaded profile: x={rule.action.speed_x_source} gain {rule.action.speed_x:.2f}, "
+            f"y={rule.action.speed_y_source} gain {rule.action.speed_y:.2f}, neutral {rule.action.speed_y_offset:.2f}"
+        )
+
+    def apply_wrist_cursor_profile(self) -> bool:
+        try:
+            speed_x = max(0.1, abs(float(self.wrist_cursor_speed_x_var.get())))
+            speed_y = max(0.1, abs(float(self.wrist_cursor_speed_y_var.get())))
+            deadband = max(0.0, float(self.wrist_cursor_deadband_var.get()))
+            smoothing = max(0.01, min(1.0, float(self.wrist_cursor_smoothing_var.get())))
+            y_neutral = float(self.wrist_cursor_y_neutral_var.get())
+        except ValueError:
+            self.wrist_cursor_status_var.set("Wrist Cursor settings must be numeric.")
+            return False
+
+        x_axis = self.wrist_cursor_x_axis_var.get().strip().lower()
+        y_axis = self.wrist_cursor_y_axis_var.get().strip().lower()
+        if x_axis not in {"x", "y", "z"} or y_axis not in {"x", "y", "z"}:
+            self.wrist_cursor_status_var.set("Choose gyro axes from x, y, or z.")
+            return False
+
+        profile = next((item for item in self.input_mapper.config.profiles if item.name == WRIST_CURSOR_PROFILE_NAME), None)
+        if profile is None:
+            profile = wrist_cursor_profile()
+            self.input_mapper.config.profiles.append(profile)
+        if not profile.mappings:
+            profile.mappings = wrist_cursor_profile().mappings
+        rule = next((item for item in profile.mappings if item.id == "wrist_cursor_follow_gyro"), None)
+        if rule is None:
+            rule = wrist_cursor_profile().mappings[0]
+            profile.mappings = [rule]
+
+        rule.source = "wristband.sequence"
+        rule.comparator = "present"
+        rule.action.type = "mouse_move"
+        rule.action.speed_x_source = f"wristband.gyro_{x_axis}"
+        rule.action.speed_y_source = f"wristband.gyro_{y_axis}"
+        rule.action.speed_x = -speed_x if self.wrist_cursor_invert_x_var.get() else speed_x
+        rule.action.speed_y = -speed_y if self.wrist_cursor_invert_y_var.get() else speed_y
+        rule.action.speed_x_offset = 0.0
+        rule.action.speed_y_offset = y_neutral
+        rule.action.move_deadband = deadband
+        rule.action.move_smoothing_alpha = smoothing
+
+        save_mapping_config(self.input_mapper.config, self.mapping_config_path)
+        self._refresh_mapping_profile_combo()
+        self._refresh_mapping_table()
+        self.wrist_cursor_status_var.set("Saved the Wrist Cursor gyro profile.")
+        self.wrist_cursor_summary_var.set(
+            f"Saved x={rule.action.speed_x_source} gain {rule.action.speed_x:.2f}, "
+            f"y={rule.action.speed_y_source} gain {rule.action.speed_y:.2f}, "
+            f"y neutral={y_neutral:.2f}, deadband={deadband:.2f}, smoothing={smoothing:.2f}"
+        )
+        self.wrist_cursor_auto_calibration_phase = "idle"
+        return True
+
+    def activate_wrist_cursor_profile(self) -> None:
+        if not self.apply_wrist_cursor_profile():
+            return
+        self.input_mapper.config.active_profile = WRIST_CURSOR_PROFILE_NAME
+        self.mapping_profile_var.set(WRIST_CURSOR_PROFILE_NAME)
+        self.input_mapper.set_active_profile(WRIST_CURSOR_PROFILE_NAME)
+        self.mapping_enabled_var.set(True)
+        self.input_mapper.set_enabled(True)
+        save_mapping_config(self.input_mapper.config, self.mapping_config_path)
+        self._refresh_mapping_profile_combo()
+        self._refresh_mapping_table()
+        self.wrist_cursor_status_var.set("Activated the Wrist Cursor profile.")
 
     def _build_visualiser_page(self, page: ttk.Frame) -> None:
         self._build_page_header(page, "Visualiser", "Live three-second wristband IMU history.")
@@ -2147,6 +3835,26 @@ class AirTrixxGUI:
             self._update_wristband_capture_count()
         self._draw_wristband_capture_timer()
         self._sync_wristband_controls()
+
+    def _update_wrist_cursor_live_view(self, serial_state: dict[str, Any]) -> None:
+        sample = extract_wristband_imu_sample(serial_state, label="")
+        if sample is None:
+            self.wrist_cursor_live_var.set("Waiting for wristband gyro data.")
+            return
+        x_axis = self.wrist_cursor_x_axis_var.get().strip().lower() or "z"
+        y_axis = self.wrist_cursor_y_axis_var.get().strip().lower() or "x"
+        axis_values = {
+            "x": float(sample["gyroX"]),
+            "y": float(sample["gyroY"]),
+            "z": float(sample["gyroZ"]),
+        }
+        horizontal = axis_values.get(x_axis, axis_values["z"])
+        vertical = axis_values.get(y_axis, axis_values["x"])
+        self.wrist_cursor_live_var.set(
+            "Gyro live: "
+            f"x={axis_values['x']:.2f} dps, y={axis_values['y']:.2f} dps, z={axis_values['z']:.2f} dps | "
+            f"cursor inputs -> horizontal {x_axis}:{horizontal:.2f}, vertical {y_axis}:{vertical:.2f}"
+        )
 
     def _ensure_keyboard_typing_mapping(self, *, save: bool) -> None:
         profile = self.input_mapper.config.active()
@@ -3967,6 +5675,12 @@ class AirTrixxGUI:
         scroll_y_var = tk.StringVar(value=str(working.action.scroll_y))
         speed_x_var = tk.StringVar(value=str(working.action.speed_x))
         speed_y_var = tk.StringVar(value=str(working.action.speed_y))
+        speed_x_source_var = tk.StringVar(value=working.action.speed_x_source)
+        speed_y_source_var = tk.StringVar(value=working.action.speed_y_source)
+        speed_x_offset_var = tk.StringVar(value=str(working.action.speed_x_offset))
+        speed_y_offset_var = tk.StringVar(value=str(working.action.speed_y_offset))
+        move_deadband_var = tk.StringVar(value=str(working.action.move_deadband))
+        move_smoothing_alpha_var = tk.StringVar(value=str(working.action.move_smoothing_alpha))
         absolute_x_var = tk.StringVar(value=str(working.action.absolute_x))
         absolute_y_var = tk.StringVar(value=str(working.action.absolute_y))
         absolute_x_source_var = tk.StringVar(value=working.action.absolute_x_source)
@@ -4146,6 +5860,27 @@ class AirTrixxGUI:
         add_label(row, "Move Y px/s", 2)
         ttk.Entry(frame, textvariable=speed_y_var, width=18).grid(row=row, column=3, sticky="ew", pady=4)
         row += 1
+        add_label(row, "Move X source")
+        ttk.Combobox(frame, textvariable=speed_x_source_var, values=source_options).grid(
+            row=row, column=1, sticky="ew", pady=4
+        )
+        add_label(row, "Move Y source", 2)
+        ttk.Combobox(frame, textvariable=speed_y_source_var, values=source_options).grid(
+            row=row, column=3, sticky="ew", pady=4
+        )
+        row += 1
+        add_label(row, "Move deadband")
+        ttk.Entry(frame, textvariable=move_deadband_var, width=18).grid(row=row, column=1, sticky="ew", pady=4)
+        add_label(row, "Move smoothing", 2)
+        ttk.Entry(frame, textvariable=move_smoothing_alpha_var, width=18).grid(
+            row=row, column=3, sticky="ew", pady=4
+        )
+        row += 1
+        add_label(row, "Move X offset")
+        ttk.Entry(frame, textvariable=speed_x_offset_var, width=18).grid(row=row, column=1, sticky="ew", pady=4)
+        add_label(row, "Move Y offset", 2)
+        ttk.Entry(frame, textvariable=speed_y_offset_var, width=18).grid(row=row, column=3, sticky="ew", pady=4)
+        row += 1
         add_label(row, "Absolute X")
         ttk.Entry(frame, textvariable=absolute_x_var, width=18).grid(row=row, column=1, sticky="ew", pady=4)
         add_label(row, "Absolute Y", 2)
@@ -4283,6 +6018,12 @@ class AirTrixxGUI:
                     "scroll_y": scroll_y_var.get(),
                     "speed_x": speed_x_var.get(),
                     "speed_y": speed_y_var.get(),
+                    "speed_x_source": speed_x_source_var.get().strip(),
+                    "speed_y_source": speed_y_source_var.get().strip(),
+                    "speed_x_offset": speed_x_offset_var.get(),
+                    "speed_y_offset": speed_y_offset_var.get(),
+                    "move_deadband": move_deadband_var.get(),
+                    "move_smoothing_alpha": move_smoothing_alpha_var.get(),
                     "absolute_x": absolute_x_var.get(),
                     "absolute_y": absolute_y_var.get(),
                     "absolute_x_source": absolute_x_source_var.get().strip(),
@@ -4582,12 +6323,16 @@ class AirTrixxGUI:
         page.tkraise()
         for name, button in self.nav_buttons.items():
             button.configure(style="NavActive.TButton" if name == page_name else "Nav.TButton")
-        if page_name in {"Dashboard", "Signals", "Keyboard", "Wristband", "Mappings", "Testing", "Data / Logs"}:
+        if page_name in {"Dashboard", "Signals", "Keyboard", "Wristband", "Wrist Cursor", "Mappings", "Testing", "Data / Logs"}:
             self._schedule_text_update(10)
         if page_name == "Camera & Servo":
             self._update_preview(force=True)
         if page_name == "Visualiser":
             self._draw_wristband_visualizer()
+        if page_name == "Wristband":
+            self._draw_wrist_mouse_calibration_pattern()
+        if page_name == "Wrist Cursor":
+            self._load_wrist_cursor_profile_into_vars()
 
     def _register_scroll_target(self, widget: tk.Widget, target: tk.Widget) -> None:
         self._scroll_targets[str(widget)] = target
@@ -6005,6 +7750,7 @@ class AirTrixxGUI:
             self.audio_dock_bridge.disconnect()
         self._sync_audio_dock_controls()
         serial_state = self._serial_state_with_audio_dock_overlay(self.serial_bridge.get_latest_state())
+        self._maybe_update_wrist_cursor_connection_state(serial_state, time.monotonic())
         camera_centering_claimed_servo = False
         if self.centering_bracket is None and self.camera_centering_active:
             camera_centering_claimed_servo = self._update_camera_centering()
@@ -6013,8 +7759,13 @@ class AirTrixxGUI:
         if self.centering_bracket is None and not camera_centering_claimed_servo and not self.hand_calibration_active:
             self.servo_controller.send_for_hands(hands, serial_state)
         now_s = time.monotonic()
+        self._update_wrist_cursor_auto_calibration(serial_state, now_s)
         if self.wristband_visualizer_capture_phase in {"ready", "capturing"}:
             self._update_wristband_visualizer_capture(now_s)
+        if self.wrist_mouse_calibration_phase in {"ready", "capturing"}:
+            self._update_wrist_mouse_calibration_capture(now_s)
+        if self.wrist_camera_alignment_phase in {"ready", "capturing"}:
+            self._update_wrist_camera_alignment_capture(now_s)
         wristband_states = self.serial_bridge.drain_wristband_states()
         if not wristband_states:
             wristband_states = [serial_state]
@@ -6022,6 +7773,8 @@ class AirTrixxGUI:
             wristband_state = self._serial_state_with_audio_dock_overlay(wristband_state)
             if self.active_page == "Visualiser" or self.wristband_visualizer_capture_phase == "capturing":
                 self._add_wristband_visualizer_state(wristband_state)
+            if self.wrist_mouse_calibration_phase == "capturing":
+                self._add_wrist_mouse_calibration_state(wristband_state)
             wrist_rule_state_before = self.wrist_rule_detector.state
             wrist_rule_event = self.wrist_rule_detector.process_serial_state(wristband_state, now_s=now_s)
             if self.wrist_rule_logger.record(
@@ -6054,12 +7807,20 @@ class AirTrixxGUI:
         )
         self._apply_audio_dock_snapshot_fields(self._latest_snapshot)
         self._latest_snapshot["face_state"] = self.hand_tracker.get_latest_face()
+        self._update_wrist_cursor_gesture_state(self._latest_snapshot, now_s)
         self._latest_snapshot["_signal_sequence"] = self._mapping_signal_sequence(self._latest_snapshot)
+        if self.wrist_camera_alignment_phase == "capturing":
+            self._add_wrist_camera_alignment_sample(self._latest_snapshot, now_s)
         self.keyboard_bridge.tick(now_s=now_s)
         if self.keyboard_training_timer_active:
             self._update_keyboard_training_timer(now_s)
         testing_suppressed = bool(self.testing_active and self.testing_output_suppressed_var.get())
-        mapper_suppressed = self._focus_is_text_input() or self.mapping_recording_shortcut or testing_suppressed
+        mapper_suppressed = (
+            self._focus_is_text_input()
+            or self.mapping_recording_shortcut
+            or testing_suppressed
+            or self._wrist_cursor_output_suppressed()
+        )
         try:
             if self.serial_bridge.is_connected or self.keyboard_bridge.source_ready:
                 self.input_mapper.process(self._latest_snapshot, now_s, suppress_output=mapper_suppressed)
@@ -6591,6 +8352,9 @@ class AirTrixxGUI:
         if page == "Wristband":
             self._update_wristband_live_view(serial_state)
             return
+        if page == "Wrist Cursor":
+            self._update_wrist_cursor_live_view(serial_state)
+            return
         if page == "Mappings":
             self._update_mapping_live_views()
             return
@@ -6984,6 +8748,7 @@ class AirTrixxGUI:
             tuple((key, input_dict.get(key)) for key in FIELD_ORDER) if isinstance(input_dict, dict) else (),
             repr(hands),
             repr(face),
+            repr(snapshot.get("wrist_cursor_state")),
         )
 
     def _apply_runtime_performance_settings(self) -> None:

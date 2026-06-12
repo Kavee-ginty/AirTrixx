@@ -23,12 +23,14 @@ from input_mapper import (
     SignalCatalog,
     TAB_SWITCH_PROFILE_NAME,
     VIEWER_3D_PROFILE_NAME,
+    WRISTBAND_MOUSE_CURSOR_PROFILE_NAME,
     default_mapping_config,
     evaluate_condition,
     load_mapping_config,
     save_mapping_config,
     gta_vice_city_profile,
     viewer_3d_profile,
+    wristband_mouse_cursor_profile,
     wrist_tab_switching_profile,
 )
 
@@ -245,6 +247,41 @@ class InputMapperRuntimeTests(unittest.TestCase):
         mapper.process(snapshot(a=True), 0.0)
         mapper.process(snapshot(a=True), 0.1)
         self.assertEqual(backend.events, [("move", 10, -5)])
+
+    def test_mouse_move_can_follow_live_signal_sources_with_deadband_and_low_pass(self) -> None:
+        rule = MappingRule(
+            source="wristband.sequence",
+            comparator="present",
+            action=MappingAction(
+                type="mouse_move",
+                speed_x=100.0,
+                speed_y=-200.0,
+                speed_x_source="wristband.calibrated_accel_x",
+                speed_y_source="wristband.calibrated_accel_y",
+                move_deadband=0.5,
+                move_smoothing_alpha=0.5,
+            ),
+        )
+        mapper, backend = self.mapper_with([rule])
+        mapper.process(
+            {"raw_device_state": {"devices": {"wristband": {"sequence": 1, "calibrated_accel": {"x": 1.0, "y": 0.0}}}}},
+            0.0,
+        )
+        mapper.process(
+            {"raw_device_state": {"devices": {"wristband": {"sequence": 2, "calibrated_accel": {"x": 0.2, "y": 0.2}}}}},
+            0.1,
+        )
+        mapper.process(
+            {"raw_device_state": {"devices": {"wristband": {"sequence": 3, "calibrated_accel": {"x": 1.0, "y": 1.0}}}}},
+            0.2,
+        )
+        self.assertEqual(
+            backend.events,
+            [
+                ("move", 5, 0),
+                ("move", 7, -10),
+            ],
+        )
 
     def test_switch_tabs_mapping_uses_relative_z_change_and_releases_alt(self) -> None:
         rules = [
@@ -476,6 +513,21 @@ class InputMapperRuntimeTests(unittest.TestCase):
 
         self.assertEqual(signals["fused.model_value"].value, "flick")
 
+    def test_signal_catalog_exposes_calibrated_wrist_accel(self) -> None:
+        signals = SignalCatalog.flatten(
+            {
+                "raw_device_state": {
+                    "devices": {
+                        "wristband": {
+                            "calibrated_accel": {"x": 1.5, "y": -0.5, "z": 0.25},
+                        }
+                    }
+                }
+            }
+        )
+        self.assertEqual(signals["wristband.calibrated_accel_x"].value, 1.5)
+        self.assertEqual(signals["wristband.calibrated_accel_y"].value, -0.5)
+
     def test_keyboard_text_action_types_live_signal_value(self) -> None:
         rule = MappingRule(
             source="keyboard.input",
@@ -534,6 +586,28 @@ class MappingConfigTests(unittest.TestCase):
         self.assertIn(TAB_SWITCH_PROFILE_NAME, config.profile_names())
         self.assertIn(GTA_VICE_CITY_PROFILE_NAME, config.profile_names())
         self.assertIn(VIEWER_3D_PROFILE_NAME, config.profile_names())
+        self.assertIn(WRISTBAND_MOUSE_CURSOR_PROFILE_NAME, config.profile_names())
+
+    def test_wristband_mouse_cursor_profile_uses_calibrated_accel_follow_rule(self) -> None:
+        profile = wristband_mouse_cursor_profile()
+        self.assertEqual(len(profile.mappings), 1)
+        rule = profile.mappings[0]
+        self.assertEqual(rule.id, "wrist_mouse_follow_accel")
+        self.assertEqual(rule.source, "wristband.sequence")
+        self.assertEqual(rule.action.speed_x_source, "wristband.calibrated_accel_x")
+        self.assertEqual(rule.action.speed_y_source, "wristband.calibrated_accel_y")
+        self.assertGreater(rule.action.move_deadband, 0.0)
+        self.assertLess(rule.action.move_smoothing_alpha, 1.0)
+
+    def test_load_config_merges_missing_builtin_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "input_mappings.json"
+            config = MappingConfig(profiles=[MappingProfile(name="Custom")], active_profile="Custom")
+            save_mapping_config(config, path)
+            loaded, error = load_mapping_config(path)
+            self.assertIsNone(error)
+            self.assertIn("Custom", loaded.profile_names())
+            self.assertIn(WRISTBAND_MOUSE_CURSOR_PROFILE_NAME, loaded.profile_names())
 
     def test_gta_profile_uses_wrist_rules_for_weapon_swaps(self) -> None:
         rules = {rule.id: rule for rule in gta_vice_city_profile().mappings}
