@@ -150,6 +150,10 @@ unsigned long lastAirTrixxReportMs = 0;
 unsigned long lastAirTrixxBatteryReportMs = 0;
 bool airTrixxBatteryReportSent = false;
 volatile bool airTrixxRecalibrationRequested = false;
+bool airTrixxWirelessReady = false;
+volatile bool airTrixxStartupBeaconActive = false;
+volatile int startupRawMM[NUM_SENSORS] = {-1, -1, -1, -1};
+volatile bool startupRawValid[NUM_SENSORS] = {false, false, false, false};
 
 // Exact horizontal key centers measured from sensors on the right side.
 // Distance starts at P/L/Backspace/Return and increases toward the left side.
@@ -180,6 +184,7 @@ ChannelMap keyMaps[] = {
 
 void printChannelMappings();
 void printDetectionLimits();
+void sendAirTrixxKeyboardTof(int rawMM[], bool rawValid[]);
 void sendAirTrixxKeyboardBattery(bool force = false);
 
 // ============================================================
@@ -278,7 +283,19 @@ void sortValues(int v[], int n) {
 bool readTrimmedAverage(uint8_t ch, int &avgMM, int samples, int &valid) {
   int values[CALIBRATION_SAMPLES];
   valid = 0;
-  for (int i = 0; i < samples; i++) { int d; if (readRaw(ch, d)) values[valid++] = d; delay(2); }
+  for (int i = 0; i < samples; i++) {
+    int d;
+    bool readingValid = readRaw(ch, d);
+    if (readingValid) values[valid++] = d;
+    for (uint8_t sensor = 0; sensor < NUM_KEY_MAPS; sensor++) {
+      if (keyMaps[sensor].ch == ch) {
+        startupRawMM[sensor] = readingValid ? d : -1;
+        startupRawValid[sensor] = readingValid;
+        break;
+      }
+    }
+    delay(2);
+  }
   if (valid < (samples/2 + 1)) return false;
   sortValues(values, valid);
   int start = valid >= 5 ? 1 : 0, end = valid >= 5 ? valid-1 : valid;
@@ -549,7 +566,15 @@ void calibrateDetectionLimits() {
   Serial.print("Starting in ");
   Serial.print(COVER_CALIBRATION_WAIT_MS / 1000);
   Serial.println(" seconds...");
-  delay(COVER_CALIBRATION_WAIT_MS);
+  unsigned long waitStartedMs = millis();
+  while (millis() - waitStartedMs < COVER_CALIBRATION_WAIT_MS) {
+    for (uint8_t i = 0; i < NUM_KEY_MAPS; i++) {
+      int rawMM = -1;
+      startupRawValid[i] = readRaw(keyMaps[i].ch, rawMM);
+      startupRawMM[i] = startupRawValid[i] ? rawMM : -1;
+    }
+    delay(2);
+  }
 
   for (uint8_t i = 0; i < NUM_KEY_MAPS; i++) {
     uint8_t ch = keyMaps[i].ch;
@@ -584,7 +609,15 @@ void calibrateIdleBackground() {
   Serial.print("Starting in ");
   Serial.print(IDLE_CALIBRATION_WAIT_MS / 1000);
   Serial.println(" seconds...");
-  delay(IDLE_CALIBRATION_WAIT_MS);
+  unsigned long waitStartedMs = millis();
+  while (millis() - waitStartedMs < IDLE_CALIBRATION_WAIT_MS) {
+    for (uint8_t i = 0; i < NUM_KEY_MAPS; i++) {
+      int rawMM = -1;
+      startupRawValid[i] = readRaw(keyMaps[i].ch, rawMM);
+      startupRawMM[i] = startupRawValid[i] ? rawMM : -1;
+    }
+    delay(2);
+  }
 
   for (uint8_t i = 0; i < NUM_KEY_MAPS; i++) {
     uint8_t ch = keyMaps[i].ch;
@@ -731,19 +764,20 @@ void initAirTrixxWireless() {
   esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
 
-  uint8_t mac[6] = {};
-  WiFi.macAddress(mac);
-  Serial.print("[KEYBOARD] WiFi STA MAC=");
-  printMacAddress(mac);
-  Serial.print(", channel=");
-  Serial.println(ESPNOW_CHANNEL);
-
   if (esp_now_init() != ESP_OK) {
     Serial.println("[KEYBOARD] ESP-NOW init failed");
     return;
   }
   esp_now_register_recv_cb(onAirTrixxDataRecv);
   addAirTrixxPeer(ANTENNA_MAC_PLACEHOLDER);
+  airTrixxWirelessReady = true;
+
+  uint8_t mac[6] = {};
+  WiFi.macAddress(mac);
+  Serial.print("[KEYBOARD] WiFi STA MAC=");
+  printMacAddress(mac);
+  Serial.print(", channel=");
+  Serial.println(ESPNOW_CHANNEL);
 }
 
 void sendAirTrixxKeyboardTof(int rawMM[], bool rawValid[]) {
@@ -772,6 +806,26 @@ void sendAirTrixxKeyboardTof(int rawMM[], bool rawValid[]) {
   packet.valid_3 = rawValid[2] ? 1 : 0;
   packet.valid_4 = rawValid[3] ? 1 : 0;
   esp_now_send(ANTENNA_MAC_PLACEHOLDER, reinterpret_cast<uint8_t *>(&packet), sizeof(packet));
+}
+
+void airTrixxStartupBeaconTask(void *parameter) {
+  (void)parameter;
+  while (airTrixxStartupBeaconActive) {
+    int rawMM[NUM_SENSORS];
+    bool rawValid[NUM_SENSORS];
+    for (uint8_t i = 0; i < NUM_SENSORS; ++i) {
+      rawMM[i] = startupRawMM[i];
+      rawValid[i] = startupRawValid[i];
+    }
+    sendAirTrixxKeyboardTof(rawMM, rawValid);
+    delay(200);
+  }
+  vTaskDelete(nullptr);
+}
+
+void startAirTrixxStartupBeacon() {
+  airTrixxStartupBeaconActive = true;
+  xTaskCreate(airTrixxStartupBeaconTask, "keyboard_beacon", 3072, nullptr, 1, nullptr);
 }
 
 void sendAirTrixxKeyboardBattery(bool force) {
@@ -810,11 +864,15 @@ void sendAirTrixxKeyboardBattery(bool force) {
 // ============================================================
 void setup() {
   Serial.begin(115200);
-  delay(2000);
+  Serial.setTxTimeoutMs(10);
+  delay(20);
+  initAirTrixxWireless();
+  startAirTrixxStartupBeacon();
   Serial.print("I2C SDA="); Serial.print(I2C_SDA_PIN); Serial.print(" SCL="); Serial.println(I2C_SCL_PIN);
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(100000);
   setupKeyboardBatterySense();
+  sendAirTrixxKeyboardBattery(true);
   printChannelMappings();
   for (uint8_t i = 0; i < NUM_KEY_MAPS; i++) {
     uint8_t ch = keyMaps[i].ch;
@@ -841,8 +899,7 @@ void setup() {
     lox[i].setMeasurementTimingBudgetMicroSeconds(MEASUREMENT_BUDGET_US);
   }
   calibrateSensors();
-  initAirTrixxWireless();
-  sendAirTrixxKeyboardBattery(true);
+  airTrixxStartupBeaconActive = false;
 }
 
 // ============================================================

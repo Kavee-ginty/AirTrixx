@@ -1062,8 +1062,7 @@ class AirTrixxGUI:
             if value is not None:
                 merged_tof[key] = value
         for key, value in bridge_valid.items():
-            if value:
-                merged_valid[key] = value
+            merged_valid[key] = bool(value)
         state.update({key: value for key, value in bridge_state.items() if key not in {"tof", "valid"}})
         state["tof"] = merged_tof
         state["valid"] = merged_valid
@@ -6023,6 +6022,8 @@ class AirTrixxGUI:
             self.audio_dock_bridge.disconnect()
         self._sync_audio_dock_controls()
         serial_state = self._serial_state_with_audio_dock_overlay(self.serial_bridge.get_latest_state())
+        if self.active_page in {"Keyboard", "Signals"}:
+            self._update_keyboard_grid(serial_state)
         camera_centering_claimed_servo = False
         if self.centering_bracket is None and self.camera_centering_active:
             camera_centering_claimed_servo = self._update_camera_centering()
