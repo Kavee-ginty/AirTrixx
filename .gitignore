@@ -35,3 +35,7 @@ packaging/*.exe
 Thumbs.db
 .vscode/
 .idea/
+
+# textBuilds
+dist-dashboard-battery/
+dist-ui-refresh/
