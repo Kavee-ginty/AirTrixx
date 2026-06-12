@@ -860,6 +860,8 @@ class InputMapper:
         self._last_recognition_label = ""
         self._last_recognition_s = 0.0
         self._last_status = "armed" if self.enabled else "disabled"
+        self._cached_signal_sequence: Any = None
+        self._cached_signals: dict[str, SignalValue] = {}
 
     @property
     def last_status(self) -> str:
@@ -882,6 +884,8 @@ class InputMapper:
         self.enabled = bool(config.enabled_on_start)
         self._states.clear()
         self._gesture_last_fired.clear()
+        self._cached_signal_sequence = None
+        self._cached_signals.clear()
 
     def set_active_profile(self, profile_name: str) -> bool:
         if profile_name not in self.config.profile_names():
@@ -891,6 +895,8 @@ class InputMapper:
             self.config.active_profile = profile_name
             self._states.clear()
             self._gesture_last_fired.clear()
+            self._cached_signal_sequence = None
+            self._cached_signals.clear()
         return True
 
     def active_rules(self) -> list[MappingRule]:
@@ -922,7 +928,14 @@ class InputMapper:
             self._last_status = self.backend.error or "input backend unavailable"
             return
 
-        signals = SignalCatalog.flatten(snapshot)
+        signal_sequence = snapshot.get("_signal_sequence") if isinstance(snapshot, dict) else None
+        if signal_sequence is not None and signal_sequence == self._cached_signal_sequence:
+            signals = self._cached_signals
+        else:
+            signals = SignalCatalog.flatten(snapshot)
+            if signal_sequence is not None:
+                self._cached_signal_sequence = signal_sequence
+                self._cached_signals = signals
         live_rule_ids = set()
         for rule in self.active_rules():
             live_rule_ids.add(rule.id)

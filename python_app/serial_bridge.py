@@ -18,7 +18,16 @@ except Exception:  # pragma: no cover - handled at runtime for missing dependenc
 
 LogCallback = Callable[[str], None]
 WRISTBAND_SAMPLE_STALE_S = 1.5
+DEVICE_DELTA_STALE_S = 1.5
 DISCONNECTED_STATUSES = {"not_connected", "disconnected", "tbd"}
+DEVICE_LIVE_FIELDS = {
+    "wristband": ("accel", "gyro", "calibrated_accel", "pitch", "roll", "yaw"),
+    "keyboard": ("tof", "valid", "input"),
+    "camdock": ("tof", "active_target"),
+    "fans": ("input", "fan_on"),
+    "charging_dock": ("input", "active_tab", "priority_channel"),
+    "audiodock": ("input", "clap_detected", "clap_type"),
+}
 
 
 class SerialBridge:
@@ -37,6 +46,8 @@ class SerialBridge:
         self._latest_state: dict[str, Any] = {}
         self._wristband_states: deque[dict[str, Any]] = deque(maxlen=512)
         self._wristband_last_sample_s: float | None = None
+        self._device_last_received_s: dict[str, float] = {}
+        self._device_sequences: dict[str, int] = {}
         self._reader_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._manual_disconnect = False
@@ -105,6 +116,8 @@ class SerialBridge:
             self._latest_state = {}
             self._wristband_states.clear()
             self._wristband_last_sample_s = None
+            self._device_last_received_s.clear()
+            self._device_sequences.clear()
         self._current_port = None
         self._log("Serial disconnected.")
 
@@ -119,22 +132,45 @@ class SerialBridge:
 
     def get_latest_state(self) -> dict[str, Any]:
         with self._latest_lock:
-            self._expire_stale_wristband_locked()
+            self._expire_stale_devices_locked()
             return copy.deepcopy(self._latest_state)
 
     def drain_wristband_states(self) -> list[dict[str, Any]]:
         with self._latest_lock:
-            self._expire_stale_wristband_locked()
+            self._expire_stale_devices_locked()
             states = list(self._wristband_states)
             self._wristband_states.clear()
         return states
 
-    def _expire_stale_wristband_locked(self) -> None:
-        if self._wristband_last_sample_s is None:
-            return
-        if time.monotonic() - self._wristband_last_sample_s <= WRISTBAND_SAMPLE_STALE_S:
-            return
-        self._mark_wristband_disconnected_locked()
+    def _expire_stale_devices_locked(self) -> None:
+        now_s = time.monotonic()
+        for device_name, received_s in list(self._device_last_received_s.items()):
+            if now_s - received_s <= DEVICE_DELTA_STALE_S:
+                continue
+            self._mark_device_disconnected_locked(device_name)
+        if self._wristband_last_sample_s is not None and now_s - self._wristband_last_sample_s > WRISTBAND_SAMPLE_STALE_S:
+            self._mark_wristband_disconnected_locked()
+
+    def _mark_device_disconnected_locked(self, device_name: str) -> None:
+        devices = self._latest_state.get("devices")
+        device = devices.get(device_name) if isinstance(devices, dict) else None
+        if isinstance(device, dict):
+            device["status"] = "not_connected"
+            device["sequence"] = None
+            device["t_ms"] = None
+            for field in DEVICE_LIVE_FIELDS.get(device_name, ()):
+                value = device.get(field)
+                if isinstance(value, dict):
+                    device[field] = {key: None for key in value}
+                elif isinstance(value, bool):
+                    device[field] = False
+                else:
+                    device[field] = None
+        self._device_last_received_s.pop(device_name, None)
+        self._device_sequences.pop(device_name, None)
+        if device_name == "wristband":
+            self._wristband_states.clear()
+            self._wristband_last_sample_s = None
 
     def _mark_wristband_disconnected_locked(self) -> None:
         devices = self._latest_state.get("devices")
@@ -151,20 +187,118 @@ class SerialBridge:
         self._wristband_states.clear()
         self._wristband_last_sample_s = None
 
+    @staticmethod
+    def _sequence_is_newer(sequence: int, previous: int) -> bool:
+        difference = (sequence - previous) & 0xFFFF
+        return 0 < difference < 0x8000
+
+    @classmethod
+    def _merge_dict(cls, target: dict[str, Any], update: dict[str, Any]) -> None:
+        for key, value in update.items():
+            existing = target.get(key)
+            if isinstance(existing, dict) and isinstance(value, dict):
+                cls._merge_dict(existing, value)
+            else:
+                target[key] = copy.deepcopy(value)
+
+    def _store_device_delta_locked(self, delta: dict[str, Any]) -> dict[str, Any]:
+        device_name = str(delta.get("device", "")).strip().lower()
+        fields = delta.get("fields")
+        sequence = delta.get("sequence")
+        if not device_name or not isinstance(fields, dict) or not isinstance(sequence, int):
+            return self._latest_state
+        previous = self._device_sequences.get(device_name)
+        if previous is not None and sequence != previous and not self._sequence_is_newer(sequence, previous):
+            return self._latest_state
+        if previous == sequence:
+            return self._latest_state
+
+        devices = self._latest_state.setdefault("devices", {})
+        if not isinstance(devices, dict):
+            return self._latest_state
+        device = devices.setdefault(device_name, {})
+        if not isinstance(device, dict):
+            device = {}
+            devices[device_name] = device
+        self._merge_dict(device, fields)
+        device["sequence"] = sequence
+        device["t_ms"] = delta.get("t_ms")
+        device.setdefault("status", "ok")
+        now_s = time.monotonic()
+        self._device_sequences[device_name] = sequence
+        self._device_last_received_s[device_name] = now_s
+        if device_name == "wristband":
+            self._wristband_last_sample_s = now_s
+            merged_state = copy.deepcopy(self._latest_state)
+            self._wristband_states.append(merged_state)
+            return merged_state
+        return self._latest_state
+
+    def _store_full_state_locked(self, state: dict[str, Any]) -> dict[str, Any]:
+        incoming_devices = state.get("devices")
+        current_devices = self._latest_state.get("devices")
+        if isinstance(incoming_devices, dict) and isinstance(current_devices, dict):
+            for device_name, incoming in list(incoming_devices.items()):
+                current = current_devices.get(device_name)
+                if not isinstance(incoming, dict) or not isinstance(current, dict):
+                    continue
+                incoming_sequence = incoming.get("sequence")
+                current_sequence = self._device_sequences.get(device_name)
+                if isinstance(incoming_sequence, int) and current_sequence is not None:
+                    if not self._sequence_is_newer(incoming_sequence, current_sequence):
+                        merged = copy.deepcopy(incoming)
+                        live_update = {
+                            field: current[field]
+                            for field in (*DEVICE_LIVE_FIELDS.get(device_name, ()), "status", "sequence", "t_ms")
+                            if field in current
+                        }
+                        self._merge_dict(merged, live_update)
+                        incoming_devices[device_name] = merged
+        self._latest_state = state
+        now_s = time.monotonic()
+        if isinstance(incoming_devices, dict):
+            for device_name, device in incoming_devices.items():
+                if not isinstance(device, dict):
+                    continue
+                status = str(device.get("status", "")).lower()
+                sequence = device.get("sequence")
+                if status in DISCONNECTED_STATUSES:
+                    self._device_last_received_s.pop(device_name, None)
+                    self._device_sequences.pop(device_name, None)
+                    continue
+                self._device_last_received_s[device_name] = now_s
+                if isinstance(sequence, int):
+                    self._device_sequences[device_name] = sequence
+        return state
+
     def _store_state_locked(self, state: dict[str, Any]) -> dict[str, Any]:
+        device_delta = state.get("device_delta")
+        if isinstance(device_delta, dict):
+            return self._store_device_delta_locked(device_delta)
+
         wristband_sample = state.get("wristband_sample")
         if isinstance(wristband_sample, dict):
-            devices = self._latest_state.setdefault("devices", {})
-            if isinstance(devices, dict):
-                wristband = devices.setdefault("wristband", {})
-                if isinstance(wristband, dict):
-                    wristband.update(wristband_sample)
-            self._wristband_last_sample_s = time.monotonic()
-            merged_state = copy.deepcopy(self._latest_state)
-            self._wristband_states.append(copy.deepcopy(merged_state))
-            return merged_state
+            return self._store_device_delta_locked(
+                {
+                    "device": "wristband",
+                    "sequence": wristband_sample.get("sequence"),
+                    "t_ms": wristband_sample.get("t_ms"),
+                    "fields": wristband_sample,
+                }
+            )
 
-        self._latest_state = state
+        keyboard_sample = state.get("keyboard_sample")
+        if isinstance(keyboard_sample, dict):
+            return self._store_device_delta_locked(
+                {
+                    "device": "keyboard",
+                    "sequence": keyboard_sample.get("sequence"),
+                    "t_ms": keyboard_sample.get("t_ms"),
+                    "fields": keyboard_sample,
+                }
+            )
+
+        self._store_full_state_locked(state)
         devices = state.get("devices")
         wristband = devices.get("wristband") if isinstance(devices, dict) else None
         status = str(wristband.get("status", "")).lower() if isinstance(wristband, dict) else ""
@@ -320,8 +454,7 @@ class SerialBridge:
                 "AUDIODOCK_" in line or 
                 "UDIODOCK_" in line or 
                 "DOCK_AUDIO" in line or 
-                "_AUDIO:" in line or
-                (self.audio_dock_bridge and self.audio_dock_bridge.expected_audio_size is not None and len(line) > 100)
+                "_AUDIO:" in line
             )
 
             if is_audiodock:

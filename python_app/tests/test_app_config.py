@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app_paths import build_app_paths, user_data_root
 from audio_dock import AudioDockBridge
 from config import DEFAULT_CALIBRATION, load_calibration_with_warnings, save_calibration
+from gui import AirTrixxGUI
 
 
 class FakeConnectedSerialBridge:
@@ -24,6 +25,17 @@ class FakeConnectedSerialBridge:
     def send_command(self, command: dict) -> bool:
         self.commands.append(command)
         return True
+
+
+class ImmediateThread:
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None) -> None:
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+
+    def start(self) -> None:
+        if self._target is not None:
+            self._target(*self._args, **self._kwargs)
 
 
 class AppPathTests(unittest.TestCase):
@@ -133,6 +145,93 @@ class AudioDockSettingsTests(unittest.TestCase):
         self.assertTrue(bridge.send_control("training_record", count=10))
 
         self.assertEqual(serial_bridge.commands, [{"cmd": "audiodock", "control": "training_record", "count": 10}])
+
+    def test_audio_dock_indexed_chunks_assemble_in_order(self) -> None:
+        serial_bridge = FakeConnectedSerialBridge()
+        transcripts: list[tuple[str, str]] = []
+        bridge = AudioDockBridge(serial_bridge=serial_bridge, on_transcript=lambda trigger, text: transcripts.append((trigger, text)))
+        bridge.connect()
+
+        with patch("audio_dock.threading.Thread", ImmediateThread), patch("audio_dock.time.sleep", lambda _: None), patch.object(
+            bridge, "_transcribe", return_value="hello world"
+        ):
+            bridge.handle_antenna_line("AUDIODOCK_TRIGGER:1,8")
+            bridge.handle_antenna_line("AUDIODOCK_AUDIO_CHUNK:0,4,52494646")
+            bridge.handle_antenna_line("AUDIODOCK_AUDIO_CHUNK:1,4,64617461")
+
+        self.assertEqual(bridge.last_audio_data, b"RIFFdata")
+        self.assertEqual(bridge.latest_transcript, "hello world")
+        self.assertEqual(transcripts[-1], ("Single clap", "hello world"))
+
+    def test_audio_dock_indexed_chunks_assemble_out_of_order(self) -> None:
+        serial_bridge = FakeConnectedSerialBridge()
+        bridge = AudioDockBridge(serial_bridge=serial_bridge)
+        bridge.connect()
+
+        with patch("audio_dock.threading.Thread", ImmediateThread), patch("audio_dock.time.sleep", lambda _: None), patch.object(
+            bridge, "_transcribe", return_value="ordered"
+        ):
+            bridge.handle_antenna_line("AUDIODOCK_TRIGGER:2,8")
+            bridge.handle_antenna_line("AUDIODOCK_AUDIO_CHUNK:1,4,64617461")
+            bridge.handle_antenna_line("AUDIODOCK_AUDIO_CHUNK:0,4,52494646")
+
+        self.assertEqual(bridge.last_audio_data, b"RIFFdata")
+        self.assertEqual(bridge.latest_transcript, "ordered")
+
+    def test_audio_dock_legacy_chunk_parsing_still_works(self) -> None:
+        serial_bridge = FakeConnectedSerialBridge()
+        bridge = AudioDockBridge(serial_bridge=serial_bridge)
+        bridge.connect()
+        expected_audio = b"RIFF" + (b"A" * 20) + b"data" + (b"B" * 20)
+
+        with patch("audio_dock.threading.Thread", ImmediateThread), patch("audio_dock.time.sleep", lambda _: None), patch.object(
+            bridge, "_transcribe", return_value="legacy"
+        ):
+            bridge.handle_antenna_line(f"AUDIODOCK_TRIGGER:1,{len(expected_audio)}")
+            bridge.handle_antenna_line(f"AUDIODOCK_AUDIO:{(b'RIFF' + (b'A' * 20)).hex()}")
+            bridge.handle_antenna_line(f"AUDIODOCK_AUDIO:{(b'data' + (b'B' * 20)).hex()}")
+
+        self.assertEqual(bridge.last_audio_data, expected_audio)
+        self.assertEqual(bridge.latest_transcript, "legacy")
+
+    def test_audio_dock_new_trigger_clears_old_transcript(self) -> None:
+        serial_bridge = FakeConnectedSerialBridge()
+        transcripts: list[tuple[str, str]] = []
+        bridge = AudioDockBridge(serial_bridge=serial_bridge, on_transcript=lambda trigger, text: transcripts.append((trigger, text)))
+        bridge.connect()
+        bridge.latest_transcript = "old text"
+        bridge.last_trigger = "Double clap"
+
+        bridge.handle_antenna_line("AUDIODOCK_TRIGGER:1,8")
+
+        self.assertEqual(bridge.latest_transcript, "")
+        self.assertEqual(bridge.last_trigger, "Single clap")
+        self.assertEqual(transcripts[-1], ("Single clap", ""))
+
+    def test_audio_dock_stale_transcript_result_is_ignored(self) -> None:
+        serial_bridge = FakeConnectedSerialBridge()
+        transcripts: list[tuple[str, str]] = []
+        bridge = AudioDockBridge(serial_bridge=serial_bridge, on_transcript=lambda trigger, text: transcripts.append((trigger, text)))
+        bridge.connect()
+
+        first_capture = bridge._start_capture("Single clap", 8)
+        assert first_capture is not None
+        second_capture = bridge._start_capture("Double clap", 8)
+        assert second_capture is not None
+
+        with patch("audio_dock.time.sleep", lambda _: None):
+            bridge._transcribe_and_send(first_capture.capture_id, first_capture.trigger_label, b"first", skip_transcription=True)
+
+        self.assertEqual(bridge.latest_transcript, "")
+        self.assertEqual(transcripts[-1], ("Double clap", ""))
+        self.assertEqual(serial_bridge.commands, [])
+
+    def test_dashboard_offline_status_uses_red_styling(self) -> None:
+        label, bg, fg, color = AirTrixxGUI._battery_status_style(None, "not_connected")
+        self.assertEqual(label, "Offline")
+        self.assertEqual(bg, "#fef3f2")
+        self.assertEqual(fg, "#b42318")
+        self.assertEqual(color, "#ef4444")
 
 
 if __name__ == "__main__":
