@@ -20,6 +20,9 @@
 
 static const uint8_t CHANNEL_COUNT = 4;
 
+// Channel names
+static const char *CHANNEL_NAMES[CHANNEL_COUNT] = {"FN", "AD", "KB", "WB"};
+
 // Pins
 static const uint8_t GATE_PINS[CHANNEL_COUNT] = {11, 4, 5, 6};
 static const uint8_t ENC_CLK = 7;
@@ -45,11 +48,25 @@ static const uint32_t DISPLAY_INTERVAL_MS = 250;
 static const uint32_t STATUS_INTERVAL_MS = 2000;
 static const uint32_t REPORT_INTERVAL_MS = 1000UL / CHARGING_DOCK_REPORT_HZ;
 static const uint32_t BUTTON_DEBOUNCE_MS = 250;
-static const int8_t WIFI_TX_POWER_QDBM = 34;  // 8.5 dBm in 0.25 dBm units.
+static const int8_t WIFI_TX_POWER_QDBM = 34;
 
-// Gate MOSFETs are active-low in the supplied sketch.
 static const uint8_t GATE_ON_LEVEL = LOW;
 static const uint8_t GATE_OFF_LEVEL = HIGH;
+
+// ---------------------------------------------------------------------------
+// Temperature sensor addresses
+// CH0 = FN: average of two sensors
+// CH1 = AD: one sensor
+// CH2 = KB: one sensor
+// CH3 = WB: no sensor
+// ---------------------------------------------------------------------------
+static const DeviceAddress TEMP_ADDR_FN1 = {0x28, 0x9E, 0x44, 0x87, 0x00, 0x00, 0x00, 0x15};
+static const DeviceAddress TEMP_ADDR_FN2 = {0x28, 0x01, 0x15, 0x88, 0x00, 0x00, 0x00, 0x42};
+static const DeviceAddress TEMP_ADDR_KB  = {0x28, 0xA2, 0xCF, 0x87, 0x00, 0x00, 0x00, 0x3E};
+static const DeviceAddress TEMP_ADDR_AD  = {0x28, 0xB8, 0xAA, 0x87, 0x00, 0x00, 0x00, 0x69};
+
+// Which channels have temperature sensors at all
+static const bool CHANNEL_HAS_TEMP[CHANNEL_COUNT] = {true, true, true, false};
 
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 Adafruit_INA219 ina1(0x45);
@@ -76,7 +93,7 @@ static float batteryV[CHANNEL_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
 static float currentmA[CHANNEL_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
 
 static int activeTab = 0;
-static int priorityCH = -1;  // -1 = charge all valid channels, 0-3 = priority channel.
+static int priorityCH = -1;
 static int lastClk = HIGH;
 static bool lastButtonState = HIGH;
 
@@ -91,14 +108,46 @@ static uint32_t espNowSendOkCount = 0;
 static uint32_t espNowSendFailCount = 0;
 static bool espNowReady = false;
 
+// ---------------------------------------------------------------------------
+// Read temperature for a channel by sensor address(es).
+// FN (ch0) averages two sensors; others read one.
+// Returns DEVICE_DISCONNECTED_C if the sensor is not found/valid.
+// ---------------------------------------------------------------------------
+static float readChannelTemp(uint8_t ch) {
+  float t = DEVICE_DISCONNECTED_C;
+  switch (ch) {
+    case 0: {  // FN – average of FN1 and FN2
+      float t1 = temps.getTempC(const_cast<uint8_t *>(TEMP_ADDR_FN1));
+      float t2 = temps.getTempC(const_cast<uint8_t *>(TEMP_ADDR_FN2));
+      bool v1 = (t1 != DEVICE_DISCONNECTED_C && t1 > -40.0f && t1 < 125.0f);
+      bool v2 = (t2 != DEVICE_DISCONNECTED_C && t2 > -40.0f && t2 < 125.0f);
+      if (v1 && v2) {
+        t = (t1 + t2) * 0.5f;
+      } else if (v1) {
+        t = t1;
+      } else if (v2) {
+        t = t2;
+      }
+      break;
+    }
+    case 1:  // AD
+      t = temps.getTempC(const_cast<uint8_t *>(TEMP_ADDR_AD));
+      break;
+    case 2:  // KB
+      t = temps.getTempC(const_cast<uint8_t *>(TEMP_ADDR_KB));
+      break;
+    case 3:  // WB – no sensor
+    default:
+      t = DEVICE_DISCONNECTED_C;
+      break;
+  }
+  return t;
+}
+
 static void printMacAddress(const uint8_t mac[6]) {
   for (int i = 0; i < 6; ++i) {
-    if (i > 0) {
-      Serial.print(":");
-    }
-    if (mac[i] < 0x10) {
-      Serial.print("0");
-    }
+    if (i > 0) Serial.print(":");
+    if (mac[i] < 0x10) Serial.print("0");
     Serial.print(mac[i], HEX);
   }
 }
@@ -124,10 +173,7 @@ static void configureWiFiChannel() {
 }
 
 static bool addEspNowPeer(const uint8_t mac[6]) {
-  if (esp_now_is_peer_exist(mac)) {
-    return true;
-  }
-
+  if (esp_now_is_peer_exist(mac)) return true;
   esp_now_peer_info_t peer = {};
   memcpy(peer.peer_addr, mac, 6);
   peer.channel = ESPNOW_CHANNEL;
@@ -159,56 +205,37 @@ static void setGate(uint8_t ch, bool enabled) {
 }
 
 static void allGatesOff() {
-  for (uint8_t i = 0; i < CHANNEL_COUNT; ++i) {
-    setGate(i, false);
-  }
+  for (uint8_t i = 0; i < CHANNEL_COUNT; ++i) setGate(i, false);
 }
 
 static float readCompensatedVoltage(uint8_t ch) {
-  if (!inaReady[ch]) {
-    return 0.0f;
-  }
-
+  if (!inaReady[ch]) return 0.0f;
   float rawV = sensors[ch]->getBusVoltage_V();
   float currentA = sensors[ch]->getCurrent_mA() / 1000.0f;
   float compensated = rawV - (currentA * BATT_IR_OHMS) + VOLT_OFFSET;
-
   if (smoothedV[ch] < 0.5f) {
     smoothedV[ch] = compensated;
   } else {
     smoothedV[ch] = (smoothedV[ch] * 0.8f) + (compensated * 0.2f);
   }
-
   return smoothedV[ch];
 }
 
 static int batteryPercent(float volts) {
-  if (volts <= 3.20f) {
-    return 0;
-  }
-  if (volts >= 4.20f) {
-    return 100;
-  }
+  if (volts <= 3.20f) return 0;
+  if (volts >= 4.20f) return 100;
   return static_cast<int>(((volts - 3.20f) * 100.0f / 1.0f) + 0.5f);
 }
 
 static uint16_t clampUint16(float value) {
-  if (value <= 0.0f) {
-    return 0;
-  }
-  if (value >= 65535.0f) {
-    return 65535;
-  }
+  if (value <= 0.0f) return 0;
+  if (value >= 65535.0f) return 65535;
   return static_cast<uint16_t>(lroundf(value));
 }
 
 static int16_t clampInt16(float value) {
-  if (value <= -32768.0f) {
-    return -32768;
-  }
-  if (value >= 32767.0f) {
-    return 32767;
-  }
+  if (value <= -32768.0f) return -32768;
+  if (value >= 32767.0f) return 32767;
   return static_cast<int16_t>(lroundf(value));
 }
 
@@ -235,8 +262,15 @@ static void updateSensorsAndChargeLogic() {
       currentmA[i] = 0.0f;
     }
 
-    curTemp[i] = temps.getTempCByIndex(i);
-    tempValid[i] = curTemp[i] != DEVICE_DISCONNECTED_C;
+    // Address-based temperature reading
+    if (CHANNEL_HAS_TEMP[i]) {
+      curTemp[i] = readChannelTemp(i);
+      tempValid[i] = (curTemp[i] != DEVICE_DISCONNECTED_C &&
+                      curTemp[i] > -40.0f && curTemp[i] < 125.0f);
+    } else {
+      curTemp[i] = DEVICE_DISCONNECTED_C;
+      tempValid[i] = false;
+    }
 
     noBattery[i] = !inaReady[i] || batteryV[i] < NO_BATTERY_V;
     fullOrIdle[i] = inaReady[i] && batteryV[i] > IDLE_FULL_V && currentmA[i] < IDLE_CURRENT_MA;
@@ -266,7 +300,6 @@ static void handleEncoder() {
     } else {
       --activeTab;
     }
-
     if (activeTab > static_cast<int>(CHANNEL_COUNT)) {
       activeTab = 0;
     } else if (activeTab < 0) {
@@ -290,6 +323,11 @@ static void handleEncoder() {
   lastButtonState = buttonState;
 }
 
+// ---------------------------------------------------------------------------
+// Display helpers
+// ---------------------------------------------------------------------------
+
+// Print a one-line status for a channel (used in overview and detail header).
 static void printChannelStatus(uint8_t ch) {
   if (!inaReady[ch]) {
     display.print("INA ERR");
@@ -323,8 +361,8 @@ static void drawOverview() {
     } else {
       display.print(" ");
     }
-    display.print("CH");
-    display.print(i + 1);
+    // Channel name instead of CH1/CH2/...
+    display.print(CHANNEL_NAMES[i]);
     display.print(": ");
     printChannelStatus(i);
   }
@@ -333,8 +371,8 @@ static void drawOverview() {
 static void drawChannelDetail(uint8_t ch) {
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.print("CHANNEL ");
-  display.print(ch + 1);
+  // Channel name in header
+  display.print(CHANNEL_NAMES[ch]);
   if (priorityCH == static_cast<int>(ch)) {
     display.print(" [PRI]");
   } else if (gateEnabled[ch]) {
@@ -371,12 +409,21 @@ static void drawChannelDetail(uint8_t ch) {
   display.print(static_cast<int>(mah[ch]));
   display.print(" mAh");
 
+  // Temperature: only show when the device is actually charging and has a sensor
   display.setCursor(85, 46);
-  if (tempValid[ch]) {
+  if (!CHANNEL_HAS_TEMP[ch]) {
+    // WB has no sensor – show nothing
+    display.print("--.-C");
+  } else if (gateEnabled[ch] && tempValid[ch]) {
+    // Charging and sensor valid → show live temperature
     display.print(curTemp[ch], 1);
     display.print("C");
-  } else {
+  } else if (!gateEnabled[ch]) {
+    // Not charging → suppress temperature
     display.print("--.-C");
+  } else {
+    // Charging but sensor error
+    display.print("ERR C");
   }
 
   display.setCursor(0, 56);
@@ -384,19 +431,14 @@ static void drawChannelDetail(uint8_t ch) {
 }
 
 static void updateDisplay() {
-  if (!displayReady) {
-    return;
-  }
-
+  if (!displayReady) return;
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
-
   if (activeTab == 0) {
     drawOverview();
   } else {
     drawChannelDetail(activeTab - 1);
   }
-
   display.display();
 }
 
@@ -406,8 +448,8 @@ static void printStatus() {
   Serial.print(" priority=");
   Serial.print(priorityCH);
   for (uint8_t i = 0; i < CHANNEL_COUNT; ++i) {
-    Serial.print(" ch");
-    Serial.print(i + 1);
+    Serial.print(" ");
+    Serial.print(CHANNEL_NAMES[i]);
     Serial.print("=");
     Serial.print(inaReady[i] ? "ok" : "ina_err");
     Serial.print(gateEnabled[i] ? "/on" : "/off");
@@ -420,7 +462,7 @@ static void printStatus() {
       Serial.print(curTemp[i], 1);
       Serial.print("C");
     } else {
-      Serial.print("temp_err");
+      Serial.print(CHANNEL_HAS_TEMP[i] ? "temp_err" : "no_sensor");
     }
   }
   Serial.print(" espnow=");
@@ -433,9 +475,7 @@ static void printStatus() {
 }
 
 static void sendChargingDockStatus() {
-  if (!espNowReady) {
-    return;
-  }
+  if (!espNowReady) return;
 
   ChargingDockStatusPacket packet = {};
   bool batteryLow = false;
@@ -451,31 +491,19 @@ static void sendChargingDockStatus() {
   for (uint8_t i = 0; i < CHANNEL_COUNT && i < AIRTRIXX_CHARGING_DOCK_CHANNELS; ++i) {
     uint8_t bit = 1 << i;
     bool batteryPresent = inaReady[i] && !noBattery[i];
-    if (inaReady[i]) {
-      packet.ina_valid_mask |= bit;
-    }
-    if (batteryPresent) {
-      packet.battery_present_mask |= bit;
-    }
-    if (gateEnabled[i]) {
-      packet.charging_mask |= bit;
-    }
-    if (fullOrIdle[i]) {
-      packet.full_mask |= bit;
-    }
-    if (hotCutoff[i]) {
-      packet.hot_mask |= bit;
-    }
-    if (tempValid[i]) {
-      packet.temp_valid_mask |= bit;
-    }
+    if (inaReady[i])      packet.ina_valid_mask     |= bit;
+    if (batteryPresent)   packet.battery_present_mask |= bit;
+    if (gateEnabled[i])   packet.charging_mask       |= bit;
+    if (fullOrIdle[i])    packet.full_mask           |= bit;
+    if (hotCutoff[i])     packet.hot_mask            |= bit;
+    if (tempValid[i])     packet.temp_valid_mask     |= bit;
 
     uint8_t percent = batteryPresent ? static_cast<uint8_t>(batteryPercent(batteryV[i])) : 0;
     packet.battery_percent[i] = percent;
-    packet.battery_mv[i] = batteryPresent ? clampUint16(batteryV[i] * 1000.0f) : 0;
-    packet.current_ma[i] = inaReady[i] ? clampInt16(currentmA[i]) : 0;
-    packet.temp_centi_c[i] = tempValid[i] ? clampInt16(curTemp[i] * 100.0f) : 0;
-    packet.energy_mah[i] = clampUint16(mah[i]);
+    packet.battery_mv[i]      = batteryPresent ? clampUint16(batteryV[i] * 1000.0f) : 0;
+    packet.current_ma[i]      = inaReady[i] ? clampInt16(currentmA[i]) : 0;
+    packet.temp_centi_c[i]    = tempValid[i] ? clampInt16(curTemp[i] * 100.0f) : 0;
+    packet.energy_mah[i]      = clampUint16(mah[i]);
     batteryLow = batteryLow || (batteryPresent && percent <= 15);
   }
   packet.header.battery_low = batteryLow ? 1 : 0;
@@ -527,10 +555,14 @@ void setup() {
   temps.begin();
   temps.setResolution(10);
 
+  // Log discovered DS18B20 sensors on the bus
+  Serial.print("[CHG] DS18B20 sensors found: ");
+  Serial.println(temps.getDeviceCount());
+
   for (uint8_t i = 0; i < CHANNEL_COUNT; ++i) {
     inaReady[i] = sensors[i]->begin(&Wire);
-    Serial.print("[CHG] INA");
-    Serial.print(i + 1);
+    Serial.print("[CHG] INA ");
+    Serial.print(CHANNEL_NAMES[i]);
     Serial.println(inaReady[i] ? " ready" : " not found");
   }
 
