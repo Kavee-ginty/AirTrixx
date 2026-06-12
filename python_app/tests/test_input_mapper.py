@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -97,6 +98,19 @@ class InputMapperRuntimeTests(unittest.TestCase):
         mapper.process(snapshot(a=1), 0.0)
         mapper.process(snapshot(a=1), 0.1)
         self.assertEqual(backend.events, [("key_tap", ("space",))])
+
+    def test_versioned_snapshot_reuses_flattened_signal_catalog(self) -> None:
+        rule = MappingRule(
+            source="fused.a",
+            comparator="truthy",
+            action=MappingAction(type="keyboard_hold", keys=["shift"]),
+        )
+        mapper, _backend = self.mapper_with([rule])
+        versioned = {"input_dict": {"a": True}, "_signal_sequence": (1,)}
+        with patch.object(SignalCatalog, "flatten", wraps=SignalCatalog.flatten) as flatten:
+            mapper.process(versioned, 0.0)
+            mapper.process(versioned, 0.1)
+        self.assertEqual(flatten.call_count, 1)
 
     def test_hold_releases_on_missing_signal(self) -> None:
         rule = MappingRule(

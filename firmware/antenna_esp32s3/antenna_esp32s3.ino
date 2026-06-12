@@ -1171,9 +1171,9 @@ void sendAudioDockComponentStatus(uint32_t nowMs) {
              nowMs,
              false);
   char statusText[16];
-  snprintf(statusText, sizeof(statusText), "__STATUS:%02X", buildAudioDockComponentMask(nowMs));
+  snprintf(statusText, sizeof(statusText), "__STATUS:%02X__", buildAudioDockComponentMask(nowMs));
   copyStringToPacketField(packet.transcript, sizeof(packet.transcript), String(statusText));
-  esp_now_send(ESPNOW_BROADCAST_MAC,
+  esp_now_send(AUDIODOCK_MAC_PLACEHOLDER,
                reinterpret_cast<const uint8_t *>(&packet),
                sizeof(packet));
 }
@@ -1196,9 +1196,6 @@ void handleIncomingPacket(const uint8_t senderMac[6], const uint8_t *data, int l
   }
   updatePacketDiagnostics(header.device_id, header.sequence);
 
-  if (header.msg_type == MSG_WRISTBAND_DATA &&
-      header.device_id == DEVICE_WRISTBAND &&
-      len == static_cast<int>(sizeof(WristbandDataPacket))) {
   if (header.msg_type == MSG_HEARTBEAT &&
       header.device_id == DEVICE_AUDIODOCK &&
       len == static_cast<int>(sizeof(HeartbeatPacket))) {
@@ -1537,17 +1534,26 @@ void printPacketDiagnosticsJson(uint8_t deviceId) {
   Serial.print("}");
 }
 
+void printNullableDistanceMm(bool ok, uint8_t valid, uint16_t distanceMm);
+
 void printWristbandSampleJson(const WristbandDataPacket &packet) {
+  WristbandCalibrationState calState = {};
+  portENTER_CRITICAL(&stateMux);
+  calState = wristCalState;
+  portEXIT_CRITICAL(&stateMux);
   WristbandMotionValues values = {};
-  wristbandPacketToValues(packet, values);
+  float pitch = 0.0f;
+  float roll = 0.0f;
+  float yaw = 0.0f;
+  applyWristbandCalibration(packet, calState, values, pitch, roll, yaw);
   if (serialMutex == NULL || xSemaphoreTake(serialMutex, portMAX_DELAY) != pdTRUE) {
     return;
   }
-  Serial.print("{\"wristband_sample\":{\"status\":\"ok\",\"sequence\":");
+  Serial.print("{\"device_delta\":{\"device\":\"wristband\",\"sequence\":");
   Serial.print(packet.header.sequence);
   Serial.print(",\"t_ms\":");
   Serial.print(packet.header.t_ms);
-  Serial.print(",\"accel\":{\"x\":");
+  Serial.print(",\"fields\":{\"status\":\"ok\",\"accel\":{\"x\":");
   Serial.print(values.accelMps2X, 4);
   Serial.print(",\"y\":");
   Serial.print(values.accelMps2Y, 4);
@@ -1559,7 +1565,47 @@ void printWristbandSampleJson(const WristbandDataPacket &packet) {
   Serial.print(values.gyroDpsY, 4);
   Serial.print(",\"z\":");
   Serial.print(values.gyroDpsZ, 4);
+  Serial.print("},\"calibrated_accel\":{\"x\":");
+  Serial.print(values.accelMps2X - calState.accelOffsetMps2X, 4);
+  Serial.print(",\"y\":");
+  Serial.print(values.accelMps2Y - calState.accelOffsetMps2Y, 4);
+  Serial.print(",\"z\":");
+  Serial.print(values.accelMps2Z - calState.accelOffsetMps2Z, 4);
+  Serial.print("},\"pitch\":");
+  Serial.print(pitch, 2);
+  Serial.print(",\"roll\":");
+  Serial.print(roll, 2);
+  Serial.print(",\"yaw\":");
+  Serial.print(yaw, 2);
   Serial.println("}}}");
+  xSemaphoreGive(serialMutex);
+}
+
+void printKeyboardSampleJson(const KeyboardTofPacket &packet) {
+  if (serialMutex == NULL || xSemaphoreTake(serialMutex, portMAX_DELAY) != pdTRUE) {
+    return;
+  }
+  Serial.print("{\"device_delta\":{\"device\":\"keyboard\",\"sequence\":");
+  Serial.print(packet.header.sequence);
+  Serial.print(",\"t_ms\":");
+  Serial.print(packet.header.t_ms);
+  Serial.print(",\"fields\":{\"status\":\"ok\",\"input\":\"tof\",\"tof\":{\"sensor_1_mm\":");
+  printNullableDistanceMm(true, packet.valid_1, packet.distance_mm_1);
+  Serial.print(",\"sensor_2_mm\":");
+  printNullableDistanceMm(true, packet.valid_2, packet.distance_mm_2);
+  Serial.print(",\"sensor_3_mm\":");
+  printNullableDistanceMm(true, packet.valid_3, packet.distance_mm_3);
+  Serial.print(",\"sensor_4_mm\":");
+  printNullableDistanceMm(true, packet.valid_4, packet.distance_mm_4);
+  Serial.print("},\"valid\":{\"sensor_1\":");
+  Serial.print(packet.valid_1 != 0 ? "true" : "false");
+  Serial.print(",\"sensor_2\":");
+  Serial.print(packet.valid_2 != 0 ? "true" : "false");
+  Serial.print(",\"sensor_3\":");
+  Serial.print(packet.valid_3 != 0 ? "true" : "false");
+  Serial.print(",\"sensor_4\":");
+  Serial.print(packet.valid_4 != 0 ? "true" : "false");
+  Serial.println("}}}}");
   xSemaphoreGive(serialMutex);
 }
 
@@ -2079,6 +2125,92 @@ void printAudioDockJson(const LatestAudioDock &snapshot,
   Serial.print("}");
 }
 
+void printCamDockDeltaJson(const CamDockDataPacket &packet) {
+  if (serialMutex == NULL || xSemaphoreTake(serialMutex, portMAX_DELAY) != pdTRUE) {
+    return;
+  }
+  Serial.print("{\"device_delta\":{\"device\":\"camdock\",\"sequence\":");
+  Serial.print(packet.header.sequence);
+  Serial.print(",\"t_ms\":");
+  Serial.print(packet.header.t_ms);
+  Serial.print(",\"fields\":{\"status\":\"ok\",\"tof\":{\"left_mm\":");
+  Serial.print(packet.left_tof_mm);
+  Serial.print(",\"right_mm\":");
+  Serial.print(packet.right_tof_mm);
+  Serial.print("},\"active_target\":\"");
+  Serial.print(activePairToString(packet.active_target));
+  Serial.println("\"}}}");
+  xSemaphoreGive(serialMutex);
+}
+
+void printFansDeltaJson(const FanStatusPacket &packet) {
+  if (serialMutex == NULL || xSemaphoreTake(serialMutex, portMAX_DELAY) != pdTRUE) {
+    return;
+  }
+  bool fanOn = packet.fan_on != 0;
+  Serial.print("{\"device_delta\":{\"device\":\"fans\",\"sequence\":");
+  Serial.print(packet.header.sequence);
+  Serial.print(",\"t_ms\":");
+  Serial.print(packet.header.t_ms);
+  Serial.print(",\"fields\":{\"status\":\"ok\",\"input\":\"");
+  Serial.print(fanOn ? "on" : "off");
+  Serial.print("\",\"fan_on\":");
+  Serial.print(fanOn ? "true" : "false");
+  Serial.println("}}}");
+  xSemaphoreGive(serialMutex);
+}
+
+void printChargingDockDeltaJson(const ChargingDockStatusPacket &packet) {
+  if (serialMutex == NULL || xSemaphoreTake(serialMutex, portMAX_DELAY) != pdTRUE) {
+    return;
+  }
+  Serial.print("{\"device_delta\":{\"device\":\"charging_dock\",\"sequence\":");
+  Serial.print(packet.header.sequence);
+  Serial.print(",\"t_ms\":");
+  Serial.print(packet.header.t_ms);
+  Serial.print(",\"fields\":{\"status\":\"ok\",\"input\":\"");
+  Serial.print(chargingDockInput(packet, true));
+  Serial.print("\",\"active_tab\":");
+  Serial.print(packet.active_tab);
+  Serial.print(",\"priority_channel\":");
+  if (packet.priority_channel >= 0 &&
+      packet.priority_channel < static_cast<int8_t>(AIRTRIXX_CHARGING_DOCK_CHANNELS)) {
+    Serial.print("\"");
+    Serial.print(chargingDockChannelName(packet.priority_channel));
+    Serial.print("\"");
+  } else {
+    Serial.print("null");
+  }
+  Serial.println("}}}");
+  xSemaphoreGive(serialMutex);
+}
+
+void printAudioDockDeltaJson(const AirTrixxPacketHeader &header,
+                             bool clapDetected,
+                             uint8_t clapType) {
+  if (serialMutex == NULL || xSemaphoreTake(serialMutex, portMAX_DELAY) != pdTRUE) {
+    return;
+  }
+  Serial.print("{\"device_delta\":{\"device\":\"audiodock\",\"sequence\":");
+  Serial.print(header.sequence);
+  Serial.print(",\"t_ms\":");
+  Serial.print(header.t_ms);
+  Serial.print(",\"fields\":{\"status\":\"ok\",\"input\":\"");
+  if (!clapDetected) {
+    Serial.print("none");
+  } else if (clapType == 2) {
+    Serial.print("double_clap");
+  } else {
+    Serial.print("single_clap");
+  }
+  Serial.print("\",\"clap_detected\":");
+  Serial.print(clapDetected ? "true" : "false");
+  Serial.print(",\"clap_type\":");
+  Serial.print(clapDetected ? clapType : 0);
+  Serial.println("}}}");
+  xSemaphoreGive(serialMutex);
+}
+
 void printJsonState() {
   LatestWristband wristSnapshot;
   LatestBatteryStatus wristBatterySnapshot;
@@ -2163,7 +2295,8 @@ void setup() {
   serialMutex = xSemaphoreCreateMutex();
 
   // Create FreeRTOS queue for Audio Dock chunks
-  audioChunkQueue = xQueueCreate(64, sizeof(AudioDockChunkPacket));
+  // Hold a complete 3-second Audio Dock WAV so bursts cannot drop the tail.
+  audioChunkQueue = xQueueCreate(512, sizeof(AudioDockChunkPacket));
   espNowRxQueue = xQueueCreate(ESPNOW_RX_QUEUE_LENGTH, sizeof(EspNowRxItem));
 
   configureWiFiChannel();
@@ -2208,8 +2341,10 @@ void pumpAudioDockChunks() {
     hexBuf[writeLen * 2] = '\0';
     
     if (serialMutex != NULL && xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
-      Serial.print("AUDIODOCK_AUDIO:");
-      Serial.println(hexBuf);
+      Serial.printf("AUDIODOCK_AUDIO_CHUNK:%lu,%u,%s\n",
+                    static_cast<unsigned long>(packet.chunk_index),
+                    static_cast<unsigned int>(writeLen),
+                    hexBuf);
       xSemaphoreGive(serialMutex);
     }
   }
@@ -2234,6 +2369,60 @@ void pumpEspNowPackets() {
       WristbandDataPacket packet = {};
       memcpy(&packet, item.data, sizeof(packet));
       printWristbandSampleJson(packet);
+    }
+    if (header.protocol_version == AIRTRIXX_PROTOCOL_VERSION &&
+        header.msg_type == MSG_KEYBOARD_TOF &&
+        header.device_id == DEVICE_KEYBOARD &&
+        item.len == sizeof(KeyboardTofPacket) &&
+        senderMatchesDevice(item.sender_mac, DEVICE_KEYBOARD)) {
+      KeyboardTofPacket packet = {};
+      memcpy(&packet, item.data, sizeof(packet));
+      printKeyboardSampleJson(packet);
+    }
+    if (header.protocol_version == AIRTRIXX_PROTOCOL_VERSION &&
+        header.msg_type == MSG_CAMDOCK_DATA &&
+        header.device_id == DEVICE_CAMDOCK &&
+        item.len == sizeof(CamDockDataPacket) &&
+        senderMatchesDevice(item.sender_mac, DEVICE_CAMDOCK)) {
+      CamDockDataPacket packet = {};
+      memcpy(&packet, item.data, sizeof(packet));
+      printCamDockDeltaJson(packet);
+    }
+    if (header.protocol_version == AIRTRIXX_PROTOCOL_VERSION &&
+        header.msg_type == MSG_FAN_STATUS &&
+        header.device_id == DEVICE_FANS &&
+        item.len == sizeof(FanStatusPacket) &&
+        senderMatchesDevice(item.sender_mac, DEVICE_FANS)) {
+      FanStatusPacket packet = {};
+      memcpy(&packet, item.data, sizeof(packet));
+      printFansDeltaJson(packet);
+    }
+    if (header.protocol_version == AIRTRIXX_PROTOCOL_VERSION &&
+        header.msg_type == MSG_CHARGING_DOCK_STATUS &&
+        header.device_id == DEVICE_CHARGING_DOCK &&
+        item.len == sizeof(ChargingDockStatusPacket) &&
+        senderMatchesDevice(item.sender_mac, DEVICE_CHARGING_DOCK)) {
+      ChargingDockStatusPacket packet = {};
+      memcpy(&packet, item.data, sizeof(packet));
+      printChargingDockDeltaJson(packet);
+    }
+    if (header.protocol_version == AIRTRIXX_PROTOCOL_VERSION &&
+        header.msg_type == MSG_AUDIODOCK_DATA &&
+        header.device_id == DEVICE_AUDIODOCK &&
+        item.len == sizeof(AudioDockDataPacket) &&
+        senderMatchesDevice(item.sender_mac, DEVICE_AUDIODOCK)) {
+      AudioDockDataPacket packet = {};
+      memcpy(&packet, item.data, sizeof(packet));
+      printAudioDockDeltaJson(packet.header, packet.clap_detected != 0, packet.clap_type);
+    }
+    if (header.protocol_version == AIRTRIXX_PROTOCOL_VERSION &&
+        header.msg_type == MSG_HEARTBEAT &&
+        header.device_id == DEVICE_AUDIODOCK &&
+        item.len == sizeof(HeartbeatPacket) &&
+        senderMatchesDevice(item.sender_mac, DEVICE_AUDIODOCK)) {
+      HeartbeatPacket packet = {};
+      memcpy(&packet, item.data, sizeof(packet));
+      printAudioDockDeltaJson(packet.header, false, 0);
     }
   }
 }
@@ -2273,7 +2462,9 @@ void loop() {
   }
 
   const uint32_t intervalMs = 1000UL / ANTENNA_JSON_HZ;
-  if (!isStreamingAudioDock && (nowMs - lastJsonMs >= intervalMs)) {
+  if (!isStreamingAudioDock &&
+      (espNowRxQueue == NULL || uxQueueMessagesWaiting(espNowRxQueue) == 0) &&
+      (nowMs - lastJsonMs >= intervalMs)) {
     lastJsonMs = nowMs;
     printJsonState();
   }
