@@ -1716,20 +1716,24 @@ void loop() {
         bool multiPeakClap = triggerScore >= CLAP_SECONDARY_THRESHOLD &&
                              peakEvents >= 2 &&
                              peak >= 8000;
+        bool directDoubleClap = doubleClapScore >= CLAP_LABEL_THRESHOLD &&
+                                peakIsAudible &&
+                                peakEvents >= 2;
         bool modelClap = (bestIsSingleClap || bestIsDoubleClap) &&
                          clapStrong &&
                          clapBeatsNoise &&
                          peakIsAudible &&
                          enoughPeakEvents;
-        bool clapAccepted = modelClap || multiPeakClap;
+        bool clapAccepted = directDoubleClap || modelClap || multiPeakClap;
 
         if (PRINT_CLAP_SCORES) {
-          Serial.printf(" best=%s %.2f peak=%lu peak_events=%u clap_ok=%u noise_margin=%u multipk=%u\n",
+          Serial.printf(" best=%s %.2f peak=%lu peak_events=%u clap_ok=%u direct_double=%u noise_margin=%u multipk=%u\n",
                         bestLabel.c_str(),
                         bestScore,
                         (unsigned long)peak,
                         (unsigned int)peakEvents,
                         (unsigned int)clapAccepted,
+                        (unsigned int)directDoubleClap,
                         (unsigned int)clapBeatsNoise,
                         (unsigned int)multiPeakClap);
         }
