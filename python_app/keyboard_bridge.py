@@ -27,6 +27,7 @@ from keyboard_model import (
     RAW_COLUMNS,
     RawFingerDetector,
     append_sample_rows,
+    enforce_min_detect_mm,
     extract_feature,
     format_max_detect_mm,
     load_model,
@@ -532,6 +533,7 @@ class KeyboardBridge:
     def _handle_line(self, line: str) -> None:
         detect_limits = parse_detect_limits(line)
         if detect_limits is not None:
+            detect_limits = enforce_min_detect_mm(detect_limits).tolist()
             with self._latest_lock:
                 self.detect_limits = detect_limits
             write_collection_metadata(self.dataset_path, detect_limits)
@@ -756,9 +758,9 @@ class KeyboardBridge:
 
     def _active_detect_limits(self) -> list[float]:
         if self.detect_limits:
-            return list(self.detect_limits)
+            return enforce_min_detect_mm(self.detect_limits).tolist()
         if self.model and self.model.get("max_detect_mm"):
-            return [float(value) for value in self.model["max_detect_mm"]]
+            return enforce_min_detect_mm(self.model["max_detect_mm"]).tolist()
         return [MAX_DETECT_MM] * len(RAW_COLUMNS)
 
     def _antenna_stream_active(self, *, max_age_s: float = 1.5, now_s: float | None = None) -> bool:
