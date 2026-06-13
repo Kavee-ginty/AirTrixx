@@ -673,10 +673,12 @@ class MappingConfigTests(unittest.TestCase):
         self.assertEqual(len(profile.mappings), 8)
         self.assertEqual(rules["wrist_cursor_follow_gyro"].action.speed_x, -30.0)
         self.assertEqual(rules["wrist_cursor_follow_gyro"].action.speed_y, -30.0)
+        self.assertEqual(rules["wrist_tab_cycle_forward"].conditions[0].source, "hands.right.z_mm")
+        self.assertEqual(rules["wrist_cursor_left_click"].source, "hands.right.gesture")
         self.assertEqual(rules["wrist_scroll_up"].source, "wristband.gyro_x")
         self.assertEqual(rules["wrist_scroll_up"].action.interval_ms, 90)
         self.assertEqual(rules["wrist_scroll_down"].action.scroll_y, -1)
-        self.assertEqual(rules["wrist_cursor_right_click"].source, "fused.left_hand_gesture")
+        self.assertEqual(rules["wrist_cursor_right_click"].source, "hands.left.gesture")
 
     def test_remove_profile_falls_back_and_protects_last_profile(self) -> None:
         config = MappingConfig(profiles=[MappingProfile(), wrist_tab_switching_profile()])

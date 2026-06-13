@@ -83,10 +83,17 @@ def hands() -> dict[str, dict[str, object]]:
 
 
 class FusionStateTests(unittest.TestCase):
-    def test_field_order_is_reduced_and_keeps_model_value(self) -> None:
-        self.assertEqual(len(FIELD_ORDER), 30)
-        self.assertIn("model_value", FIELD_ORDER)
+    def test_field_order_is_reduced_for_mapping(self) -> None:
+        self.assertEqual(len(FIELD_ORDER), 25)
         self.assertIn("wrist_rule_value", FIELD_ORDER)
+        for field in (
+            "model_value",
+            "wrist_pitch",
+            "wrist_roll",
+            "wrist_rotate_left_return",
+            "wrist_rotate_right_return",
+        ):
+            self.assertNotIn(field, FIELD_ORDER)
         for field in REMOVED_FIELDS:
             self.assertNotIn(field, FIELD_ORDER)
 
@@ -128,7 +135,7 @@ class FusionStateTests(unittest.TestCase):
         array = fusion.build_input_array(values)
 
         self.assertEqual(len(array), len(FIELD_ORDER))
-        self.assertEqual(array[FIELD_ORDER.index("model_value")], "flick")
+        self.assertEqual(array[FIELD_ORDER.index("wrist_rule_value")], "none")
 
     def test_hand_y_is_converted_to_up_coordinate(self) -> None:
         values = FusionState().build_input_dict(serial_state(), hands(), model_value="none")

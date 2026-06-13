@@ -21,8 +21,6 @@ FIELD_ORDER = [
     "wrist_gyro_x",
     "wrist_gyro_y",
     "wrist_gyro_z",
-    "wrist_pitch",
-    "wrist_roll",
     "camdock_battery_level",
     "wristband_battery_level",
     "fans_battery_level",
@@ -33,10 +31,7 @@ FIELD_ORDER = [
     "charging_dock_input",
     "audiodock_input",
     "fans_input",
-    "model_value",
     "wrist_rule_value",
-    "wrist_rotate_left_return",
-    "wrist_rotate_right_return",
 ]
 
 
