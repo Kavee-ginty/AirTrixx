@@ -18,7 +18,7 @@ import threading
 import time
 import tkinter as tk
 from collections import deque
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from pathlib import Path
 from typing import Any
 
@@ -4214,11 +4214,12 @@ class AirTrixxGUI:
         self.mapping_profile_combo.grid(row=0, column=1, sticky="ew", padx=(0, 8))
         self.mapping_profile_combo.bind("<<ComboboxSelected>>", self.on_mapping_profile_changed)
         ttk.Button(profile_box, text="New", command=self.new_mapping_profile).grid(row=0, column=2, sticky="ew", padx=(0, 6))
-        ttk.Button(profile_box, text="Delete", command=self.delete_mapping_profile).grid(row=0, column=3, sticky="ew", padx=(0, 6))
-        ttk.Button(profile_box, text="Save", command=self.save_input_mappings).grid(row=0, column=4, sticky="ew", padx=(0, 6))
-        ttk.Button(profile_box, text="Load", command=self.load_input_mappings).grid(row=0, column=5, sticky="ew", padx=(0, 6))
-        ttk.Button(profile_box, text="Import", command=self.import_input_mappings).grid(row=0, column=6, sticky="ew", padx=(0, 6))
-        ttk.Button(profile_box, text="Export", command=self.export_input_mappings).grid(row=0, column=7, sticky="ew")
+        ttk.Button(profile_box, text="Rename", command=self.rename_mapping_profile).grid(row=0, column=3, sticky="ew", padx=(0, 6))
+        ttk.Button(profile_box, text="Delete", command=self.delete_mapping_profile).grid(row=0, column=4, sticky="ew", padx=(0, 6))
+        ttk.Button(profile_box, text="Save", command=self.save_input_mappings).grid(row=0, column=5, sticky="ew", padx=(0, 6))
+        ttk.Button(profile_box, text="Load", command=self.load_input_mappings).grid(row=0, column=6, sticky="ew", padx=(0, 6))
+        ttk.Button(profile_box, text="Import", command=self.import_input_mappings).grid(row=0, column=7, sticky="ew", padx=(0, 6))
+        ttk.Button(profile_box, text="Export", command=self.export_input_mappings).grid(row=0, column=8, sticky="ew")
 
         split = ttk.Frame(body)
         split.grid(row=2, column=0, sticky="nsew")
@@ -5513,6 +5514,39 @@ class AirTrixxGUI:
         self._refresh_testing_list()
         self._update_mapping_status()
 
+    def rename_mapping_profile(self) -> None:
+        current_name = self.mapping_profile_var.get().strip()
+        if not current_name:
+            self.log("Select an input mapping profile to rename.")
+            return
+        new_name = simpledialog.askstring(
+            "Rename profile",
+            "New profile name:",
+            initialvalue=current_name,
+            parent=self.root,
+        )
+        if new_name is None:
+            return
+        new_name = new_name.strip()
+        if not new_name:
+            self.log("Profile name cannot be empty.")
+            return
+        existing_names = set(self.input_mapper.config.profile_names())
+        if new_name != current_name and new_name in existing_names:
+            self.log(f'Input mapping profile "{new_name}" already exists.')
+            return
+        profile = self.input_mapper.config.active()
+        profile.name = new_name
+        if self.input_mapper.config.active_profile == current_name:
+            self.input_mapper.config.active_profile = new_name
+        self.mapping_profile_var.set(new_name)
+        save_mapping_config(self.input_mapper.config, self.mapping_config_path)
+        self._refresh_mapping_profile_combo()
+        self._refresh_mapping_table()
+        self._refresh_testing_list()
+        self._update_mapping_status()
+        self.log(f'Renamed input mapping profile "{current_name}" to "{new_name}".')
+
     def delete_mapping_profile(self) -> None:
         name = self.mapping_profile_var.get()
         if len(self.input_mapper.config.profiles) <= 1:
@@ -5674,6 +5708,10 @@ class AirTrixxGUI:
         self.input_mapper.test_action(rule.action)
         self._refresh_mapping_table()
 
+    @staticmethod
+    def _mapping_source_visible(source: str) -> bool:
+        return not str(source).startswith("fused.")
+
     def _rule_dialog_sources(self, rule: MappingRule) -> list[str]:
         sources = set(SignalCatalog.flatten(self._latest_snapshot).keys())
         sources.update(item.source for item in self.input_mapper.active_rules() if item.source)
@@ -5687,7 +5725,8 @@ class AirTrixxGUI:
         if rule.action.text_source:
             sources.add(rule.action.text_source)
         sources.add("keyboard.input")
-        return sorted(sources)
+        visible_sources = [source for source in sources if self._mapping_source_visible(source) or source == rule.source]
+        return sorted(visible_sources)
 
     def _open_mapping_dialog(self, rule: MappingRule, *, is_new: bool) -> None:
         working = copy.deepcopy(rule)
@@ -6218,7 +6257,13 @@ class AirTrixxGUI:
     def _refresh_mapping_signal_tree(self) -> None:
         if not hasattr(self, "mapping_signal_tree"):
             return
+        existing_groups = set(self.mapping_signal_group_items.values())
+        existing_items = set(self.mapping_signal_items.values())
+        seen_groups: set[str] = set()
+        seen_items: set[str] = set()
         for signal in SignalCatalog.rows(self._latest_snapshot):
+            if not self._mapping_source_visible(signal.id):
+                continue
             group_item = self.mapping_signal_group_items.get(signal.group)
             if group_item is None:
                 group_item = f"group:{signal.group.lower().replace(' ', '_')}"
@@ -6232,6 +6277,7 @@ class AirTrixxGUI:
                     values=("", ""),
                     open=True,
                 )
+            seen_groups.add(group_item)
             item_id = f"signal:{signal.id}"
             self.mapping_signal_items[signal.id] = item_id
             values = (signal.display_value, signal.id)
@@ -6245,6 +6291,13 @@ class AirTrixxGUI:
                     text=signal.label,
                     values=values,
                 )
+            seen_items.add(item_id)
+        for item_id in existing_items - seen_items:
+            if self.mapping_signal_tree.exists(item_id):
+                self.mapping_signal_tree.delete(item_id)
+        for group_item in existing_groups - seen_groups:
+            if self.mapping_signal_tree.exists(group_item):
+                self.mapping_signal_tree.delete(group_item)
 
     def _refresh_mapping_table(self) -> None:
         if not hasattr(self, "mapping_rule_tree"):

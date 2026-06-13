@@ -22,6 +22,7 @@ from input_mapper import (
     MappingRule,
     SignalCatalog,
     TAB_SWITCH_PROFILE_NAME,
+    TAB_CURSOR_SCROLL_PROFILE_NAME,
     VIEWER_3D_PROFILE_NAME,
     WRISTBAND_MOUSE_CURSOR_PROFILE_NAME,
     default_mapping_config,
@@ -31,7 +32,10 @@ from input_mapper import (
     gta_vice_city_profile,
     viewer_3d_profile,
     wristband_mouse_cursor_profile,
+    wrist_scroll_profile,
     wrist_tab_switching_profile,
+    tabs_cursor_scroll_profile,
+    WRIST_SCROLL_PROFILE_NAME,
 )
 
 
@@ -583,10 +587,10 @@ class InputMapperRuntimeTests(unittest.TestCase):
 class MappingConfigTests(unittest.TestCase):
     def test_default_config_includes_wrist_tab_switching_profile(self) -> None:
         config = default_mapping_config()
-        self.assertIn(TAB_SWITCH_PROFILE_NAME, config.profile_names())
-        self.assertIn(GTA_VICE_CITY_PROFILE_NAME, config.profile_names())
-        self.assertIn(VIEWER_3D_PROFILE_NAME, config.profile_names())
-        self.assertIn(WRISTBAND_MOUSE_CURSOR_PROFILE_NAME, config.profile_names())
+        self.assertEqual(
+            config.profile_names(),
+            [GTA_VICE_CITY_PROFILE_NAME, VIEWER_3D_PROFILE_NAME, TAB_CURSOR_SCROLL_PROFILE_NAME],
+        )
 
     def test_wristband_mouse_cursor_profile_uses_calibrated_accel_follow_rule(self) -> None:
         profile = wristband_mouse_cursor_profile()
@@ -607,7 +611,32 @@ class MappingConfigTests(unittest.TestCase):
             loaded, error = load_mapping_config(path)
             self.assertIsNone(error)
             self.assertIn("Custom", loaded.profile_names())
-            self.assertIn(WRISTBAND_MOUSE_CURSOR_PROFILE_NAME, loaded.profile_names())
+            self.assertEqual(loaded.profile_names(), ["Custom"])
+
+    def test_load_config_preserves_user_customized_builtin_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "input_mappings.json"
+            customized = MappingProfile(
+                name=TAB_SWITCH_PROFILE_NAME,
+                mappings=[
+                    MappingRule(
+                        id="custom_tab_rule",
+                        name="Custom tab rule",
+                        source="fused.wrist_rule_value",
+                        comparator="eq",
+                        threshold="rotate_right_return",
+                        action=MappingAction(type="keyboard_tap", keys=["tab"]),
+                    )
+                ],
+            )
+            config = MappingConfig(profiles=[customized], active_profile=TAB_SWITCH_PROFILE_NAME)
+            save_mapping_config(config, path)
+
+            loaded, error = load_mapping_config(path)
+
+            self.assertIsNone(error)
+            loaded_profile = next(profile for profile in loaded.profiles if profile.name == TAB_SWITCH_PROFILE_NAME)
+            self.assertEqual([rule.id for rule in loaded_profile.mappings], ["custom_tab_rule"])
 
     def test_gta_profile_uses_wrist_rules_for_weapon_swaps(self) -> None:
         rules = {rule.id: rule for rule in gta_vice_city_profile().mappings}
@@ -629,6 +658,25 @@ class MappingConfigTests(unittest.TestCase):
                 "viewer_zoom_out",
             }.issubset(rule_ids)
         )
+
+    def test_wrist_scroll_profile_uses_wrist_rules_for_mouse_scroll(self) -> None:
+        rules = {rule.id: rule for rule in wrist_scroll_profile().mappings}
+        self.assertEqual(rules["wrist_scroll_up"].source, "fused.wrist_rule_value")
+        self.assertEqual(rules["wrist_scroll_up"].threshold, "rotate_right_return")
+        self.assertEqual(rules["wrist_scroll_up"].action.type, "mouse_scroll")
+        self.assertEqual(rules["wrist_scroll_down"].threshold, "rotate_left_return")
+        self.assertEqual(rules["wrist_scroll_down"].action.scroll_y, -1)
+
+    def test_tabs_cursor_scroll_profile_matches_finalized_mapping(self) -> None:
+        profile = tabs_cursor_scroll_profile()
+        rules = {rule.id: rule for rule in profile.mappings}
+        self.assertEqual(len(profile.mappings), 8)
+        self.assertEqual(rules["wrist_cursor_follow_gyro"].action.speed_x, -30.0)
+        self.assertEqual(rules["wrist_cursor_follow_gyro"].action.speed_y, -30.0)
+        self.assertEqual(rules["wrist_scroll_up"].source, "wristband.gyro_x")
+        self.assertEqual(rules["wrist_scroll_up"].action.interval_ms, 90)
+        self.assertEqual(rules["wrist_scroll_down"].action.scroll_y, -1)
+        self.assertEqual(rules["wrist_cursor_right_click"].source, "fused.left_hand_gesture")
 
     def test_remove_profile_falls_back_and_protects_last_profile(self) -> None:
         config = MappingConfig(profiles=[MappingProfile(), wrist_tab_switching_profile()])
@@ -692,7 +740,7 @@ class MappingConfigTests(unittest.TestCase):
             path.write_text(json.dumps({"version": 1, "profiles": [{"mappings": [{"action": {"type": "bad"}}]}]}))
             loaded, error = load_mapping_config(path)
             self.assertIsNotNone(error)
-            self.assertEqual(loaded.active().mappings, [])
+            self.assertEqual(loaded.profile_names(), [GTA_VICE_CITY_PROFILE_NAME, VIEWER_3D_PROFILE_NAME, TAB_CURSOR_SCROLL_PROFILE_NAME])
 
 
 if __name__ == "__main__":

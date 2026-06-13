@@ -637,6 +637,262 @@ GTA_VICE_CITY_PROFILE_NAME = "GTA Vice City"
 VIEWER_3D_PROFILE_NAME = "3D Viewer"
 WRISTBAND_MOUSE_CURSOR_PROFILE_NAME = "Wristband Mouse Cursor"
 WRIST_CURSOR_PROFILE_NAME = "Wrist Cursor"
+WRIST_SCROLL_PROFILE_NAME = "Wrist Scroll"
+TAB_CURSOR_SCROLL_PROFILE_NAME = "Tabs + Cursor + Scroll"
+
+TAB_CURSOR_SCROLL_PROFILE_DATA: dict[str, Any] = {
+    "name": TAB_CURSOR_SCROLL_PROFILE_NAME,
+    "mappings": [
+        {
+            "id": "wrist_tab_cycle_forward",
+            "name": "Cycle tabs forward",
+            "enabled": True,
+            "source": "fused.wrist_rule_value",
+            "comparator": "eq",
+            "threshold": "rotate_right_return",
+            "low": "0.0",
+            "high": "1.0",
+            "hysteresis": 0.0,
+            "debounce_ms": 0,
+            "gate_source": "",
+            "gate_comparator": "truthy",
+            "gate_threshold": True,
+            "gate_low": 0.0,
+            "gate_high": 1.0,
+            "conditions": [
+                {
+                    "source": "fused.right_hand_z_mm",
+                    "comparator": "lt",
+                    "threshold": "500",
+                    "low": 0.0,
+                    "high": 1.0,
+                    "hysteresis": 0.0,
+                    "output_keys": ["alt"],
+                }
+            ],
+            "recognition_label": "",
+            "action": {"type": "keyboard_tap", "keys": ["tab"]},
+        },
+        {
+            "id": "wrist_tab_cycle_backward",
+            "name": "Cycle tabs backward",
+            "enabled": True,
+            "source": "fused.wrist_rule_value",
+            "comparator": "eq",
+            "threshold": "rotate_left_return",
+            "low": "0.0",
+            "high": "1.0",
+            "hysteresis": 0.0,
+            "debounce_ms": 0,
+            "gate_source": "",
+            "gate_comparator": "truthy",
+            "gate_threshold": True,
+            "gate_low": 0.0,
+            "gate_high": 1.0,
+            "conditions": [
+                {
+                    "source": "hands.right.z_mm",
+                    "comparator": "lt",
+                    "threshold": "500",
+                    "low": 0.0,
+                    "high": 1.0,
+                    "hysteresis": 0.0,
+                    "output_keys": ["alt"],
+                }
+            ],
+            "recognition_label": "",
+            "action": {"type": "keyboard_tap", "keys": ["shift", "tab"]},
+        },
+        {
+            "id": "wrist_cursor_follow_gyro",
+            "name": "Follow cursor with wrist gyro",
+            "enabled": True,
+            "source": "wrist_cursor.enabled",
+            "comparator": "truthy",
+            "threshold": "100.0",
+            "low": "0.0",
+            "high": "1.0",
+            "hysteresis": 0.0,
+            "debounce_ms": 0,
+            "gate_source": "",
+            "gate_comparator": "truthy",
+            "gate_threshold": True,
+            "gate_low": 0.0,
+            "gate_high": 1.0,
+            "conditions": [
+                {
+                    "source": "hands.left.gesture",
+                    "comparator": "eq",
+                    "threshold": "open_palm",
+                    "low": 0.0,
+                    "high": 1.0,
+                    "hysteresis": 0.0,
+                    "output_keys": [],
+                }
+            ],
+            "recognition_label": "",
+            "action": {
+                "type": "mouse_move",
+                "speed_x": -30.0,
+                "speed_y": -30.0,
+                "speed_x_source": "wristband.gyro_z",
+                "speed_y_source": "wristband.gyro_x",
+                "move_deadband": 2.0,
+                "move_smoothing_alpha": 0.18,
+            },
+        },
+        {
+            "id": "wrist_cursor_left_click",
+            "name": "Left click",
+            "enabled": True,
+            "source": "fused.right_hand_gesture",
+            "comparator": "eq",
+            "threshold": "index_thumb_pinch",
+            "low": "0.0",
+            "high": "1.0",
+            "hysteresis": 0.0,
+            "debounce_ms": 0,
+            "gate_source": "",
+            "gate_comparator": "truthy",
+            "gate_threshold": True,
+            "gate_low": 0.0,
+            "gate_high": 1.0,
+            "conditions": [
+                {
+                    "source": "hands.left.gesture",
+                    "comparator": "eq",
+                    "threshold": "closed_fist",
+                    "low": 0.0,
+                    "high": 1.0,
+                    "hysteresis": 0.0,
+                    "output_keys": [],
+                }
+            ],
+            "recognition_label": "",
+            "action": {"type": "mouse_click", "button": "left"},
+        },
+        {
+            "id": "wrist_cursor_left_hold",
+            "name": "Left hold",
+            "enabled": True,
+            "source": "fused.right_hand_gesture",
+            "comparator": "eq",
+            "threshold": "index_thumb_pinch",
+            "low": "0.0",
+            "high": "1.0",
+            "hysteresis": 0.0,
+            "debounce_ms": 0,
+            "gate_source": "",
+            "gate_comparator": "truthy",
+            "gate_threshold": True,
+            "gate_low": 0.0,
+            "gate_high": 1.0,
+            "conditions": [
+                {
+                    "source": "hands.left.gesture",
+                    "comparator": "eq",
+                    "threshold": "closed_fist",
+                    "low": 0.0,
+                    "high": 1.0,
+                    "hysteresis": 0.0,
+                    "output_keys": [],
+                }
+            ],
+            "recognition_label": "",
+            "action": {"type": "mouse_hold", "button": "left"},
+        },
+        {
+            "id": "wrist_cursor_right_click",
+            "name": "Right click",
+            "enabled": True,
+            "source": "fused.left_hand_gesture",
+            "comparator": "eq",
+            "threshold": "index_thumb_pinch",
+            "low": "0.0",
+            "high": "1.0",
+            "hysteresis": 0.0,
+            "debounce_ms": 0,
+            "gate_source": "",
+            "gate_comparator": "truthy",
+            "gate_threshold": True,
+            "gate_low": 0.0,
+            "gate_high": 1.0,
+            "conditions": [
+                {
+                    "source": "hands.left.gesture",
+                    "comparator": "eq",
+                    "threshold": "closed_fist",
+                    "low": 0.0,
+                    "high": 1.0,
+                    "hysteresis": 0.0,
+                    "output_keys": [],
+                }
+            ],
+            "recognition_label": "",
+            "action": {"type": "mouse_click", "button": "right"},
+        },
+        {
+            "id": "wrist_scroll_up",
+            "name": "Scroll up",
+            "enabled": True,
+            "source": "wristband.gyro_x",
+            "comparator": "lt",
+            "threshold": "-4",
+            "low": "0.0",
+            "high": "1.0",
+            "hysteresis": 2.0,
+            "debounce_ms": 60,
+            "gate_source": "",
+            "gate_comparator": "truthy",
+            "gate_threshold": True,
+            "gate_low": 0.0,
+            "gate_high": 1.0,
+            "conditions": [
+                {
+                    "source": "hands.left.gesture",
+                    "comparator": "eq",
+                    "threshold": "peace_sign",
+                    "low": 0.0,
+                    "high": 1.0,
+                    "hysteresis": 0.0,
+                    "output_keys": [],
+                }
+            ],
+            "recognition_label": "",
+            "action": {"type": "mouse_scroll", "interval_ms": 90, "scroll_y": 1},
+        },
+        {
+            "id": "wrist_scroll_down",
+            "name": "Scroll down",
+            "enabled": True,
+            "source": "wristband.gyro_x",
+            "comparator": "gt",
+            "threshold": "8",
+            "low": "0.0",
+            "high": "1.0",
+            "hysteresis": 2.0,
+            "debounce_ms": 60,
+            "gate_source": "",
+            "gate_comparator": "truthy",
+            "gate_threshold": True,
+            "gate_low": 0.0,
+            "gate_high": 1.0,
+            "conditions": [
+                {
+                    "source": "hands.left.gesture",
+                    "comparator": "eq",
+                    "threshold": "peace_sign",
+                    "low": 0.0,
+                    "high": 1.0,
+                    "hysteresis": 0.0,
+                    "output_keys": [],
+                }
+            ],
+            "recognition_label": "",
+            "action": {"type": "mouse_scroll", "interval_ms": 90, "scroll_y": -1},
+        },
+    ],
+}
 
 
 def wrist_tab_switching_profile() -> MappingProfile:
@@ -911,31 +1167,48 @@ def wrist_cursor_profile() -> MappingProfile:
     )
 
 
+def wrist_scroll_profile() -> MappingProfile:
+    return MappingProfile(
+        name=WRIST_SCROLL_PROFILE_NAME,
+        mappings=[
+            MappingRule(
+                id="wrist_scroll_up",
+                name="Scroll up from wrist rotate right",
+                source="fused.wrist_rule_value",
+                comparator="eq",
+                threshold="rotate_right_return",
+                recognition_label="Scroll up",
+                action=MappingAction(type="mouse_scroll", scroll_y=1),
+            ),
+            MappingRule(
+                id="wrist_scroll_down",
+                name="Scroll down from wrist rotate left",
+                source="fused.wrist_rule_value",
+                comparator="eq",
+                threshold="rotate_left_return",
+                recognition_label="Scroll down",
+                action=MappingAction(type="mouse_scroll", scroll_y=-1),
+            ),
+        ],
+    )
+
+
+def tabs_cursor_scroll_profile() -> MappingProfile:
+    return MappingProfile.from_dict(TAB_CURSOR_SCROLL_PROFILE_DATA)
+
+
 def builtin_mapping_profiles() -> list[MappingProfile]:
     return [
-        MappingProfile(),
-        wrist_tab_switching_profile(),
         gta_vice_city_profile(),
         viewer_3d_profile(),
-        wristband_mouse_cursor_profile(),
-        wrist_cursor_profile(),
+        tabs_cursor_scroll_profile(),
     ]
 
 
 def ensure_builtin_profiles(config: MappingConfig) -> MappingConfig:
-    builtin_profiles = builtin_mapping_profiles()
+    if not config.profiles:
+        config.profiles = builtin_mapping_profiles()
     existing_by_name = {profile.name: profile for profile in config.profiles}
-    for builtin_profile in builtin_profiles:
-        existing_profile = existing_by_name.get(builtin_profile.name)
-        if existing_profile is None:
-            config.profiles.append(builtin_profile)
-            existing_by_name[builtin_profile.name] = builtin_profile
-            continue
-        existing_rule_ids = {rule.id for rule in existing_profile.mappings}
-        for builtin_rule in builtin_profile.mappings:
-            if builtin_rule.id not in existing_rule_ids:
-                existing_profile.mappings.append(builtin_rule)
-                existing_rule_ids.add(builtin_rule.id)
     if config.active_profile not in existing_by_name and config.profiles:
         config.active_profile = config.profiles[0].name
     return config
