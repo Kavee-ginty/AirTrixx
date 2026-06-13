@@ -102,6 +102,7 @@ class SignalCatalog:
         input_dict = snapshot.get("input_dict", {}) if isinstance(snapshot, dict) else {}
         hand_state = snapshot.get("hand_state", {}) if isinstance(snapshot, dict) else {}
         face_state = snapshot.get("face_state", {}) if isinstance(snapshot, dict) else {}
+        wrist_cursor_state = snapshot.get("wrist_cursor_state", {}) if isinstance(snapshot, dict) else {}
         devices = raw_state.get("devices", {}) if isinstance(raw_state, dict) else {}
 
         add("Antenna", "antenna.connected", "Antenna connected", bool(raw_state))
@@ -157,6 +158,7 @@ class SignalCatalog:
 
         wrist = devices.get("wristband", {}) if isinstance(devices, dict) else {}
         wrist_accel = wrist.get("accel", {}) if isinstance(wrist, dict) else {}
+        wrist_calibrated_accel = wrist.get("calibrated_accel", {}) if isinstance(wrist, dict) else {}
         wrist_gyro = wrist.get("gyro", {}) if isinstance(wrist, dict) else {}
         add("Wristband", "wristband.status", "Status", wrist.get("status") if isinstance(wrist, dict) else None)
         add("Wristband", "wristband.sequence", "Sequence", wrist.get("sequence") if isinstance(wrist, dict) else None)
@@ -166,6 +168,12 @@ class SignalCatalog:
         add("Wristband", "wristband.yaw", "Yaw", wrist.get("yaw") if isinstance(wrist, dict) else None)
         for axis in ("x", "y", "z"):
             add("Wristband", f"wristband.accel_{axis}", f"Accel {axis}", wrist_accel.get(axis))
+            add(
+                "Wristband",
+                f"wristband.calibrated_accel_{axis}",
+                f"Calibrated accel {axis}",
+                wrist_calibrated_accel.get(axis),
+            )
             add("Wristband", f"wristband.gyro_{axis}", f"Gyro {axis}", wrist_gyro.get(axis))
 
         camdock = devices.get("camdock", {}) if isinstance(devices, dict) else {}
@@ -196,6 +204,12 @@ class SignalCatalog:
             add("Camera", "camera.face_x", "Face x", face_state.get("x"))
             add("Camera", "camera.face_top_y", "Face top y", face_state.get("top_y"))
             add("Camera", "camera.face_y", "Face y", face_state.get("y"))
+
+        if isinstance(wrist_cursor_state, dict):
+            add("Fused Input", "wrist_cursor.enabled", "Wrist cursor enabled", wrist_cursor_state.get("enabled"))
+            add("Fused Input", "wrist_cursor.left_click", "Wrist cursor left click", wrist_cursor_state.get("left_click"))
+            add("Fused Input", "wrist_cursor.left_hold", "Wrist cursor left hold", wrist_cursor_state.get("left_hold"))
+            add("Fused Input", "wrist_cursor.right_click", "Wrist cursor right click", wrist_cursor_state.get("right_click"))
 
         audiodock = devices.get("audiodock", {}) if isinstance(devices, dict) else {}
         add("Audio Dock", "audiodock.status", "Status", audiodock.get("status") if isinstance(audiodock, dict) else None)
@@ -242,6 +256,12 @@ class MappingAction:
     scroll_y: int = 1
     speed_x: float = 0.0
     speed_y: float = 0.0
+    speed_x_source: str = ""
+    speed_y_source: str = ""
+    speed_x_offset: float = 0.0
+    speed_y_offset: float = 0.0
+    move_deadband: float = 0.0
+    move_smoothing_alpha: float = 1.0
     absolute_x: float = 0.5
     absolute_y: float = 0.5
     absolute_x_source: str = ""
@@ -259,6 +279,7 @@ class MappingAction:
         action_type = str(data.get("type", "keyboard_tap"))
         if action_type not in ACTION_TYPES:
             raise ValueError(f"unknown mapping action type: {action_type}")
+        move_smoothing_alpha = float(data.get("move_smoothing_alpha", 1.0) or 1.0)
         smoothing_alpha = float(data.get("absolute_smoothing_alpha", 1.0) or 1.0)
         return cls(
             type=action_type,
@@ -273,6 +294,12 @@ class MappingAction:
             scroll_y=int(float(data.get("scroll_y", 1) or 0)),
             speed_x=float(data.get("speed_x", 0.0) or 0.0),
             speed_y=float(data.get("speed_y", 0.0) or 0.0),
+            speed_x_source=str(data.get("speed_x_source") or ""),
+            speed_y_source=str(data.get("speed_y_source") or ""),
+            speed_x_offset=float(data.get("speed_x_offset", 0.0) or 0.0),
+            speed_y_offset=float(data.get("speed_y_offset", 0.0) or 0.0),
+            move_deadband=max(0.0, float(data.get("move_deadband", 0.0) or 0.0)),
+            move_smoothing_alpha=max(0.01, min(1.0, move_smoothing_alpha)),
             absolute_x=max(0.0, min(1.0, float(data.get("absolute_x", 0.5) or 0.0))),
             absolute_y=max(0.0, min(1.0, float(data.get("absolute_y", 0.5) or 0.0))),
             absolute_x_source=str(data.get("absolute_x_source") or ""),
@@ -298,6 +325,12 @@ class MappingAction:
             "scroll_y": self.scroll_y,
             "speed_x": self.speed_x,
             "speed_y": self.speed_y,
+            "speed_x_source": self.speed_x_source,
+            "speed_y_source": self.speed_y_source,
+            "speed_x_offset": self.speed_x_offset,
+            "speed_y_offset": self.speed_y_offset,
+            "move_deadband": self.move_deadband,
+            "move_smoothing_alpha": self.move_smoothing_alpha,
             "absolute_x": self.absolute_x,
             "absolute_y": self.absolute_y,
             "absolute_x_source": self.absolute_x_source,
@@ -340,6 +373,18 @@ class MappingAction:
         if self.type == "mouse_scroll":
             return f"scroll x={self.scroll_x} y={self.scroll_y}"
         if self.type == "mouse_move":
+            if self.speed_x_source or self.speed_y_source:
+                x_source = self.speed_x_source or "0"
+                y_source = self.speed_y_source or "0"
+                flags = []
+                if self.move_deadband > 0.0:
+                    flags.append(f"deadband {self.move_deadband:g}")
+                if self.speed_x_offset or self.speed_y_offset:
+                    flags.append(f"offset {self.speed_x_offset:g},{self.speed_y_offset:g}")
+                if self.move_smoothing_alpha < 1.0:
+                    flags.append(f"alpha {self.move_smoothing_alpha:g}")
+                suffix = f" ({', '.join(flags)})" if flags else ""
+                return f"move from {x_source},{y_source} gain {self.speed_x:g},{self.speed_y:g}{suffix}"
             return f"move x={self.speed_x:g}/s y={self.speed_y:g}/s"
         if self.type == "mouse_absolute":
             if self.absolute_x_source or self.absolute_y_source:
@@ -590,6 +635,8 @@ class MappingConfig:
 TAB_SWITCH_PROFILE_NAME = "Wrist Tab Switching"
 GTA_VICE_CITY_PROFILE_NAME = "GTA Vice City"
 VIEWER_3D_PROFILE_NAME = "3D Viewer"
+WRISTBAND_MOUSE_CURSOR_PROFILE_NAME = "Wristband Mouse Cursor"
+WRIST_CURSOR_PROFILE_NAME = "Wrist Cursor"
 
 
 def wrist_tab_switching_profile() -> MappingProfile:
@@ -797,15 +844,105 @@ def viewer_3d_profile() -> MappingProfile:
     )
 
 
-def default_mapping_config() -> MappingConfig:
-    return MappingConfig(
-        profiles=[
-            MappingProfile(),
-            wrist_tab_switching_profile(),
-            gta_vice_city_profile(),
-            viewer_3d_profile(),
-        ]
+def wristband_mouse_cursor_profile() -> MappingProfile:
+    return MappingProfile(
+        name=WRISTBAND_MOUSE_CURSOR_PROFILE_NAME,
+        mappings=[
+            MappingRule(
+                id="wrist_mouse_follow_accel",
+                name="Follow cursor with wrist accel",
+                source="wristband.sequence",
+                comparator="present",
+                action=MappingAction(
+                    type="mouse_move",
+                    speed_x=220.0,
+                    speed_y=-220.0,
+                    speed_x_source="wristband.calibrated_accel_x",
+                    speed_y_source="wristband.calibrated_accel_y",
+                    move_deadband=0.75,
+                    move_smoothing_alpha=0.22,
+                ),
+            ),
+        ],
     )
+
+
+def wrist_cursor_profile() -> MappingProfile:
+    return MappingProfile(
+        name=WRIST_CURSOR_PROFILE_NAME,
+        mappings=[
+            MappingRule(
+                id="wrist_cursor_follow_gyro",
+                name="Follow cursor with wrist gyro",
+                source="wrist_cursor.enabled",
+                comparator="truthy",
+                action=MappingAction(
+                    type="mouse_move",
+                    speed_x=-12.0,
+                    speed_y=-12.0,
+                    speed_x_source="wristband.gyro_z",
+                    speed_y_source="wristband.gyro_x",
+                    move_deadband=2.0,
+                    move_smoothing_alpha=0.18,
+                ),
+            ),
+            MappingRule(
+                id="wrist_cursor_left_click",
+                name="Left click from right hand tap",
+                source="wrist_cursor.left_click",
+                comparator="truthy",
+                action=MappingAction(type="mouse_click", button="left"),
+            ),
+            MappingRule(
+                id="wrist_cursor_left_hold",
+                name="Left hold from right hand fist",
+                source="wrist_cursor.left_hold",
+                comparator="truthy",
+                action=MappingAction(type="mouse_hold", button="left"),
+            ),
+            MappingRule(
+                id="wrist_cursor_right_click",
+                name="Right click from left hand tap",
+                source="wrist_cursor.right_click",
+                comparator="truthy",
+                action=MappingAction(type="mouse_click", button="right"),
+            ),
+        ],
+    )
+
+
+def builtin_mapping_profiles() -> list[MappingProfile]:
+    return [
+        MappingProfile(),
+        wrist_tab_switching_profile(),
+        gta_vice_city_profile(),
+        viewer_3d_profile(),
+        wristband_mouse_cursor_profile(),
+        wrist_cursor_profile(),
+    ]
+
+
+def ensure_builtin_profiles(config: MappingConfig) -> MappingConfig:
+    builtin_profiles = builtin_mapping_profiles()
+    existing_by_name = {profile.name: profile for profile in config.profiles}
+    for builtin_profile in builtin_profiles:
+        existing_profile = existing_by_name.get(builtin_profile.name)
+        if existing_profile is None:
+            config.profiles.append(builtin_profile)
+            existing_by_name[builtin_profile.name] = builtin_profile
+            continue
+        existing_rule_ids = {rule.id for rule in existing_profile.mappings}
+        for builtin_rule in builtin_profile.mappings:
+            if builtin_rule.id not in existing_rule_ids:
+                existing_profile.mappings.append(builtin_rule)
+                existing_rule_ids.add(builtin_rule.id)
+    if config.active_profile not in existing_by_name and config.profiles:
+        config.active_profile = config.profiles[0].name
+    return config
+
+
+def default_mapping_config() -> MappingConfig:
+    return ensure_builtin_profiles(MappingConfig(profiles=builtin_mapping_profiles()))
 
 
 def load_mapping_config(path: Path = DEFAULT_MAPPING_PATH) -> tuple[MappingConfig, str | None]:
@@ -813,7 +950,7 @@ def load_mapping_config(path: Path = DEFAULT_MAPPING_PATH) -> tuple[MappingConfi
         return default_mapping_config(), None
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
-        return MappingConfig.from_dict(data), None
+        return ensure_builtin_profiles(MappingConfig.from_dict(data)), None
     except Exception as exc:
         return default_mapping_config(), str(exc)
 
@@ -834,6 +971,8 @@ class _RuntimeState:
     last_process_s: float | None = None
     residual_x: float = 0.0
     residual_y: float = 0.0
+    move_value_x: float | None = None
+    move_value_y: float | None = None
     absolute_x: float | None = None
     absolute_y: float | None = None
     status: str = "idle"
@@ -1024,6 +1163,8 @@ class InputMapper:
             state.active = False
             state.pending_desired = None
             state.enter_blocked = False
+            state.move_value_x = None
+            state.move_value_y = None
             state.status = "idle"
 
     def test_action(self, action: MappingAction) -> None:
@@ -1073,6 +1214,8 @@ class InputMapper:
             state.last_process_s = now_s
             state.residual_x = 0.0
             state.residual_y = 0.0
+            state.move_value_x = None
+            state.move_value_y = None
             state.absolute_x = None
             state.absolute_y = None
             state.enter_blocked = bool(gesture_name and not self._can_fire_gesture(gesture_name, now_s))
@@ -1289,7 +1432,7 @@ class InputMapper:
             last = state.last_process_s if state.last_process_s is not None else now_s
             dt = max(0.0, min(0.2, now_s - last))
             state.last_process_s = now_s
-            self._move_relative(action, state, dt, now_s)
+            self._move_relative(action, state, dt, now_s, signals)
         elif action.type == "mouse_absolute" and action.continuous:
             if self._move_absolute(action, signals, state):
                 state.last_fired_s = now_s
@@ -1312,9 +1455,40 @@ class InputMapper:
         holders.add(rule_id)
         self._rule_buttons.setdefault(rule_id, set()).add(button)
 
-    def _move_relative(self, action: MappingAction, state: _RuntimeState, dt: float, now_s: float) -> None:
-        move_x = (action.speed_x * dt) + state.residual_x
-        move_y = (action.speed_y * dt) + state.residual_y
+    def _move_relative(
+        self,
+        action: MappingAction,
+        state: _RuntimeState,
+        dt: float,
+        now_s: float,
+        signals: dict[str, SignalValue] | None = None,
+    ) -> None:
+        velocity_x = action.speed_x
+        velocity_y = action.speed_y
+        if action.speed_x_source or action.speed_y_source:
+            velocity_x = self._relative_speed_value(
+                gain=action.speed_x,
+                source=action.speed_x_source,
+                signals=signals,
+                previous=state.move_value_x,
+                offset=action.speed_x_offset,
+                deadband=action.move_deadband,
+                smoothing_alpha=action.move_smoothing_alpha,
+            )
+            velocity_y = self._relative_speed_value(
+                gain=action.speed_y,
+                source=action.speed_y_source,
+                signals=signals,
+                previous=state.move_value_y,
+                offset=action.speed_y_offset,
+                deadband=action.move_deadband,
+                smoothing_alpha=action.move_smoothing_alpha,
+            )
+            state.move_value_x = velocity_x
+            state.move_value_y = velocity_y
+
+        move_x = (velocity_x * dt) + state.residual_x
+        move_y = (velocity_y * dt) + state.residual_y
         step_x = int(move_x)
         step_y = int(move_y)
         state.residual_x = move_x - step_x
@@ -1322,6 +1496,32 @@ class InputMapper:
         if step_x or step_y:
             self.backend.move(step_x, step_y)
             state.last_fired_s = now_s
+
+    @staticmethod
+    def _relative_speed_value(
+        *,
+        gain: float,
+        source: str,
+        signals: dict[str, SignalValue] | None,
+        previous: float | None,
+        offset: float,
+        deadband: float,
+        smoothing_alpha: float,
+    ) -> float:
+        if not source or not signals:
+            return gain
+        signal = signals.get(source)
+        number = _to_number(signal.value) if signal is not None else None
+        if number is None:
+            target = 0.0
+        else:
+            centered = number - offset
+            target = 0.0 if abs(centered) < max(0.0, deadband) else centered * gain
+        if previous is None:
+            return target
+        alpha = max(0.01, min(1.0, smoothing_alpha))
+        filtered = previous + (target - previous) * alpha
+        return 0.0 if abs(filtered) < 0.01 else filtered
 
     def _move_absolute(
         self,

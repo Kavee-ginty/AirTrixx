@@ -31,6 +31,9 @@ static const uint8_t ENC_SW = 2;
 static const uint8_t TEMP_BUS = 3;
 static const uint8_t I2C_SDA = 10;
 static const uint8_t I2C_SCL = 9;
+static const int ENCODER_COUNTS_PER_REV = 15;
+static const int LCD_WINDOW_COUNT = CHANNEL_COUNT + 1;
+static const int COUNTS_PER_WINDOW = ENCODER_COUNTS_PER_REV / LCD_WINDOW_COUNT;
 
 // Electrical constants
 static const float BATT_IR_OHMS = 0.41f;
@@ -45,7 +48,6 @@ static const float MIN_MAH_CURRENT_MA = 20.0f;
 
 static const uint32_t SENSOR_INTERVAL_MS = 500;
 static const uint32_t DISPLAY_INTERVAL_MS = 250;
-static const uint32_t STATUS_INTERVAL_MS = 2000;
 static const uint32_t REPORT_INTERVAL_MS = 1000UL / CHARGING_DOCK_REPORT_HZ;
 static const uint32_t BUTTON_DEBOUNCE_MS = 250;
 static const int8_t WIFI_TX_POWER_QDBM = 34;
@@ -94,19 +96,34 @@ static float currentmA[CHANNEL_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
 
 static int activeTab = 0;
 static int priorityCH = -1;
-static int lastClk = HIGH;
 static bool lastButtonState = HIGH;
+static volatile long encoderCount = 0;
+static volatile uint32_t lastEncoderIsrUs = 0;
+static long lastReportedEncoderCount = LONG_MIN;
 
 static uint32_t lastTickMs = 0;
 static uint32_t lastSensorMs = 0;
 static uint32_t lastDisplayMs = 0;
-static uint32_t lastStatusMs = 0;
 static uint32_t lastReportMs = 0;
 static uint32_t lastButtonMs = 0;
 static uint16_t chargingDockSequence = 0;
 static uint32_t espNowSendOkCount = 0;
 static uint32_t espNowSendFailCount = 0;
 static bool espNowReady = false;
+
+void IRAM_ATTR onEncoderClockFalling() {
+  uint32_t nowUs = micros();
+  if (nowUs - lastEncoderIsrUs < 700) {
+    return;
+  }
+  lastEncoderIsrUs = nowUs;
+
+  if (digitalRead(ENC_DT) != digitalRead(ENC_CLK)) {
+    ++encoderCount;
+  } else {
+    --encoderCount;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Read temperature for a channel by sensor address(es).
@@ -293,20 +310,39 @@ static void updateSensorsAndChargeLogic() {
 }
 
 static void handleEncoder() {
-  int clk = digitalRead(ENC_CLK);
-  if (clk != lastClk && clk == LOW) {
-    if (digitalRead(ENC_DT) != clk) {
-      ++activeTab;
-    } else {
-      --activeTab;
+  long countSnapshot = encoderCount;
+  if (countSnapshot != lastReportedEncoderCount) {
+    int normalizedCount = static_cast<int>(countSnapshot % ENCODER_COUNTS_PER_REV);
+    if (normalizedCount < 0) {
+      normalizedCount += ENCODER_COUNTS_PER_REV;
     }
-    if (activeTab > static_cast<int>(CHANNEL_COUNT)) {
-      activeTab = 0;
-    } else if (activeTab < 0) {
-      activeTab = CHANNEL_COUNT;
+
+    int previousTab = activeTab;
+    activeTab = normalizedCount / COUNTS_PER_WINDOW;
+    if (activeTab >= LCD_WINDOW_COUNT) {
+      activeTab = LCD_WINDOW_COUNT - 1;
     }
+
+    Serial.print("[ENC] count=");
+    Serial.print(countSnapshot);
+    Serial.print(" normalized=");
+    Serial.print(normalizedCount);
+    Serial.print("/");
+    Serial.print(ENCODER_COUNTS_PER_REV);
+    Serial.print(" window=");
+    Serial.print(activeTab);
+    Serial.print("/");
+    Serial.print(LCD_WINDOW_COUNT - 1);
+    Serial.print(" priority=");
+    Serial.println(priorityCH);
+
+    if (activeTab != previousTab) {
+      Serial.print("[ENC] window switched -> ");
+      Serial.println(activeTab);
+    }
+
+    lastReportedEncoderCount = countSnapshot;
   }
-  lastClk = clk;
 
   bool buttonState = digitalRead(ENC_SW);
   uint32_t now = millis();
@@ -319,6 +355,8 @@ static void handleEncoder() {
     } else {
       priorityCH = -1;
     }
+    Serial.print("[ENC] button -> priority=");
+    Serial.println(priorityCH);
   }
   lastButtonState = buttonState;
 }
@@ -442,38 +480,6 @@ static void updateDisplay() {
   display.display();
 }
 
-static void printStatus() {
-  Serial.print("[CHG] tab=");
-  Serial.print(activeTab);
-  Serial.print(" priority=");
-  Serial.print(priorityCH);
-  for (uint8_t i = 0; i < CHANNEL_COUNT; ++i) {
-    Serial.print(" ");
-    Serial.print(CHANNEL_NAMES[i]);
-    Serial.print("=");
-    Serial.print(inaReady[i] ? "ok" : "ina_err");
-    Serial.print(gateEnabled[i] ? "/on" : "/off");
-    Serial.print("/");
-    Serial.print(batteryV[i], 3);
-    Serial.print("V/");
-    Serial.print(currentmA[i], 0);
-    Serial.print("mA/");
-    if (tempValid[i]) {
-      Serial.print(curTemp[i], 1);
-      Serial.print("C");
-    } else {
-      Serial.print(CHANNEL_HAS_TEMP[i] ? "temp_err" : "no_sensor");
-    }
-  }
-  Serial.print(" espnow=");
-  Serial.print(espNowReady ? "ready" : "off");
-  Serial.print(" send_ok/fail=");
-  Serial.print(espNowSendOkCount);
-  Serial.print("/");
-  Serial.print(espNowSendFailCount);
-  Serial.println();
-}
-
 static void sendChargingDockStatus() {
   if (!espNowReady) return;
 
@@ -533,8 +539,8 @@ void setup() {
   pinMode(ENC_CLK, INPUT_PULLUP);
   pinMode(ENC_DT, INPUT_PULLUP);
   pinMode(ENC_SW, INPUT_PULLUP);
-  lastClk = digitalRead(ENC_CLK);
   lastButtonState = digitalRead(ENC_SW);
+  attachInterrupt(digitalPinToInterrupt(ENC_CLK), onEncoderClockFalling, FALLING);
 
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(400000);
@@ -570,9 +576,9 @@ void setup() {
   lastTickMs = millis();
   lastSensorMs = 0;
   lastDisplayMs = 0;
-  lastStatusMs = 0;
   lastReportMs = 0;
   Serial.println("[CHG] Setup complete");
+  Serial.println("[ENC] Encoder debug enabled");
 }
 
 void loop() {
@@ -588,11 +594,6 @@ void loop() {
   if (now - lastDisplayMs >= DISPLAY_INTERVAL_MS) {
     lastDisplayMs = now;
     updateDisplay();
-  }
-
-  if (now - lastStatusMs >= STATUS_INTERVAL_MS) {
-    lastStatusMs = now;
-    printStatus();
   }
 
   if (now - lastReportMs >= REPORT_INTERVAL_MS) {

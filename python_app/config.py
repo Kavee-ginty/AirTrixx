@@ -66,8 +66,8 @@ DEFAULT_CALIBRATION: dict[str, Any] = {
     "tracking_frame_skip": 1,
     "preview_fps": 10,
     "face_detection_enabled_after_centering": 0,
-    "camera_width": 424,
-    "camera_height": 240,
+    "camera_width": 1280,
+    "camera_height": 720,
     "prediction_latency_ms": 50.0,
     "camera_horizontal_fov_deg": 70.0,
     "camera_vertical_fov_deg": 43.0,
@@ -116,8 +116,8 @@ class AppConfig:
     serial_port: str | None = None
     serial_baud: int = 921600
     camera_index: int = 1
-    camera_width: int = 424
-    camera_height: int = 240
+    camera_width: int = 1280
+    camera_height: int = 720
     tracking_frame_skip: int = 1
     preview_fps: int = 10
     face_detection_enabled_after_centering: bool = False
@@ -187,6 +187,17 @@ def _calibration_int(
     return max(minimum, min(maximum, value))
 
 
+def _camera_dimensions(calibration: dict[str, Any]) -> tuple[int, int]:
+    width = _calibration_int(calibration, "camera_width", 1280, 160, 1920)
+    height = _calibration_int(calibration, "camera_height", 720, 120, 1080)
+
+    # Upgrade the old low-resolution default automatically when a user has not
+    # intentionally changed it yet.
+    if width == 424 and height == 240:
+        return 1280, 720
+    return width, height
+
+
 def load_calibration(path: Path = CALIBRATION_PATH) -> dict[str, Any]:
     calibration, _warnings = load_calibration_with_warnings(path)
     return calibration
@@ -227,11 +238,12 @@ def load_app_config() -> AppConfig:
     ensure_directories()
     warnings = migrate_legacy_runtime_files(PATHS)
     calibration, calibration_warnings = load_calibration_with_warnings(PATHS.calibration_path)
+    camera_width, camera_height = _camera_dimensions(calibration)
     startup_warnings = [f"Migrated runtime file: {item}" for item in warnings]
     startup_warnings.extend(calibration_warnings)
     return AppConfig(
-        camera_width=_calibration_int(calibration, "camera_width", 424, 160, 1920),
-        camera_height=_calibration_int(calibration, "camera_height", 240, 120, 1080),
+        camera_width=camera_width,
+        camera_height=camera_height,
         tracking_frame_skip=_calibration_int(calibration, "tracking_frame_skip", 1, 0, 8),
         preview_fps=_calibration_int(calibration, "preview_fps", 10, 1, 60),
         face_detection_enabled_after_centering=bool(

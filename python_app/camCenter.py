@@ -95,6 +95,10 @@ except Exception:
     CALIBRATION_PATH = APP_DIR / "config" / "calibration.json"
 
 
+DEFAULT_CAMERA_WIDTH = 1280
+DEFAULT_CAMERA_HEIGHT = 720
+
+
 def load_centers() -> tuple[int, int]:
     """Load camera center pan/tilt from the same calibration file as main.py."""
     try:
@@ -105,6 +109,26 @@ def load_centers() -> tuple[int, int]:
     pan = int(data.get("cam_pan_center", DEFAULT_CENTER_TICKS))
     tilt = int(data.get("cam_tilt_center", DEFAULT_CENTER_TICKS))
     return clamp_tick(pan), clamp_tick(tilt)
+
+
+def load_camera_size() -> tuple[int, int]:
+    try:
+        data = json.loads(CALIBRATION_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        data = {}
+
+    try:
+        width = int(float(data.get("camera_width", DEFAULT_CAMERA_WIDTH)))
+    except (TypeError, ValueError):
+        width = DEFAULT_CAMERA_WIDTH
+    try:
+        height = int(float(data.get("camera_height", DEFAULT_CAMERA_HEIGHT)))
+    except (TypeError, ValueError):
+        height = DEFAULT_CAMERA_HEIGHT
+
+    if width == 424 and height == 240:
+        return DEFAULT_CAMERA_WIDTH, DEFAULT_CAMERA_HEIGHT
+    return max(160, min(1920, width)), max(120, min(1080, height))
 
 
 def clamp_tick(value: int | float) -> int:
@@ -288,6 +312,7 @@ def draw_debug_overlay(
 
 def main() -> None:
     pan_tick, tilt_tick = load_centers()
+    camera_width, camera_height = load_camera_size()
     center_pan, center_tilt = pan_tick, tilt_tick
     manual_step = MANUAL_STEP_TICKS
     auto_enabled = True
@@ -303,10 +328,11 @@ def main() -> None:
     if not cap.isOpened():
         raise SystemExit(f"Could not open camera index {CAMERA_INDEX}.")
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, camera_width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, camera_height)
 
     print("Camera centering debugger started.")
+    print(f"Requested camera resolution: {camera_width}x{camera_height}")
     print("Move the camera bracket until your head is near the top-center guide.")
 
     while True:
