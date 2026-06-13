@@ -50,6 +50,8 @@ TEXT_COMMAND_KEYS = {
     "space": ["space"],
     "return": ["enter"],
     "enter": ["enter"],
+    "win": ["cmd"],
+    "windows": ["cmd"],
     "backspace": ["backspace"],
     "backspase": ["backspace"],
     "capslock": ["caps_lock"],
@@ -590,6 +592,7 @@ class MappingConfig:
 TAB_SWITCH_PROFILE_NAME = "Wrist Tab Switching"
 GTA_VICE_CITY_PROFILE_NAME = "GTA Vice City"
 VIEWER_3D_PROFILE_NAME = "3D Viewer"
+KEYBOARD_WORD_TYPING_PROFILE_NAME = "Keyboard Word Typing"
 
 
 def wrist_tab_switching_profile() -> MappingProfile:
@@ -797,14 +800,57 @@ def viewer_3d_profile() -> MappingProfile:
     )
 
 
+def keyboard_word_typing_profile() -> MappingProfile:
+    return MappingProfile(
+        name=KEYBOARD_WORD_TYPING_PROFILE_NAME,
+        mappings=[
+            MappingRule(
+                id="keyboard_word_press_windows",
+                name="Keyboard: Win -> Windows key",
+                source="keyboard.input",
+                comparator="eq",
+                threshold="win",
+                recognition_label="Keyboard Windows key",
+                action=MappingAction(type="keyboard_tap", keys=["cmd"]),
+            ),
+            MappingRule(
+                id="keyboard_word_type_prediction",
+                name="Keyboard: type predicted word",
+                source="keyboard.input",
+                comparator="present",
+                threshold=True,
+                recognition_label="Keyboard word typed",
+                action=MappingAction(
+                    type="keyboard_text",
+                    text_source="keyboard.input",
+                    append_space=True,
+                ),
+            ),
+        ],
+    )
+
+
+def ensure_builtin_profiles(config: MappingConfig) -> MappingConfig:
+    builtins = {
+        TAB_SWITCH_PROFILE_NAME: wrist_tab_switching_profile(),
+        GTA_VICE_CITY_PROFILE_NAME: gta_vice_city_profile(),
+        VIEWER_3D_PROFILE_NAME: viewer_3d_profile(),
+        KEYBOARD_WORD_TYPING_PROFILE_NAME: keyboard_word_typing_profile(),
+    }
+    existing_names = {profile.name for profile in config.profiles}
+    for name, profile in builtins.items():
+        if name not in existing_names:
+            config.profiles.append(profile)
+    return config
+
+
 def default_mapping_config() -> MappingConfig:
-    return MappingConfig(
+    return ensure_builtin_profiles(
+        MappingConfig(
         profiles=[
             MappingProfile(),
-            wrist_tab_switching_profile(),
-            gta_vice_city_profile(),
-            viewer_3d_profile(),
         ]
+        )
     )
 
 
@@ -813,7 +859,7 @@ def load_mapping_config(path: Path = DEFAULT_MAPPING_PATH) -> tuple[MappingConfi
         return default_mapping_config(), None
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
-        return MappingConfig.from_dict(data), None
+        return ensure_builtin_profiles(MappingConfig.from_dict(data)), None
     except Exception as exc:
         return default_mapping_config(), str(exc)
 
