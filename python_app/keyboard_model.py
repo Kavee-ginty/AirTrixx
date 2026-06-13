@@ -26,7 +26,7 @@ RAW_CHANNELS = (1, 2, 0, 3)
 RAW_COLUMNS = ("ch1_raw", "ch2_raw", "ch0_raw", "ch3_raw")
 MM_COLUMNS = ("ch1_mm", "ch2_mm", "ch0_mm", "ch3_mm")
 RAW_TRIGGER_MM = 35.0
-MAX_DETECT_MM = 210.0
+MAX_DETECT_MM = 360.0
 OUTPUT_COLUMNS = [
     "sample_id",
     "word",
@@ -34,6 +34,13 @@ OUTPUT_COLUMNS = [
     "host_time_utc",
     *EXPECTED_BOARD_COLUMNS,
 ]
+
+
+def enforce_min_detect_mm(
+    max_detect_mm: float | list[float] | tuple[float, ...],
+    minimum_mm: float = MAX_DETECT_MM,
+) -> np.ndarray:
+    return np.maximum(normalize_max_detect_mm(max_detect_mm), float(minimum_mm))
 
 
 def normalize_max_detect_mm(max_detect_mm: float | list[float] | tuple[float, ...]) -> np.ndarray:
@@ -46,7 +53,7 @@ def normalize_max_detect_mm(max_detect_mm: float | list[float] | tuple[float, ..
 
 
 def format_max_detect_mm(max_detect_mm: float | list[float] | tuple[float, ...]) -> str:
-    values = normalize_max_detect_mm(max_detect_mm)
+    values = enforce_min_detect_mm(max_detect_mm)
     return ", ".join(f"CH{channel}={value:.0f}mm" for channel, value in zip(RAW_CHANNELS, values))
 
 
@@ -83,7 +90,7 @@ def write_collection_metadata(
         json.dumps(
             {
                 "raw_channels": list(RAW_CHANNELS),
-                "max_detect_mm_by_channel": normalize_max_detect_mm(max_detect_mm).tolist(),
+                "max_detect_mm_by_channel": enforce_min_detect_mm(max_detect_mm).tolist(),
             },
             indent=2,
         )
@@ -98,7 +105,7 @@ def load_max_detect_mm(dataset_path: Path, fallback: float | None = None) -> flo
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         values = metadata.get("max_detect_mm_by_channel")
         if values:
-            return [float(value) for value in values]
+            return enforce_min_detect_mm(values).tolist()
     return float(fallback if fallback is not None else MAX_DETECT_MM)
 
 
@@ -118,7 +125,7 @@ class RawFingerDetector:
         max_detect_mm: float | list[float] | tuple[float, ...] = MAX_DETECT_MM,
     ) -> None:
         self.trigger_mm = trigger_mm
-        self.max_detect_mm = normalize_max_detect_mm(max_detect_mm)
+        self.max_detect_mm = enforce_min_detect_mm(max_detect_mm)
         self.baseline: list[float | None] = [None] * len(RAW_COLUMNS)
 
     def update(self, row: dict[str, str]) -> bool:
@@ -213,7 +220,7 @@ def extract_feature(
     mm = np.array([[float(row[column]) for column in MM_COLUMNS] for row in rows])
     raw = np.array([[float(row[column]) for column in RAW_COLUMNS] for row in rows])
     timestamps = np.array([float(row["ms"]) for row in rows])
-    max_detect = normalize_max_detect_mm(max_detect_mm)
+    max_detect = enforce_min_detect_mm(max_detect_mm)
 
     raw_valid = raw >= 0
     raw_baseline = np.array(
@@ -239,7 +246,8 @@ def extract_feature(
 
     detectable_crop = (raw_crop >= 0) & (raw_crop <= max_detect)
     raw_delta = np.where(detectable_crop, np.clip(raw_baseline - raw_crop, 0.0, 700.0), 0.0) / 700.0
-    mm_filled = np.where(mm_crop < 0, 260.0, np.clip(mm_crop, 0.0, 260.0)) / 260.0
+    mm_cap = float(np.max(max_detect)) if len(max_detect) else MAX_DETECT_MM
+    mm_filled = np.where(mm_crop < 0, mm_cap, np.clip(mm_crop, 0.0, mm_cap)) / max(mm_cap, 1.0)
 
     channels = [active_crop]
     if representation in ("mm", "both"):
@@ -353,7 +361,7 @@ def save_model(
         representation=np.array(representation),
         k=np.array(k),
         metric=np.array(metric),
-        max_detect_mm=normalize_max_detect_mm(max_detect_mm),
+        max_detect_mm=enforce_min_detect_mm(max_detect_mm),
     )
 
 

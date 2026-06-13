@@ -109,13 +109,63 @@ SERIAL_AUTOCONNECT_DELAY_MS = 250
 SERIAL_AUTOCONNECT_RETRY_MS = 1000
 SERIAL_PORT_FAIL_COOLDOWN_S = 8.0
 LIVE_DATA_HISTORY_ROWS = 10
-KEYBOARD_DISTANCE_ROWS = 30
+KEYBOARD_DISTANCE_ROWS = 34
 KEYBOARD_DISTANCE_BAND_MM = 10
 KEYBOARD_CANVAS_ROWS = (
     ("Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"),
     ("A", "S", "D", "F", "G", "H", "J", "K", "L"),
     ("SHIFT", "Z", "X", "C", "V", "B", "N", "M", "BACKSPACE"),
     ("?123", "SPACE", "RETURN"),
+)
+KEYBOARD_DISPLAY_ROWS = (
+    (("Q", 1.0), ("W", 1.0), ("E", 1.0), ("R", 1.0), ("T", 1.0), ("Y", 1.0), ("U", 1.0), ("I", 1.0), ("O", 1.0), ("P", 1.0)),
+    (("A", 1.0), ("S", 1.0), ("D", 1.0), ("F", 1.0), ("G", 1.0), ("H", 1.0), ("J", 1.0), ("K", 1.0), ("L", 1.0)),
+    (("SHIFT", 1.45), ("Z", 1.0), ("X", 1.0), ("C", 1.0), ("V", 1.0), ("B", 1.0), ("N", 1.0), ("M", 1.0), ("BACKSPACE", 1.45)),
+    (("?123", 2.15), ("SPACE", 4.4), ("RETURN", 2.15)),
+)
+KEYBOARD_DISPLAY_LABELS = {
+    "SHIFT": "⇧",
+    "BACKSPACE": "⌫",
+    "?123": ".?123",
+    "SPACE": "space",
+    "RETURN": "return",
+}
+KEYBOARD_ROW_SPANS_MM = (
+    [
+        ("P", 60.0, 86.0),
+        ("O", 86.0, 112.0),
+        ("I", 112.0, 138.0),
+        ("U", 138.0, 164.0),
+        ("Y", 164.0, 190.0),
+        ("T", 190.0, 216.0),
+        ("R", 216.0, 242.0),
+        ("E", 242.0, 268.0),
+        ("W", 268.0, 294.0),
+        ("Q", 294.0, 320.0),
+    ],
+    [
+        ("L", 50.0, 78.8889),
+        ("K", 78.8889, 107.7778),
+        ("J", 107.7778, 136.6667),
+        ("H", 136.6667, 165.5556),
+        ("G", 165.5556, 194.4444),
+        ("F", 194.4444, 223.3333),
+        ("D", 223.3333, 252.2222),
+        ("S", 252.2222, 281.1111),
+        ("A", 281.1111, 310.0),
+    ],
+    [
+        ("M", 100.0, 122.8571),
+        ("N", 122.8571, 145.7143),
+        ("B", 145.7143, 168.5714),
+        ("V", 168.5714, 191.4286),
+        ("C", 191.4286, 214.2857),
+        ("X", 214.2857, 237.1429),
+        ("Z", 237.1429, 260.0),
+    ],
+    [
+        ("SPACE", 70.0, 250.0),
+    ],
 )
 SERVO_DEBUG_INTERVAL_S = 0.2
 SERVO_DEBUG_LOG_LIMIT = 600
@@ -368,7 +418,7 @@ class AirTrixxGUI:
         self.pages: dict[str, ttk.Frame] = {}
         self.dashboard_battery_cards: dict[str, dict[str, Any]] = {}
         self.keyboard_canvas: tk.Canvas | None = None
-        self.keyboard_canvas_keys: dict[str, tuple[int, int]] = {}
+        self.keyboard_canvas_keys: dict[str, tuple[int, int, int]] = {}
         self._last_keyboard_sequence: Any = object()
         self._last_keyboard_active_keys: set[str] = set()
         self._last_status_update_s = 0.0
@@ -8399,38 +8449,76 @@ class AirTrixxGUI:
         canvas.delete("all")
         self.keyboard_canvas_keys.clear()
         width = max(640, canvas.winfo_width())
-        row_height = 48
-        gap = 5
-        top = 5
-        for row_index, keys in enumerate(KEYBOARD_CANVAS_ROWS):
-            key_width = (width - gap * (len(keys) + 1)) / len(keys)
-            y1 = top + row_index * (row_height + gap)
+        left_pad = 12
+        top = 10
+        row_gap = 14
+        key_gap = 8
+        row_height = 64
+        total_units = max(sum(unit for _, unit in row) for row in KEYBOARD_DISPLAY_ROWS)
+        usable_width = width - 2 * left_pad - key_gap * (10 - 1)
+        unit_width = usable_width / max(total_units, 1.0)
+
+        for row_index, row in enumerate(KEYBOARD_DISPLAY_ROWS):
+            row_units = sum(unit for _, unit in row)
+            row_width = row_units * unit_width + key_gap * (len(row) - 1)
+            x = (width - row_width) / 2
+            y1 = top + row_index * (row_height + row_gap)
             y2 = y1 + row_height
-            for key_index, key in enumerate(keys):
-                x1 = gap + key_index * (key_width + gap)
+
+            for key, unit in row:
+                key_width = unit * unit_width
+                x1 = x
                 x2 = x1 + key_width
-                rect = canvas.create_rectangle(
-                    x1, y1, x2, y2, fill="#f8fafc", outline="#d0d5dd", width=1
+                shadow = canvas.create_line(
+                    x1 + 10,
+                    y2 + 1,
+                    x2 - 10,
+                    y2 + 1,
+                    fill="#9ca3af",
+                    width=2,
+                    capstyle=tk.ROUND,
                 )
+                rect = canvas.create_rectangle(
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    fill="#ffffff",
+                    outline="#eef2f6",
+                    width=1,
+                )
+                label = KEYBOARD_DISPLAY_LABELS.get(key, key)
+                font = ("Segoe UI", 23) if len(label) <= 2 else ("Segoe UI", 19)
                 text = canvas.create_text(
                     (x1 + x2) / 2,
-                    (y1 + y2) / 2,
-                    text=key,
-                    fill="#1f2d3d",
-                    font=("Segoe UI Semibold", 9),
+                    (y1 + y2) / 2 - 1,
+                    text=label,
+                    fill="#111111",
+                    font=font,
                 )
-                self.keyboard_canvas_keys[key] = (rect, text)
+                self.keyboard_canvas_keys[key] = (rect, text, shadow)
+                x = x2 + key_gap
         for key in self._last_keyboard_active_keys:
             self._set_keyboard_canvas_key_active(key, True)
+
+    @staticmethod
+    def _keyboard_key_for_distance(row_index: int, distance_mm: float) -> str | None:
+        if row_index >= len(KEYBOARD_ROW_SPANS_MM):
+            return None
+        for key, start_mm, end_mm in KEYBOARD_ROW_SPANS_MM[row_index]:
+            if start_mm <= distance_mm <= end_mm:
+                return key
+        return None
 
     def _set_keyboard_canvas_key_active(self, key: str, active: bool) -> None:
         canvas = self.keyboard_canvas
         items = self.keyboard_canvas_keys.get(key)
         if canvas is None or items is None:
             return
-        rect, text = items
-        canvas.itemconfigure(rect, fill="#22c55e" if active else "#f8fafc")
-        canvas.itemconfigure(text, fill="#052e16" if active else "#1f2d3d")
+        rect, text, shadow = items
+        canvas.itemconfigure(rect, fill="#dcfce7" if active else "#ffffff", outline="#bfe6cb" if active else "#eef2f6")
+        canvas.itemconfigure(text, fill="#166534" if active else "#111111")
+        canvas.itemconfigure(shadow, fill="#86efac" if active else "#9ca3af")
 
     def _update_keyboard_grid(self, serial_state: dict[str, Any]) -> None:
         if self.keyboard_canvas is None or self.active_page != "Keyboard":
@@ -8459,12 +8547,9 @@ class AirTrixxGUI:
                 continue
             if distance < 0 or distance > KEYBOARD_DISTANCE_ROWS * KEYBOARD_DISTANCE_BAND_MM:
                 continue
-            distance_index = min(
-                len(keys) - 1,
-                int(distance / (KEYBOARD_DISTANCE_ROWS * KEYBOARD_DISTANCE_BAND_MM) * len(keys)),
-            )
-            key_index = len(keys) - 1 - distance_index
-            active_keys.add(keys[key_index])
+            active_key = self._keyboard_key_for_distance(row_index, float(distance))
+            if active_key is not None and active_key in keys:
+                active_keys.add(active_key)
 
         for key in self._last_keyboard_active_keys - active_keys:
             self._set_keyboard_canvas_key_active(key, False)

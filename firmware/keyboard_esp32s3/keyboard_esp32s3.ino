@@ -79,7 +79,7 @@ const int WORD_COUNT = sizeof(wordList) / sizeof(wordList[0]);
 #define NUM_HOLD_MS            300
 #define NUM_MODE_COOLDOWN_MS   1200
 #define COVER_TRIGGER_MM       15
-#define DEFAULT_MAX_SIGNAL_DISTANCE_MM 210
+#define DEFAULT_MAX_SIGNAL_DISTANCE_MM 360
 #define COVER_CALIBRATION_WAIT_MS 3000
 #define COVER_LIMIT_MARGIN_MM 5
 #define MAX_KEY_MARGIN_MM      10
@@ -155,31 +155,31 @@ volatile bool airTrixxStartupBeaconActive = false;
 volatile int startupRawMM[NUM_SENSORS] = {-1, -1, -1, -1};
 volatile bool startupRawValid[NUM_SENSORS] = {false, false, false, false};
 
-// Exact horizontal key centers measured from sensors on the right side.
-// Distance starts at P/L/Backspace/Return and increases toward the left side.
-const uint8_t TOP_CENTERS[]       = {10, 30, 50, 70, 90, 110, 130, 150, 170, 190};
-const uint8_t TOP_HALF_WIDTHS[]   = { 9,  9,  9,  9,  9,   9,   9,   9,   9,   9};
-const uint8_t HOME_CENTERS[]      = {20, 40, 60, 80, 100, 120, 140, 160, 180};
-const uint8_t HOME_HALF_WIDTHS[]  = { 9,  9,  9,  9,   9,   9,   9,   9,   9};
-const uint8_t LOWER_CENTERS[]     = {13, 40, 60, 80, 100, 120, 140, 160, 188};
-const uint8_t LOWER_HALF_WIDTHS[] = {12,  9,  9,  9,   9,   9,   9,   9,  12};
-const uint8_t CTRL_CENTERS[]      = {25, 100, 175};
-const uint8_t CTRL_HALF_WIDTHS[]  = {24,  49,  24};
+// Exact horizontal key ranges measured from sensors on the right side.
+// Distance starts at P/L/M/Return and increases toward the left side.
+const uint16_t TOP_STARTS[]  = { 60,  86, 112, 138, 164, 190, 216, 242, 268, 294};
+const uint16_t TOP_ENDS[]    = { 86, 112, 138, 164, 190, 216, 242, 268, 294, 320};
+const uint16_t HOME_STARTS[] = { 50,  79, 108, 137, 166, 195, 224, 253, 282};
+const uint16_t HOME_ENDS[]   = { 79, 108, 137, 166, 195, 224, 253, 282, 310};
+const uint16_t LOWER_STARTS[] = {  0, 100, 123, 146, 169, 192, 215, 238, 261};
+const uint16_t LOWER_ENDS[]   = { 99, 123, 146, 169, 192, 215, 238, 260, 320};
+const uint16_t CTRL_STARTS[]  = {  0,  70, 251};
+const uint16_t CTRL_ENDS[]    = { 69, 250, 320};
 
 // Special actions: ^ = Shift, < = Backspace, # = ?123, space = Space, \r = Return.
 struct ChannelMap {
   uint8_t ch;
   const char *actions;
   const char *labels;
-  const uint8_t *centers;
-  const uint8_t *halfWidths;
+  const uint16_t *starts;
+  const uint16_t *ends;
   uint8_t count;
 };
 ChannelMap keyMaps[] = {
-  {1, "poiuytrewq", "P O I U Y T R E W Q", TOP_CENTERS, TOP_HALF_WIDTHS, 10},
-  {2, "lkjhgfdsa",  "L K J H G F D S A", HOME_CENTERS, HOME_HALF_WIDTHS, 9},
-  {0, "<mnbvcxz^",  "BACKSPACE M N B V C X Z SHIFT", LOWER_CENTERS, LOWER_HALF_WIDTHS, 9},
-  {3, "\r #",       "RETURN SPACE ?123", CTRL_CENTERS, CTRL_HALF_WIDTHS, 3}
+  {1, "poiuytrewq", "P O I U Y T R E W Q", TOP_STARTS, TOP_ENDS, 10},
+  {2, "lkjhgfdsa",  "L K J H G F D S A", HOME_STARTS, HOME_ENDS, 9},
+  {0, "<mnbvcxz^",  "BACKSPACE M N B V C X Z SHIFT", LOWER_STARTS, LOWER_ENDS, 9},
+  {3, "\r #",       "RETURN SPACE ?123", CTRL_STARTS, CTRL_ENDS, 3}
 };
 
 void printChannelMappings();
@@ -333,10 +333,8 @@ char applyCaps(char key) { return (capsMode && key >= 'a' && key <= 'z') ? toupp
 
 int distanceToKeyIndex(const ChannelMap &map, int d) {
   for (uint8_t i = 0; i < map.count; i++) {
-    int rangeStart = (i == 0) ? 0 : (map.centers[i - 1] + map.centers[i] + 1) / 2;
-    int rangeEnd = (i == map.count - 1)
-      ? map.centers[i] + map.halfWidths[i]
-      : (map.centers[i] + map.centers[i + 1] + 1) / 2 - 1;
+    int rangeStart = map.starts[i];
+    int rangeEnd = map.ends[i];
     if (d >= rangeStart && d <= rangeEnd) return i;
   }
   return -1;
@@ -358,7 +356,7 @@ int getMaxKeyDistance(uint8_t ch) {
   for (uint8_t i = 0; i < NUM_KEY_MAPS; i++) {
     if (keyMaps[i].ch == ch) {
       uint8_t last = keyMaps[i].count - 1;
-      return keyMaps[i].centers[last] + keyMaps[i].halfWidths[last];
+      return keyMaps[i].ends[last];
     }
   }
   return -1;
@@ -536,10 +534,8 @@ void printChannelMappings() {
     Serial.print("    accepted ranges: ");
     for (uint8_t j = 0; j < keyMaps[i].count; j++) {
       if (j > 0) Serial.print(" | ");
-      int rangeStart = (j == 0) ? 0 : (keyMaps[i].centers[j - 1] + keyMaps[i].centers[j] + 1) / 2;
-      int rangeEnd = (j == keyMaps[i].count - 1)
-        ? keyMaps[i].centers[j] + keyMaps[i].halfWidths[j]
-        : (keyMaps[i].centers[j] + keyMaps[i].centers[j + 1] + 1) / 2 - 1;
+      int rangeStart = keyMaps[i].starts[j];
+      int rangeEnd = keyMaps[i].ends[j];
       Serial.print(rangeStart);
       Serial.print('-');
       Serial.print(rangeEnd);
@@ -586,7 +582,7 @@ void calibrateDetectionLimits() {
     int d;
     int validReadings = 0;
     if (readTrimmedAverage(ch, d, CALIBRATION_SAMPLES, validReadings)) {
-      maxSignalMM[i] = d + COVER_LIMIT_MARGIN_MM;
+      maxSignalMM[i] = max(DEFAULT_MAX_SIGNAL_DISTANCE_MM, d + COVER_LIMIT_MARGIN_MM);
       Serial.print("CH"); Serial.print(ch);
       Serial.print(" covered distance = "); Serial.print(d);
       Serial.print("mm, detect limit = "); Serial.print(maxSignalMM[i]);
