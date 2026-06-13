@@ -5693,16 +5693,32 @@ class AirTrixxGUI:
         working = copy.deepcopy(rule)
         dialog = tk.Toplevel(self.root)
         dialog.title("Add Mapping" if is_new else "Edit Mapping")
-        dialog.geometry("980x840")
+        screen_w = max(1, int(dialog.winfo_screenwidth()))
+        screen_h = max(1, int(dialog.winfo_screenheight()))
+        dialog_w = min(940, max(820, screen_w - 120))
+        dialog_h = min(720, max(560, screen_h - 120))
+        dialog.geometry(f"{dialog_w}x{dialog_h}")
+        dialog.minsize(780, 520)
         dialog.transient(self.root)
         dialog.grab_set()
         dialog.columnconfigure(0, weight=1)
         dialog.rowconfigure(0, weight=1)
+        dialog.rowconfigure(1, weight=0)
 
-        frame = ttk.Frame(dialog, padding=14)
-        frame.grid(row=0, column=0, sticky="nsew")
+        canvas = tk.Canvas(dialog, highlightthickness=0, bg="#ffffff")
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(dialog, orient="vertical", command=canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        frame = ttk.Frame(canvas, padding=14)
         frame.columnconfigure(1, weight=1)
         frame.columnconfigure(3, weight=1)
+        frame_window = canvas.create_window((0, 0), window=frame, anchor="nw")
+        frame.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(frame_window, width=event.width))
+        self._register_scroll_target(canvas, canvas)
+        self._register_scroll_target(frame, canvas)
 
         name_var = tk.StringVar(value=working.name)
         enabled_var = tk.BooleanVar(value=working.enabled)
@@ -6186,8 +6202,8 @@ class AirTrixxGUI:
             dialog.destroy()
 
         record_button.configure(command=toggle_recording)
-        actions = ttk.Frame(frame)
-        actions.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        actions = ttk.Frame(dialog, padding=(14, 10, 14, 14))
+        actions.grid(row=1, column=0, columnspan=2, sticky="ew")
         actions.columnconfigure(0, weight=1)
         ttk.Button(actions, text="Test Action", command=test_action).grid(row=0, column=1, sticky="e", padx=(0, 6))
         ttk.Button(actions, text="Cancel", command=close_dialog).grid(row=0, column=2, sticky="e", padx=(0, 6))
@@ -7120,7 +7136,7 @@ class AirTrixxGUI:
         self.camera_face_position_ok = False
         self.camera_face_align_settled_s = None
         self._update_bracket_buttons()
-        self.camera_centering_status_var.set("Camera centering: started; searching for face.")
+        self.camera_centering_status_var.set("Camera centering: waiting for camera feed.")
         self.hand_calibration_status_var.set("Calibration phase: waiting for camera centering.")
         self.serial_autoconnect_enabled = True
         if not self.serial_bridge.is_connected:
@@ -7948,6 +7964,10 @@ class AirTrixxGUI:
     def _update_camera_centering(self) -> bool:
         if not self.serial_bridge.is_connected:
             self.camera_centering_status_var.set("Camera centering: waiting for Antenna serial link.")
+            return True
+
+        if not self.hand_tracker.has_latest_frame():
+            self.camera_centering_status_var.set("Camera centering: waiting for camera feed.")
             return True
 
         now = time.monotonic()

@@ -17,54 +17,6 @@
 #endif
 
 // ============================================================
-// WORDS LIST - direct firmware fuzzy matching fallback
-// ============================================================
-const char* wordList[] = {
-  "the", "and", "you", "that", "was", "for", "are", "with",
-  "his", "they", "this", "have", "from", "one", "had", "but",
-  "not", "what", "all", "were", "when", "your", "can", "said",
-  "there", "use", "each", "which", "she", "how", "their", "will",
-  "other", "about", "out", "many", "then", "them", "these", "some",
-  "her", "would", "make", "like", "him", "into", "time", "has",
-  "look", "two", "more", "write", "see", "number", "way", "could",
-  "come", "its", "over", "think", "also", "back", "after", "work",
-  "first", "well", "even", "want", "because", "any", "give", "most",
-  "tell", "very", "just", "name", "good", "great", "where", "help",
-  "through", "much", "before", "right", "mean", "old", "same",
-  "boy", "follow", "came", "show", "around", "form", "three",
-  "small", "set", "put", "end", "does", "another", "large",
-  "need", "big", "high", "such", "place", "turn", "here", "why",
-  "ask", "went", "read", "land", "different", "home", "move",
-  "try", "kind", "hand", "again", "change", "off", "play",
-  "air", "away", "animal", "house", "point", "page", "letter",
-  "found", "study", "still", "learn", "plant", "food", "sun",
-  "four", "thought", "let", "keep", "feet", "side",
-  "paper", "together", "got", "group", "often", "run", "important",
-  "car", "mile", "night", "walk", "white", "sea", "began", "grow",
-  "river", "carry", "state", "once", "book", "hear", "stop",
-  "second", "late", "idea", "body", "dog", "cat", "eat", "face",
-  "door", "cut", "sure", "watch", "color", "note", "rain", "road",
-  "farm", "pull", "draw", "voice", "seen", "cold", "plan",
-  "sing", "war", "ground", "fall", "king", "town", "fire",
-  "problem", "piece", "told", "knew", "pass", "since", "top",
-  "whole", "space", "heard", "best", "hour", "better", "true",
-  "hundred", "five", "remember", "step", "early", "hold", "west",
-  "reach", "fast", "listen", "feel", "talk", "bird", "soon",
-  "family", "leave", "song", "measure", "product", "black", "short",
-  "wind", "rock", "lived", "happened", "horse", "stood", "strong",
-  "hello", "world", "please", "thank", "sorry", "okay", "yes", "no",
-  "maybe", "today", "tomorrow", "morning", "love", "hate",
-  "happy", "sad", "nice", "cool", "hot",
-  "phone", "send", "call", "meet", "free", "busy", "wait", "done",
-  "open", "close", "start", "buy", "sell", "pay", "get",
-  "take", "bring", "find", "know",
-  "going", "coming", "doing", "having", "being", "making",
-  "money", "people", "year", "day", "week", "month",
-  "water", "light", "dark", "long", "slow", "hard", "easy", "new", "young"
-};
-const int WORD_COUNT = sizeof(wordList) / sizeof(wordList[0]);
-
-// ============================================================
 // CONFIG
 // ============================================================
 #define NUM_SENSORS            4
@@ -73,22 +25,14 @@ const int WORD_COUNT = sizeof(wordList) / sizeof(wordList[0]);
 #define MIN_AVG_READY          4
 #define CALIBRATION_SAMPLES    25
 #define IDLE_CALIBRATION_WAIT_MS 3000
-#define CAPS_DISTANCE_MM       50
-#define KEY_DWELL_MS           80
-#define CAPS_HOLD_MS           300
-#define NUM_HOLD_MS            300
-#define NUM_MODE_COOLDOWN_MS   1200
-#define COVER_TRIGGER_MM       15
 #define DEFAULT_MAX_SIGNAL_DISTANCE_MM 360
 #define COVER_CALIBRATION_WAIT_MS 3000
 #define COVER_LIMIT_MARGIN_MM 5
-#define MAX_KEY_MARGIN_MM      10
 #define MEASUREMENT_BUDGET_US  20000
 #define TCA_SETTLE_US          700
 #define SENSOR_INIT_RETRIES    3
 #define LOG_SAMPLE_INTERVAL_MS 20
 #define LOG_LABEL_MAX_LEN      32
-#define DOMINANT_MARGIN_MM     20
 
 #if defined(CONFIG_IDF_TARGET_ESP32S3) || defined(ARDUINO_ESP32S3_DEV)
   #define I2C_SDA_PIN 8
@@ -123,27 +67,11 @@ long    avgSum[NUM_SENSORS]   = {0, 0, 0, 0};
 uint8_t avgPos[NUM_SENSORS]   = {0, 0, 0, 0};
 uint8_t avgCount[NUM_SENSORS] = {0, 0, 0, 0};
 
-bool capsMode           = false;
-bool capsGestureLatched = false;
-unsigned long capsStartMs = 0;
-
-bool numbersMode          = false;
-bool numGestureLatched    = false;
-unsigned long numStartMs  = 0;
-unsigned long lastNumToggleMs = 0;
-
 bool  loggingMode         = false;
 char  logLabel[LOG_LABEL_MAX_LEN] = "";
 bool  logHeaderPrinted    = false;
 unsigned long lastLogMs   = 0;
 unsigned long logFrame    = 0;
-
-char  pendingKey          = '\0';
-char  lastPrintedKey      = '\0';
-unsigned long pendingStartMs  = 0;
-unsigned long lastKeypressMs  = 0;
-String swipeBuffer        = "";
-int prevCoveredCount      = 0;
 uint16_t airTrixxKeyboardSequence = 0;
 uint16_t airTrixxKeyboardBatterySequence = 0;
 unsigned long lastAirTrixxReportMs = 0;
@@ -186,64 +114,6 @@ void printChannelMappings();
 void printDetectionLimits();
 void sendAirTrixxKeyboardTof(int rawMM[], bool rawValid[]);
 void sendAirTrixxKeyboardBattery(bool force = false);
-
-// ============================================================
-// FUZZY MATCHING
-// ============================================================
-int editDistance(const char* a, const char* b) {
-  int la = min((int)strlen(a), 32);
-  int lb = min((int)strlen(b), 32);
-  int dp[33][33];
-  for (int i = 0; i <= la; i++) dp[i][0] = i;
-  for (int j = 0; j <= lb; j++) dp[0][j] = j;
-  for (int i = 1; i <= la; i++)
-    for (int j = 1; j <= lb; j++)
-      dp[i][j] = (tolower((unsigned char)a[i-1]) == tolower((unsigned char)b[j-1]))
-        ? dp[i-1][j-1]
-        : 1 + min(dp[i-1][j-1], min(dp[i-1][j], dp[i][j-1]));
-  return dp[la][lb];
-}
-
-void extractConsonants(const char* word, char* out, int maxLen) {
-  const char vowels[] = "aeiouAEIOU";
-  int j = 0;
-  for (int i = 0; word[i] && j < maxLen-1; i++)
-    if (!strchr(vowels, word[i])) out[j++] = tolower((unsigned char)word[i]);
-  out[j] = '\0';
-}
-
-int matchScore(const char* swipe, const char* candidate) {
-  int direct = editDistance(swipe, candidate);
-  char ss[32], cs[32];
-  extractConsonants(swipe, ss, sizeof(ss));
-  extractConsonants(candidate, cs, sizeof(cs));
-  int skel    = editDistance(ss, cs);
-  int lenDiff = abs((int)strlen(swipe) - (int)strlen(candidate));
-  return min(direct, skel) + (lenDiff > 3 ? lenDiff : 0);
-}
-
-String fuzzyMatchWord(String swipe) {
-  if (swipe.length() == 0) return swipe;
-  char swipeLower[32];
-  swipe.toLowerCase();
-  swipe.toCharArray(swipeLower, sizeof(swipeLower));
-
-  int bestScore = 9999; const char* bestWord = nullptr;
-  int secScore  = 9999; const char* secWord  = nullptr;
-
-  for (int i = 0; i < WORD_COUNT; i++) {
-    int s = matchScore(swipeLower, wordList[i]);
-    if (s < bestScore) { secScore = bestScore; secWord = bestWord; bestScore = s; bestWord = wordList[i]; }
-    else if (s < secScore) { secScore = s; secWord = wordList[i]; }
-  }
-
-  Serial.print("  [Fuzzy] Best: ");
-  if (bestWord) { Serial.print(bestWord); Serial.print("("); Serial.print(bestScore); Serial.print(")"); }
-  if (secWord)  { Serial.print(" 2nd: "); Serial.print(secWord); Serial.print("("); Serial.print(secScore); Serial.print(")"); }
-  Serial.println();
-
-  return (bestScore <= 4 && bestWord) ? String(bestWord) : swipe;
-}
 
 // ============================================================
 // SENSOR HELPERS
@@ -319,130 +189,6 @@ void addMovingSample(uint8_t ch, int mm) {
 bool getMovingAverage(uint8_t ch, int &avgMM) {
   uint8_t i = chToIdx(ch); if (i == 255 || avgCount[i] < MIN_AVG_READY) return false;
   avgMM = avgSum[i] / avgCount[i]; return true;
-}
-
-// ============================================================
-// KEY HELPERS
-// ============================================================
-int getKeyCount(uint8_t ch) {
-  for (uint8_t i = 0; i < NUM_KEY_MAPS; i++) if (keyMaps[i].ch == ch) return keyMaps[i].count;
-  return 0;
-}
-
-char applyCaps(char key) { return (capsMode && key >= 'a' && key <= 'z') ? toupper(key) : key; }
-
-int distanceToKeyIndex(const ChannelMap &map, int d) {
-  for (uint8_t i = 0; i < map.count; i++) {
-    int rangeStart = map.starts[i];
-    int rangeEnd = map.ends[i];
-    if (d >= rangeStart && d <= rangeEnd) return i;
-  }
-  return -1;
-}
-
-char getActionForChannel(uint8_t ch, int d) {
-  if (d < 0) d = 0;
-  for (uint8_t i = 0; i < NUM_KEY_MAPS; i++) {
-    if (keyMaps[i].ch == ch) {
-      int idx = distanceToKeyIndex(keyMaps[i], d);
-      if (idx < 0) return '\0';
-      return applyCaps(keyMaps[i].actions[idx]);
-    }
-  }
-  return '\0';
-}
-
-int getMaxKeyDistance(uint8_t ch) {
-  for (uint8_t i = 0; i < NUM_KEY_MAPS; i++) {
-    if (keyMaps[i].ch == ch) {
-      uint8_t last = keyMaps[i].count - 1;
-      return keyMaps[i].ends[last];
-    }
-  }
-  return -1;
-}
-
-bool isRealCover(uint8_t ch, int rawMM) {
-  uint8_t idx = chToIdx(ch);
-  if (idx == 255) return false;
-  int maxKeyRawMM = zeroMM[idx] + getMaxKeyDistance(ch) + MAX_KEY_MARGIN_MM;
-  if (rawMM - zeroMM[idx] > maxSignalMM[idx]) return false;
-  if (rawMM > maxKeyRawMM) return false;
-  if (idleValid[idx]) return rawMM < (idleMM[idx] - COVER_TRIGGER_MM);
-  return true;
-}
-
-void finishSwipeBuffer(const char *actionLabel) {
-  if (swipeBuffer.length() > 0) {
-    Serial.print("RAW SWIPE: "); Serial.println(swipeBuffer);
-    String matched = fuzzyMatchWord(swipeBuffer);
-    Serial.print("WORD: "); Serial.println(matched);
-    swipeBuffer = "";
-  }
-  if (actionLabel) Serial.println(actionLabel);
-}
-
-void handleKeyAction(char action, uint8_t ch, int distanceMM) {
-  if (action == '^') {
-    capsMode = !capsMode;
-    Serial.println(capsMode ? "SHIFT/CAPS ON" : "SHIFT/CAPS OFF");
-    return;
-  }
-  if (action == '<') {
-    if (swipeBuffer.length() > 0) swipeBuffer.remove(swipeBuffer.length() - 1);
-    Serial.print("BACKSPACE -> "); Serial.println(swipeBuffer);
-    return;
-  }
-  if (action == ' ') {
-    finishSwipeBuffer("SPACE");
-    return;
-  }
-  if (action == '\r') {
-    finishSwipeBuffer("RETURN");
-    return;
-  }
-  if (action == '#') {
-    numbersMode = !numbersMode;
-    Serial.println(numbersMode ? "?123 MODE REQUESTED" : "ABC MODE REQUESTED");
-    return;
-  }
-
-  if (swipeBuffer.length() == 0 || swipeBuffer.charAt(swipeBuffer.length() - 1) != action)
-    swipeBuffer += action;
-  Serial.print("Buffered: "); Serial.print(swipeBuffer);
-  Serial.print("  CH"); Serial.print(ch);
-  Serial.print("="); Serial.print(distanceMM); Serial.println("mm");
-}
-
-void resetKeyState() { pendingKey = '\0'; lastPrintedKey = '\0'; pendingStartMs = 0; }
-
-// ============================================================
-// DOMINANT SENSOR SELECTION
-// ============================================================
-int findDominantSensor(int distPerCh[], bool rawValid[]) {
-  int winnerIdx = -1;
-  int winnerDistance = 9999;
-
-  for (uint8_t i = 0; i < NUM_KEY_MAPS; i++) {
-    if (distPerCh[i] < 0) continue;
-    if (!rawValid[i])      continue;
-    if (distPerCh[i] < winnerDistance) {
-      winnerDistance = distPerCh[i];
-      winnerIdx  = i;
-    }
-  }
-
-  if (winnerIdx < 0) return -1;
-
-  for (uint8_t i = 0; i < NUM_KEY_MAPS; i++) {
-    if ((int)i == winnerIdx) continue;
-    if (distPerCh[i] < 0)   continue;
-    if (!rawValid[i])        continue;
-    int gap = distPerCh[i] - winnerDistance;
-    if (gap < DOMINANT_MARGIN_MM) return -1;
-  }
-
-  return winnerIdx;
 }
 
 // ============================================================
@@ -759,7 +505,6 @@ void initAirTrixxWireless() {
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
-
   if (esp_now_init() != ESP_OK) {
     Serial.println("[KEYBOARD] ESP-NOW init failed");
     return;
@@ -910,13 +655,14 @@ void loop() {
   }
   sendAirTrixxKeyboardBattery(false);
 
-  int coveredCount=0, closeCount=0, farCount=0;
-  int distPerCh[NUM_KEY_MAPS], relativePerCh[NUM_KEY_MAPS], rawPerCh[NUM_KEY_MAPS];
+  int relativePerCh[NUM_KEY_MAPS];
+  int rawPerCh[NUM_KEY_MAPS];
   bool rawValid[NUM_KEY_MAPS];
 
   for (uint8_t i = 0; i < NUM_KEY_MAPS; i++) {
     uint8_t ch = keyMaps[i].ch;
-    int rawMM; distPerCh[i] = -1; relativePerCh[i] = -1;
+    int rawMM;
+    relativePerCh[i] = -1;
     rawValid[i] = readRaw(ch, rawMM);
     rawPerCh[i] = rawValid[i] ? rawMM : -1;
     if (rawValid[i]) addMovingSample(ch, rawMM);
@@ -926,13 +672,7 @@ void loop() {
     uint8_t ch = keyMaps[i].ch;
     int avgRawMM;
     if (!getMovingAverage(ch, avgRawMM)) continue;
-    int d = avgRawMM;
-    relativePerCh[i] = d;
-    if (d > maxSignalMM[i]) continue;
-    if (d <= CAPS_DISTANCE_MM) closeCount++; else farCount++;
-    if (!isRealCover(ch, avgRawMM)) continue;
-    distPerCh[i] = d;
-    coveredCount++;
+    relativePerCh[i] = avgRawMM;
   }
 
   sendAirTrixxKeyboardTof(rawPerCh, rawValid);
@@ -940,50 +680,5 @@ void loop() {
   if (loggingMode) {
     if (!logHeaderPrinted) { printLogHeader(); logHeaderPrinted = true; }
     if (millis() - lastLogMs >= LOG_SAMPLE_INTERVAL_MS) { printLogRow(rawPerCh, rawValid, relativePerCh); lastLogMs = millis(); }
-    return;
-  }
-
-  if (coveredCount == 0 && prevCoveredCount > 0) {
-    finishSwipeBuffer(nullptr);
-    resetKeyState();
-  }
-  prevCoveredCount = coveredCount;
-
-  if (coveredCount == NUM_KEY_MAPS && closeCount == NUM_KEY_MAPS) {
-    if (capsStartMs == 0) capsStartMs = millis();
-    if (!capsGestureLatched && millis() - capsStartMs >= CAPS_HOLD_MS) {
-      capsMode = !capsMode; capsGestureLatched = true;
-      resetMovingAverages(); resetKeyState();
-      Serial.println(capsMode ? "CAPS ON" : "caps off");
-    }
-    numStartMs = 0; numGestureLatched = false; return;
-  }
-  capsStartMs = 0; capsGestureLatched = false;
-
-  if (coveredCount == NUM_KEY_MAPS && farCount == NUM_KEY_MAPS) {
-    if (millis() - lastNumToggleMs >= NUM_MODE_COOLDOWN_MS && numStartMs == 0) numStartMs = millis();
-    if (!numGestureLatched && millis() - numStartMs >= NUM_HOLD_MS && millis() - lastNumToggleMs >= NUM_MODE_COOLDOWN_MS) {
-      numbersMode = !numbersMode; numGestureLatched = true; lastNumToggleMs = millis();
-      resetMovingAverages(); resetKeyState();
-      Serial.println(numbersMode ? "NUMBERS MODE ON" : "NUMBERS MODE OFF");
-    }
-    return;
-  }
-  numStartMs = 0;
-  if (millis() - lastNumToggleMs >= NUM_MODE_COOLDOWN_MS) numGestureLatched = false;
-
-  int dominantIdx = findDominantSensor(distPerCh, rawValid);
-  if (dominantIdx < 0) return;
-
-  uint8_t dominantCh   = keyMaps[dominantIdx].ch;
-  int     dominantDist = distPerCh[dominantIdx];
-
-  char action = getActionForChannel(dominantCh, dominantDist);
-  if (action == '\0') { resetKeyState(); return; }
-  if (action != pendingKey) { pendingKey = action; pendingStartMs = millis(); }
-  if (millis() - pendingStartMs >= KEY_DWELL_MS && action != lastPrintedKey) {
-    handleKeyAction(action, dominantCh, dominantDist);
-    lastPrintedKey = action;
-    lastKeypressMs = millis();
   }
 }

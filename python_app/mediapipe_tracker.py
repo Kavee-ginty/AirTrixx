@@ -150,7 +150,75 @@ def _draw_task_landmarks(frame_bgr: Any, landmarks: list[Any]) -> None:
 
 
 def _finger_is_extended(landmarks: Any, tip_index: int, pip_index: int) -> bool:
-    return landmarks[tip_index].y < landmarks[pip_index].y - 0.025
+    tip = landmarks[tip_index]
+    pip = landmarks[pip_index]
+    mcp = landmarks[pip_index - 1]
+    vertical_extended = float(tip.y) < float(pip.y) - 0.025
+    pip_to_mcp = _landmark_distance(landmarks, pip_index, pip_index - 1)
+    tip_to_mcp = _landmark_distance(landmarks, tip_index, pip_index - 1)
+    return vertical_extended or tip_to_mcp > pip_to_mcp * 1.55
+
+
+def _finger_is_curled(landmarks: Any, tip_index: int, pip_index: int) -> bool:
+    tip = landmarks[tip_index]
+    pip = landmarks[pip_index]
+    vertical_curled = float(tip.y) > float(pip.y) + 0.015
+    pip_to_wrist = _landmark_distance(landmarks, pip_index, 0)
+    tip_to_wrist = _landmark_distance(landmarks, tip_index, 0)
+    return vertical_curled or tip_to_wrist < pip_to_wrist + 0.015
+
+
+def _landmark_distance(landmarks: Any, first_index: int, second_index: int) -> float:
+    first = landmarks[first_index]
+    second = landmarks[second_index]
+    dx = float(first.x) - float(second.x)
+    dy = float(first.y) - float(second.y)
+    return float((dx * dx + dy * dy) ** 0.5)
+
+
+def _thumb_is_raised(landmarks: Any) -> bool:
+    thumb_tip = landmarks[4]
+    thumb_ip = landmarks[3]
+    index_mcp = landmarks[5]
+    return (
+        float(thumb_tip.y) < float(thumb_ip.y) - 0.02
+        and float(thumb_tip.y) < float(index_mcp.y) - 0.05
+    )
+
+
+def _thumb_is_extended_outward(landmarks: Any) -> bool:
+    wrist_to_thumb = _landmark_distance(landmarks, 0, 4)
+    wrist_to_thumb_ip = _landmark_distance(landmarks, 0, 3)
+    thumb_to_index_base = _landmark_distance(landmarks, 4, 5)
+    return wrist_to_thumb > wrist_to_thumb_ip + 0.02 and thumb_to_index_base > 0.09
+
+
+def _thumb_is_open_for_gun(landmarks: Any) -> bool:
+    thumb_tip = landmarks[4]
+    thumb_ip = landmarks[3]
+    thumb_to_index_base = _landmark_distance(landmarks, 4, 5)
+    thumb_segment = _landmark_distance(landmarks, 4, 3)
+    return (
+        thumb_to_index_base > 0.08
+        and thumb_segment > 0.05
+        and (
+            _thumb_is_extended_outward(landmarks)
+            or _thumb_is_raised(landmarks)
+            or abs(float(thumb_tip.y) - float(thumb_ip.y)) > 0.05
+        )
+    )
+
+
+def _thumb_pinches_finger(
+    landmarks: Any,
+    finger_tip_index: int,
+    finger_pip_index: int,
+    *,
+    pinch_threshold: float = 0.055,
+) -> bool:
+    thumb_to_tip = _landmark_distance(landmarks, 4, finger_tip_index)
+    thumb_to_pip = _landmark_distance(landmarks, 4, finger_pip_index)
+    return thumb_to_tip <= pinch_threshold and thumb_to_pip < 0.12
 
 
 def classify_hand_gesture(landmarks: Any) -> str:
@@ -158,11 +226,26 @@ def classify_hand_gesture(landmarks: Any) -> str:
     middle_up = _finger_is_extended(landmarks, 12, 10)
     ring_up = _finger_is_extended(landmarks, 16, 14)
     pinky_up = _finger_is_extended(landmarks, 20, 18)
+    index_curled = _finger_is_curled(landmarks, 8, 6)
+    middle_curled = _finger_is_curled(landmarks, 12, 10)
+    ring_curled = _finger_is_curled(landmarks, 16, 14)
+    pinky_curled = _finger_is_curled(landmarks, 20, 18)
+    thumb_up = _thumb_is_raised(landmarks)
+    thumb_open_for_gun = _thumb_is_open_for_gun(landmarks)
+    index_thumb_pinch = _thumb_pinches_finger(landmarks, 8, 6)
     extended_count = sum([index_up, middle_up, ring_up, pinky_up])
 
+    if index_thumb_pinch and middle_curled and ring_curled and pinky_curled:
+        return "index_thumb_pinch"
     if extended_count >= 4:
         return "open_palm"
-    if index_up and not middle_up and not ring_up and not pinky_up:
+    if thumb_up and index_curled and middle_curled and ring_curled and pinky_curled:
+        return "thumb_up"
+    if thumb_open_for_gun and index_up and middle_curled and ring_curled and pinky_curled:
+        return "gun_gesture"
+    if index_up and middle_up and not ring_up and not pinky_up:
+        return "peace_sign"
+    if index_up and not index_thumb_pinch and middle_curled and ring_curled and pinky_curled:
         return "index_finger_up"
     if extended_count == 0:
         return "closed_fist"

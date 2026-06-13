@@ -643,6 +643,26 @@ void sendServoCommandToCamDock(const ServoCommandPacket &packet) {
   }
 }
 
+void centerCamDockServos() {
+  ServoCommandPacket packet = {};
+  fillHeader(packet.header,
+             MSG_SERVO_COMMAND,
+             DEVICE_ANTENNA,
+             ++servoCommandSequence,
+             millis(),
+             false);
+  packet.active_pair = ACTIVE_PAIR_DOCK;
+  packet.active_mask = maskForActivePair(packet.active_pair);
+  packet.disable_unused = 0;
+  packet.r_pan = DEFAULT_R_PAN_CENTER;
+  packet.r_tilt = DEFAULT_R_TILT_CENTER;
+  packet.l_pan = DEFAULT_L_PAN_CENTER;
+  packet.l_tilt = DEFAULT_L_TILT_CENTER;
+  packet.cam_pan = DEFAULT_CAM_PAN_CENTER;
+  packet.cam_tilt = DEFAULT_CAM_TILT_CENTER;
+  sendServoCommandToCamDock(packet);
+}
+
 void sendOtaStartToTarget(const OtaStartPacket &packet, const uint8_t mac[6], const char *label) {
   esp_err_t result = esp_now_send(mac,
                                   reinterpret_cast<const uint8_t *>(&packet),
@@ -1257,11 +1277,16 @@ void handleIncomingPacket(const uint8_t senderMac[6], const uint8_t *data, int l
              len == static_cast<int>(sizeof(CamDockDataPacket))) {
     CamDockDataPacket packet = {};
     memcpy(&packet, data, sizeof(packet));
+    bool reconnect = false;
     portENTER_CRITICAL(&stateMux);
+    reconnect = !stateFresh(latestCamDock.seen, latestCamDock.received_ms, millis());
     latestCamDock.packet = packet;
     latestCamDock.seen = true;
     latestCamDock.received_ms = millis();
     portEXIT_CRITICAL(&stateMux);
+    if (reconnect) {
+      centerCamDockServos();
+    }
   } else if (header.msg_type == MSG_KEYBOARD_TOF && len == static_cast<int>(sizeof(KeyboardTofPacket))) {
     KeyboardTofPacket packet = {};
     memcpy(&packet, data, sizeof(packet));
