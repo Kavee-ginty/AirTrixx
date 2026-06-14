@@ -145,7 +145,7 @@ Runtime config, mappings, logs, and temporary audio files are stored outside the
 - Windows: `%APPDATA%\AirTrixx`
 - macOS: `~/Library/Application Support/AirTrixx`
 
-Keyboard training data and the locally retrained model are stored under the same user data root in `keyboard`. The app installs the bundled starter model on first launch, then replaces it when you train new words from the Keyboard page.
+Keyboard training data and the locally retrained model are stored under the same user data root in `keyboard`. The app installs the bundled starter model on first launch, then replaces it when you train new words from the Keyboard page. The default `Tabs + Cursor + Scroll` profile also types detected keyboard words and treats words like `space`, `return`, `backspace`, `capslock`, `win`, and `zero` through `nine` as commands.
 
 ## Package The App
 

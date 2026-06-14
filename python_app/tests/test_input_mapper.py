@@ -561,7 +561,52 @@ class InputMapperRuntimeTests(unittest.TestCase):
             {"raw_device_state": {"devices": {"keyboard": {"input": "backspace"}}}},
             0.0,
         )
-        self.assertEqual(backend.events, [("key_tap", ("backspace",))])
+        self.assertEqual(backend.events, [("key_tap", ("ctrl", "backspace"))])
+
+    def test_keyboard_text_action_maps_extended_command_words_to_keys(self) -> None:
+        rule = MappingRule(
+            source="keyboard.input",
+            comparator="present",
+            action=MappingAction(type="keyboard_text", text_source="keyboard.input", append_space=True),
+        )
+        mapper, backend = self.mapper_with([rule])
+        expected_events = [
+            ("key_tap", ("cmd",)),
+            ("key_tap", ("ctrl", "backspace")),
+            ("key_tap", ("caps_lock",)),
+            ("key_tap", ("space",)),
+            ("key_tap", ("0",)),
+            ("key_tap", ("1",)),
+            ("key_tap", ("2",)),
+            ("key_tap", ("3",)),
+            ("key_tap", ("4",)),
+            ("key_tap", ("5",)),
+            ("key_tap", ("6",)),
+            ("key_tap", ("7",)),
+            ("key_tap", ("8",)),
+            ("key_tap", ("9",)),
+        ]
+        for index, word in enumerate(
+            [
+                "win",
+                "backspace",
+                "capslock",
+                "space",
+                "zero",
+                "one",
+                "two",
+                "three",
+                "four",
+                "five",
+                "six",
+                "seven",
+                "eight",
+                "nine",
+            ]
+        ):
+            mapper.process({"raw_device_state": {"devices": {"keyboard": {"input": word}}}}, float(index))
+            mapper.process({"raw_device_state": {"devices": {"keyboard": {"input": None}}}}, float(index) + 0.01)
+        self.assertEqual(backend.events, expected_events)
 
     def test_signal_catalog_exposes_keyboard_prediction_fields(self) -> None:
         signals = SignalCatalog.flatten(
@@ -670,13 +715,16 @@ class MappingConfigTests(unittest.TestCase):
     def test_tabs_cursor_scroll_profile_matches_finalized_mapping(self) -> None:
         profile = tabs_cursor_scroll_profile()
         rules = {rule.id: rule for rule in profile.mappings}
-        self.assertEqual(len(profile.mappings), 8)
+        self.assertEqual(len(profile.mappings), 9)
         self.assertEqual(rules["wrist_cursor_follow_gyro"].action.speed_x, -30.0)
         self.assertEqual(rules["wrist_cursor_follow_gyro"].action.speed_y, -30.0)
         self.assertEqual(rules["wrist_scroll_up"].source, "wristband.gyro_x")
         self.assertEqual(rules["wrist_scroll_up"].action.interval_ms, 90)
         self.assertEqual(rules["wrist_scroll_down"].action.scroll_y, -1)
         self.assertEqual(rules["wrist_cursor_right_click"].source, "fused.left_hand_gesture")
+        self.assertEqual(rules["keyboard_type_prediction"].source, "keyboard.input")
+        self.assertEqual(rules["keyboard_type_prediction"].action.type, "keyboard_text")
+        self.assertTrue(rules["keyboard_type_prediction"].action.append_space)
 
     def test_remove_profile_falls_back_and_protects_last_profile(self) -> None:
         config = MappingConfig(profiles=[MappingProfile(), wrist_tab_switching_profile()])
