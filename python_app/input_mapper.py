@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -20,6 +22,7 @@ ACTION_TYPES = {
     "keyboard_hold",
     "keyboard_repeat",
     "keyboard_text",
+    "keyboard_sequence",
     "mouse_click",
     "mouse_hold",
     "mouse_scroll",
@@ -55,6 +58,18 @@ TEXT_COMMAND_KEYS = {
     "capslock": ["caps_lock"],
     "capslook": ["caps_lock"],
     "caps": ["caps_lock"],
+}
+TRANSCRIPT_COMMAND_WORDS = {
+    "police",
+    "weapons",
+    "tank",
+    "health",
+}
+TRANSCRIPT_COMMAND_ALIASES = {
+    "thank": "tank",
+    "bank": "tank",
+    "help": "health",
+    "hello": "health",
 }
 
 
@@ -212,13 +227,18 @@ class SignalCatalog:
             add("Fused Input", "wrist_cursor.right_click", "Wrist cursor right click", wrist_cursor_state.get("right_click"))
 
         audiodock = devices.get("audiodock", {}) if isinstance(devices, dict) else {}
+        transcript = audiodock.get("latest_transcript") if isinstance(audiodock, dict) else None
+        transcript_normalized = _normalize_audio_dock_transcript(transcript)
+        transcript_command = _audio_dock_transcript_command(transcript)
         add("Audio Dock", "audiodock.status", "Status", audiodock.get("status") if isinstance(audiodock, dict) else None)
         add("Audio Dock", "audiodock.app_connected", "App connected", audiodock.get("app_connected") if isinstance(audiodock, dict) else None)
         add("Audio Dock", "audiodock.input", "Input state", audiodock.get("input") if isinstance(audiodock, dict) else None)
         add("Audio Dock", "audiodock.clap_detected", "Clap detected", audiodock.get("clap_detected") if isinstance(audiodock, dict) else None)
         add("Audio Dock", "audiodock.clap_type", "Clap type", audiodock.get("clap_type") if isinstance(audiodock, dict) else None)
         add("Audio Dock", "audiodock.last_trigger", "Last trigger", audiodock.get("last_trigger") if isinstance(audiodock, dict) else None)
-        add("Audio Dock", "audiodock.latest_transcript", "Latest transcript", audiodock.get("latest_transcript") if isinstance(audiodock, dict) else None)
+        add("Audio Dock", "audiodock.latest_transcript", "Latest transcript", transcript)
+        add("Audio Dock", "audiodock.latest_transcript_normalized", "Latest transcript normalized", transcript_normalized)
+        add("Audio Dock", "audiodock.latest_transcript_command", "Latest transcript command", transcript_command)
 
         fans = devices.get("fans", {}) if isinstance(devices, dict) else {}
         fan_temps = fans.get("temps", {}) if isinstance(fans, dict) else {}
@@ -246,6 +266,7 @@ class SignalCatalog:
 class MappingAction:
     type: str = "keyboard_tap"
     keys: list[str] = field(default_factory=list)
+    hold_ms: int = 0
     button: str = "left"
     clicks: int = 1
     interval_ms: int = 250
@@ -284,6 +305,7 @@ class MappingAction:
         return cls(
             type=action_type,
             keys=parse_key_combo(data.get("keys", [])),
+            hold_ms=max(0, int(float(data.get("hold_ms", 0) or 0))),
             text=str(data.get("text") or ""),
             text_source=str(data.get("text_source") or ""),
             append_space=bool(data.get("append_space", True)),
@@ -315,6 +337,7 @@ class MappingAction:
         return {
             "type": self.type,
             "keys": list(self.keys),
+            "hold_ms": self.hold_ms,
             "text": self.text,
             "text_source": self.text_source,
             "append_space": self.append_space,
@@ -348,16 +371,18 @@ class MappingAction:
             return "hold"
         if self.type in {"keyboard_repeat", "mouse_scroll"}:
             return "repeat"
-        if self.type == "keyboard_text":
+        if self.type in {"keyboard_text", "keyboard_sequence"}:
             return "text"
         if self.type == "mouse_move":
             return "continuous"
         return "tap"
 
     def summary(self) -> str:
-        if self.type == "keyboard_text":
+        if self.type in {"keyboard_text", "keyboard_sequence"}:
             source = self.text_source or "source"
             suffix = " + space" if self.append_space else ""
+            if self.type == "keyboard_sequence":
+                return f"tap text {self.text or source} every {self.interval_ms} ms{suffix}"
             return f"type {self.text or source}{suffix}"
         if self.type.startswith("keyboard"):
             combo = "+".join(self.keys) if self.keys else "(no keys)"
@@ -639,6 +664,18 @@ WRISTBAND_MOUSE_CURSOR_PROFILE_NAME = "Wristband Mouse Cursor"
 WRIST_CURSOR_PROFILE_NAME = "Wrist Cursor"
 WRIST_SCROLL_PROFILE_NAME = "Wrist Scroll"
 TAB_CURSOR_SCROLL_PROFILE_NAME = "Tabs + Cursor + Scroll"
+GTA_RUNTIME_RULES = (
+    MappingRule(
+        id="gta_enter_peace_runtime",
+        name="Enter on left peace sign",
+        source="hands.left.gesture",
+        comparator="eq",
+        threshold="peace_sign",
+        debounce_ms=80,
+        recognition_label="Enter",
+        action=MappingAction(type="keyboard_tap", keys=["enter"], hold_ms=250),
+    ),
+)
 
 TAB_CURSOR_SCROLL_PROFILE_DATA: dict[str, Any] = {
     "name": TAB_CURSOR_SCROLL_PROFILE_NAME,
@@ -667,11 +704,11 @@ TAB_CURSOR_SCROLL_PROFILE_DATA: dict[str, Any] = {
                     "low": 0.0,
                     "high": 1.0,
                     "hysteresis": 0.0,
-                    "output_keys": ["alt"],
+                    "output_keys": [],
                 }
             ],
             "recognition_label": "",
-            "action": {"type": "keyboard_tap", "keys": ["tab"]},
+            "action": {"type": "keyboard_tap", "keys": ["alt", "tab"]},
         },
         {
             "id": "wrist_tab_cycle_backward",
@@ -697,11 +734,11 @@ TAB_CURSOR_SCROLL_PROFILE_DATA: dict[str, Any] = {
                     "low": 0.0,
                     "high": 1.0,
                     "hysteresis": 0.0,
-                    "output_keys": ["alt"],
+                    "output_keys": [],
                 }
             ],
             "recognition_label": "",
-            "action": {"type": "keyboard_tap", "keys": ["shift", "tab"]},
+            "action": {"type": "keyboard_tap", "keys": ["alt", "shift", "tab"]},
         },
         {
             "id": "wrist_cursor_follow_gyro",
@@ -935,9 +972,30 @@ def wrist_tab_switching_profile() -> MappingProfile:
 
 
 def gta_vice_city_profile() -> MappingProfile:
+    voice_gate = MappingCondition(
+        source="fused.audio_dock_voice_gate",
+        comparator="truthy",
+        threshold=True,
+    )
     return MappingProfile(
         name=GTA_VICE_CITY_PROFILE_NAME,
         mappings=[
+            MappingRule(
+                id="gta_follow_cursor_wrist_gyro",
+                name="Follow cursor with wrist gyro",
+                source="wrist_cursor.enabled",
+                comparator="truthy",
+                conditions=[MappingCondition(source="hands.left.gesture", comparator="eq", threshold="open_palm")],
+                action=MappingAction(
+                    type="mouse_move",
+                    speed_x=-12.0,
+                    speed_y=-12.0,
+                    speed_x_source="wristband.gyro_z",
+                    speed_y_source="wristband.gyro_x",
+                    move_deadband=2.0,
+                    move_smoothing_alpha=0.18,
+                ),
+            ),
             MappingRule(
                 id="gta_run_forward",
                 name="Run forward",
@@ -986,6 +1044,16 @@ def gta_vice_city_profile() -> MappingProfile:
                 action=MappingAction(type="keyboard_tap", keys=["ctrl"]),
             ),
             MappingRule(
+                id="gta_fire_hold",
+                name="Fire weapon",
+                source="hands.right.gesture",
+                comparator="eq",
+                threshold="gun_gesture",
+                debounce_ms=60,
+                recognition_label="Fire hold",
+                action=MappingAction(type="mouse_hold", button="left"),
+            ),
+            MappingRule(
                 id="gta_swap_weapon_next",
                 name="Swap weapon next",
                 source="fused.wrist_rule_value",
@@ -1002,6 +1070,66 @@ def gta_vice_city_profile() -> MappingProfile:
                 threshold="rotate_left_return",
                 recognition_label="Previous weapon",
                 action=MappingAction(type="mouse_scroll", scroll_y=-1),
+            ),
+            MappingRule(
+                id="gta_cheat_police",
+                name="Cheat: police",
+                source="audiodock.latest_transcript_command",
+                comparator="eq",
+                threshold="police",
+                conditions=[voice_gate],
+                recognition_label="Cheat police",
+                action=MappingAction(
+                    type="keyboard_sequence",
+                    text="leavemealone",
+                    append_space=False,
+                    interval_ms=250,
+                ),
+            ),
+            MappingRule(
+                id="gta_cheat_weapons",
+                name="Cheat: weapons",
+                source="audiodock.latest_transcript_command",
+                comparator="eq",
+                threshold="weapons",
+                conditions=[voice_gate],
+                recognition_label="Cheat weapons",
+                action=MappingAction(
+                    type="keyboard_sequence",
+                    text="nuttertools",
+                    append_space=False,
+                    interval_ms=250,
+                ),
+            ),
+            MappingRule(
+                id="gta_cheat_tank",
+                name="Cheat: tank",
+                source="audiodock.latest_transcript_command",
+                comparator="eq",
+                threshold="tank",
+                conditions=[voice_gate],
+                recognition_label="Cheat tank",
+                action=MappingAction(
+                    type="keyboard_sequence",
+                    text="panzer",
+                    append_space=False,
+                    interval_ms=250,
+                ),
+            ),
+            MappingRule(
+                id="gta_cheat_health",
+                name="Cheat: health",
+                source="audiodock.latest_transcript_command",
+                comparator="eq",
+                threshold="health",
+                conditions=[voice_gate],
+                recognition_label="Cheat health",
+                action=MappingAction(
+                    type="keyboard_sequence",
+                    text="aspirine",
+                    append_space=False,
+                    interval_ms=250,
+                ),
             ),
         ],
     )
@@ -1205,6 +1333,121 @@ def builtin_mapping_profiles() -> list[MappingProfile]:
     ]
 
 
+def _has_rule(profile: MappingProfile, rule_id: str) -> bool:
+    return any(rule.id == rule_id for rule in profile.mappings)
+
+
+def _is_tabs_cursor_scroll_profile(profile: MappingProfile) -> bool:
+    rule_ids = {rule.id for rule in profile.mappings}
+    required = {
+        "wrist_tab_cycle_forward",
+        "wrist_tab_cycle_backward",
+        "wrist_cursor_follow_gyro",
+        "wrist_scroll_up",
+        "wrist_scroll_down",
+    }
+    return required.issubset(rule_ids)
+
+
+def _normalize_gta_vice_city_profile(profile: MappingProfile) -> bool:
+    changed = False
+    builtin_rules = {rule.id: rule for rule in gta_vice_city_profile().mappings}
+    required_rule_ids = (
+        "gta_follow_cursor_wrist_gyro",
+        "gta_fire_hold",
+        "gta_cheat_police",
+        "gta_cheat_weapons",
+        "gta_cheat_tank",
+        "gta_cheat_health",
+    )
+    existing_by_id = {rule.id: rule for rule in profile.mappings}
+
+    for rule_id in required_rule_ids:
+        builtin_rule = builtin_rules[rule_id]
+        existing_rule = existing_by_id.get(rule_id)
+        if existing_rule is None:
+            if rule_id == "gta_follow_cursor_wrist_gyro":
+                profile.mappings.insert(0, builtin_rule)
+            else:
+                profile.mappings.append(builtin_rule)
+            changed = True
+            continue
+        builtin_rule.enabled = existing_rule.enabled
+        if rule_id.startswith("gta_cheat_") and existing_rule.to_dict() != builtin_rule.to_dict():
+            index = profile.mappings.index(existing_rule)
+            profile.mappings[index] = builtin_rule
+            changed = True
+
+    return changed
+
+
+def normalize_mapping_config(config: MappingConfig) -> tuple[MappingConfig, bool]:
+    changed = False
+    renamed_active_profile = None
+    normalized_profiles: list[MappingProfile] = []
+    seen_names: set[str] = set()
+
+    for profile in config.profiles:
+        profile_changed = False
+        profile_name = profile.name
+        if profile_name == "Windows" and _is_tabs_cursor_scroll_profile(profile):
+            profile_name = TAB_CURSOR_SCROLL_PROFILE_NAME
+            profile_changed = True
+            if config.active_profile == profile.name:
+                renamed_active_profile = profile_name
+        if profile_name in seen_names:
+            if profile_name == WRIST_CURSOR_PROFILE_NAME and any(
+                existing.name == TAB_CURSOR_SCROLL_PROFILE_NAME for existing in normalized_profiles
+            ):
+                changed = True
+                continue
+            changed = True
+            continue
+        if profile_name == WRIST_CURSOR_PROFILE_NAME and any(
+            existing.name == TAB_CURSOR_SCROLL_PROFILE_NAME for existing in normalized_profiles
+        ):
+            changed = True
+            continue
+        seen_names.add(profile_name)
+        if profile_changed:
+            profile.name = profile_name
+            changed = True
+
+        if profile_name == GTA_VICE_CITY_PROFILE_NAME and _normalize_gta_vice_city_profile(profile):
+            changed = True
+
+        if _is_tabs_cursor_scroll_profile(profile):
+            for rule in profile.mappings:
+                if rule.id == "wrist_tab_cycle_forward":
+                    for condition in rule.all_conditions():
+                        if "alt" in condition.output_keys:
+                            condition.output_keys = [key for key in condition.output_keys if key != "alt"]
+                            profile_changed = True
+                    if rule.action.type != "keyboard_tap" or rule.action.keys != ["alt", "tab"]:
+                        rule.action.type = "keyboard_tap"
+                        rule.action.keys = ["alt", "tab"]
+                        profile_changed = True
+                elif rule.id == "wrist_tab_cycle_backward":
+                    for condition in rule.all_conditions():
+                        if "alt" in condition.output_keys:
+                            condition.output_keys = [key for key in condition.output_keys if key != "alt"]
+                            profile_changed = True
+                    if rule.action.type != "keyboard_tap" or rule.action.keys != ["alt", "shift", "tab"]:
+                        rule.action.type = "keyboard_tap"
+                        rule.action.keys = ["alt", "shift", "tab"]
+                        profile_changed = True
+            if profile_changed:
+                changed = True
+
+        normalized_profiles.append(profile)
+
+    if renamed_active_profile:
+        config.active_profile = renamed_active_profile
+        changed = True
+    config.profiles = normalized_profiles
+    return ensure_builtin_profiles(config), changed
+
+
 def ensure_builtin_profiles(config: MappingConfig) -> MappingConfig:
     if not config.profiles:
         config.profiles = builtin_mapping_profiles()
@@ -1215,7 +1458,8 @@ def ensure_builtin_profiles(config: MappingConfig) -> MappingConfig:
 
 
 def default_mapping_config() -> MappingConfig:
-    return ensure_builtin_profiles(MappingConfig(profiles=builtin_mapping_profiles()))
+    config, _changed = normalize_mapping_config(MappingConfig(profiles=builtin_mapping_profiles()))
+    return config
 
 
 def load_mapping_config(path: Path = DEFAULT_MAPPING_PATH) -> tuple[MappingConfig, str | None]:
@@ -1223,7 +1467,10 @@ def load_mapping_config(path: Path = DEFAULT_MAPPING_PATH) -> tuple[MappingConfi
         return default_mapping_config(), None
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
-        return ensure_builtin_profiles(MappingConfig.from_dict(data)), None
+        config, changed = normalize_mapping_config(MappingConfig.from_dict(data))
+        if changed:
+            save_mapping_config(config, path)
+        return config, None
     except Exception as exc:
         return default_mapping_config(), str(exc)
 
@@ -1248,6 +1495,9 @@ class _RuntimeState:
     move_value_y: float | None = None
     absolute_x: float | None = None
     absolute_y: float | None = None
+    sequence_text: str = ""
+    sequence_index: int = 0
+    next_sequence_s: float = 0.0
     status: str = "idle"
 
 
@@ -1312,7 +1562,34 @@ class InputMapper:
         return True
 
     def active_rules(self) -> list[MappingRule]:
-        return self.config.active().mappings
+        rules = list(self.config.active().mappings)
+        if self.config.active_profile == GTA_VICE_CITY_PROFILE_NAME:
+            existing_ids = {rule.id for rule in rules}
+            for rule in GTA_RUNTIME_RULES:
+                if rule.id not in existing_ids:
+                    rules.append(copy.deepcopy(rule))
+        return rules
+
+    def debug_snapshot(self) -> dict[str, Any]:
+        active_rule_names: list[str] = []
+        status_counts: dict[str, int] = {}
+        for rule in self.active_rules():
+            state = self._states.get(rule.id)
+            status = (state.status if state is not None else "idle") or "idle"
+            status_counts[status] = status_counts.get(status, 0) + 1
+            if state is not None and state.active:
+                active_rule_names.append(rule.name or rule.id)
+        active_rule_names.sort()
+        return {
+            "profile": self.config.active_profile,
+            "enabled": self.enabled,
+            "last_status": self._last_status,
+            "active_rule_names": active_rule_names,
+            "active_rule_count": len(active_rule_names),
+            "held_key_count": len(self._held_keys),
+            "held_button_count": len(self._held_buttons),
+            "status_counts": status_counts,
+        }
 
     def last_recognition(self, max_age_s: float = 1.2, now_s: float | None = None) -> str:
         now_s = time.monotonic() if now_s is None else now_s
@@ -1439,6 +1716,9 @@ class InputMapper:
             state.move_value_x = None
             state.move_value_y = None
             state.status = "idle"
+            state.sequence_text = ""
+            state.sequence_index = 0
+            state.next_sequence_s = 0.0
 
     def test_action(self, action: MappingAction) -> None:
         if not self.backend.available:
@@ -1491,6 +1771,9 @@ class InputMapper:
             state.move_value_y = None
             state.absolute_x = None
             state.absolute_y = None
+            state.sequence_text = ""
+            state.sequence_index = 0
+            state.next_sequence_s = 0.0
             state.enter_blocked = bool(gesture_name and not self._can_fire_gesture(gesture_name, now_s))
             if state.enter_blocked:
                 state.status = "gesture cooldown"
@@ -1500,6 +1783,9 @@ class InputMapper:
             state.active = False
             state.last_process_s = None
             state.enter_blocked = False
+            state.sequence_text = ""
+            state.sequence_index = 0
+            state.next_sequence_s = 0.0
             self.release_rule(rule.id, include_modifiers=False)
             return
 
@@ -1530,13 +1816,15 @@ class InputMapper:
     ) -> None:
         rule_id = rule.id
         if action.type == "keyboard_tap":
-            self.backend.tap_keys(action.keys)
+            self.backend.tap_keys(action.keys, hold_ms=action.hold_ms)
         elif action.type == "keyboard_hold":
             self._hold_keys(rule_id, action.keys)
         elif action.type == "keyboard_repeat":
             self.backend.tap_keys(action.keys)
         elif action.type == "keyboard_text":
             self._type_text_action(action, source_value, signals or {})
+        elif action.type == "keyboard_sequence":
+            self._start_keyboard_sequence(rule_id, action, source_value, signals or {}, now_s)
         elif action.type == "mouse_click":
             self.backend.click_mouse(action.button, action.clicks)
         elif action.type == "mouse_hold":
@@ -1574,6 +1862,49 @@ class InputMapper:
         if action.append_space and not text.endswith((" ", "\n", "\t")):
             text += " "
         self.backend.type_text(text)
+
+    def _start_keyboard_sequence(
+        self,
+        rule_id: str,
+        action: MappingAction,
+        source_value: Any,
+        signals: dict[str, SignalValue],
+        now_s: float,
+    ) -> None:
+        text = self._text_action_value(action, source_value, signals)
+        if not text:
+            return
+        state = self._states.setdefault(rule_id, _RuntimeState())
+        state.sequence_text = text
+        state.sequence_index = 0
+        state.next_sequence_s = now_s
+        self._advance_keyboard_sequence(action, state, now_s)
+
+    @staticmethod
+    def _text_action_value(
+        action: MappingAction,
+        source_value: Any,
+        signals: dict[str, SignalValue],
+    ) -> str:
+        value: Any = action.text
+        if action.text_source:
+            signal = signals.get(action.text_source)
+            value = signal.value if signal is not None else ""
+        elif not value:
+            value = source_value
+        text = str(value or "")
+        if action.append_space and text and not text.endswith((" ", "\n", "\t")):
+            text += " "
+        return text
+
+    def _advance_keyboard_sequence(self, action: MappingAction, state: _RuntimeState, now_s: float) -> None:
+        if state.sequence_index >= len(state.sequence_text):
+            return
+        character = state.sequence_text[state.sequence_index]
+        token = {" ": "space", "\n": "enter", "\t": "tab"}.get(character, character)
+        self.backend.tap_keys([token])
+        state.sequence_index += 1
+        state.next_sequence_s = now_s + max(0.02, action.interval_ms / 1000.0)
 
     def _sync_condition_outputs(
         self,
@@ -1709,6 +2040,8 @@ class InputMapper:
         elif action.type == "mouse_absolute" and action.continuous:
             if self._move_absolute(action, signals, state):
                 state.last_fired_s = now_s
+        elif action.type == "keyboard_sequence" and now_s >= state.next_sequence_s:
+            self._advance_keyboard_sequence(action, state, now_s)
 
     def _hold_keys(self, rule_id: str, tokens: list[str]) -> None:
         for token in tokens:
@@ -1946,3 +2279,24 @@ def _compare_equal(left: Any, right: Any) -> bool:
     if left_number is not None and right_number is not None:
         return left_number == right_number
     return str(left).strip().lower() == str(right).strip().lower()
+
+
+def _normalize_audio_dock_transcript(text: Any) -> str:
+    normalized = " ".join(str(text or "").strip().lower().split())
+    if not normalized:
+        return ""
+    return re.sub(r"[^\w\s']+", "", normalized).strip()
+
+
+def _audio_dock_transcript_command(text: Any) -> str:
+    normalized = _normalize_audio_dock_transcript(text)
+    if not normalized:
+        return ""
+    if "game mode" in normalized:
+        return "game mode"
+    tokens = normalized.split()
+    for token in tokens:
+        token = TRANSCRIPT_COMMAND_ALIASES.get(token, token)
+        if token in TRANSCRIPT_COMMAND_WORDS:
+            return token
+    return ""

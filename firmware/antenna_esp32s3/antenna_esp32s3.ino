@@ -933,6 +933,15 @@ void handleSerialJsonCommand(const String &line) {
       } else if (control == "speakertest" || control == "speaker_test" ||
                  control == "speaker" || control == "spktest") {
         commandText = "__CMD:SPEAKERTEST__";
+      } else if (control == "mode_voice" || control == "modevoice" ||
+                 control == "voice" || control == "vice_city" ||
+                 control == "vicecity" || control == "always_listen" ||
+                 control == "alwayslisten") {
+        commandText = "__CMD:MODEVOICE__";
+      } else if (control == "mode_clap" || control == "modeclap" ||
+                 control == "clap" || control == "double_clap" ||
+                 control == "doubleclap") {
+        commandText = "__CMD:MODECLAP__";
       } else if (control == "training_record" || control == "trainingrecord" ||
                  control == "record_sample" || control == "sample") {
         uint16_t count = 1;
@@ -2225,6 +2234,8 @@ void printAudioDockDeltaJson(const AirTrixxPacketHeader &header,
     Serial.print("none");
   } else if (clapType == 2) {
     Serial.print("double_clap");
+  } else if (clapType == 3) {
+    Serial.print("voice_command");
   } else {
     Serial.print("single_clap");
   }

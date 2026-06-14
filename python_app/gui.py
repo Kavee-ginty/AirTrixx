@@ -46,6 +46,7 @@ from input_mapper import (
     MappingProfile,
     MappingRule,
     SignalCatalog,
+    GTA_VICE_CITY_PROFILE_NAME,
     WRIST_CURSOR_PROFILE_NAME,
     WRISTBAND_MOUSE_CURSOR_PROFILE_NAME,
     wrist_cursor_profile,
@@ -108,6 +109,13 @@ CAMERA_OVERLAY_MAX_LINES = 4
 SERIAL_AUTOCONNECT_DELAY_MS = 250
 SERIAL_AUTOCONNECT_RETRY_MS = 1000
 SERIAL_PORT_FAIL_COOLDOWN_S = 8.0
+AUDIO_DOCK_VOICE_GATE_SECONDS = 12.0
+RUNTIME_DEBUG_LOG_INTERVAL_S = 0.5
+RUNTIME_DEBUG_SLOW_TICK_MS = 45.0
+RUNTIME_DEBUG_SLOW_STAGE_MS = 20.0
+RUNTIME_DEBUG_STALE_FRAME_MS = 250.0
+RUNTIME_DEBUG_STALE_HAND_MS = 450.0
+RUNTIME_DEBUG_LOG_BATCH_WARN_MS = 12.0
 LIVE_DATA_HISTORY_ROWS = 10
 KEYBOARD_DISTANCE_ROWS = 34
 KEYBOARD_DISTANCE_BAND_MM = 10
@@ -375,6 +383,7 @@ MAPPING_ACTION_OPTIONS = (
     "keyboard_hold",
     "keyboard_repeat",
     "keyboard_text",
+    "keyboard_sequence",
     "mouse_click",
     "mouse_hold",
     "mouse_scroll",
@@ -407,6 +416,13 @@ class AirTrixxGUI:
         self._mapping_refresh_after_id: str | None = None
         self._last_preview_update_s = 0.0
         self._last_tick_error = ""
+        self._last_focus_debug = ""
+        self._last_mapper_suppressed_debug: bool | None = None
+        self._last_mapper_suppressed_reason = ""
+        self._last_runtime_debug_log_s = 0.0
+        self._last_runtime_debug_signature = ""
+        self._last_stale_runtime_signature = ""
+        self._last_log_drain_count = 0
         self._latest_snapshot: dict[str, Any] = {}
         self.centering_bracket: str | None = None
         self.centering_positions: dict[str, dict[str, int]] = {}
@@ -435,6 +451,8 @@ class AirTrixxGUI:
         self.camera_popup_label: ttk.Label | None = None
         self._popup_photo: tk.PhotoImage | None = None
         self.camera_popup_dismissed = False
+        self.camera_popup_manual = False
+        self.logs_notebook: ttk.Notebook | None = None
         self._last_servo_debug_sequence = 0
         self._last_servo_debug_log_s = 0.0
         self.ota_server: http.server.ThreadingHTTPServer | None = None
@@ -624,6 +642,9 @@ class AirTrixxGUI:
         self.audio_dock_last_trigger_var = tk.StringVar(value="-")
         self.audio_dock_latest_transcript_var = tk.StringVar(value="-")
         self.audio_dock_port_var = tk.StringVar()
+        self._audio_dock_voice_gate_until_s = 0.0
+        self._audio_dock_thumb_up_seen = {"left": False, "right": False}
+        self._audio_dock_last_listening_control = ""
         self.audio_training_mode_var = tk.BooleanVar(value=False)
         self.audio_training_label_var = tk.StringVar(value=TRAINING_LABELS[0])
         self.audio_training_count_var = tk.StringVar(value="10")
@@ -656,6 +677,8 @@ class AirTrixxGUI:
         self.mapping_config_path = self.config.mapping_path
         mapping_config, mapping_error = load_mapping_config(self.mapping_config_path)
         self.input_mapper = InputMapper(self.input_backend, mapping_config, on_log=self.log)
+        if mapping_config.active_profile == GTA_VICE_CITY_PROFILE_NAME:
+            self.input_mapper.set_enabled(True)
         self.mapping_recording_shortcut = False
         self.mapping_signal_items: dict[str, str] = {}
         self.mapping_signal_group_items: dict[str, str] = {}
@@ -733,6 +756,15 @@ class AirTrixxGUI:
 
     def log(self, message: str) -> None:
         self.log_queue.put(message)
+
+    @staticmethod
+    def _format_ms(value_ms: Any) -> str:
+        if value_ms is None:
+            return "-"
+        try:
+            return f"{float(value_ms):.1f}ms"
+        except (TypeError, ValueError):
+            return str(value_ms)
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self.root)
@@ -943,8 +975,7 @@ class AirTrixxGUI:
         body.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
         body.columnconfigure(0, weight=1)
-        self._register_scroll_target(canvas, canvas)
-        self._register_scroll_target(body, canvas)
+        self._register_scroll_tree(body, canvas)
         return body
 
     def _build_signals_page(self, page: ttk.Frame) -> None:
@@ -1279,6 +1310,7 @@ class AirTrixxGUI:
         devices = raw_state.get("devices", {}) if isinstance(raw_state, dict) else {}
         audiodock = devices.get("audiodock", {}) if isinstance(devices, dict) else {}
         input_dict["audiodock_input"] = self._audio_dock_input_value(audiodock if isinstance(audiodock, dict) else {})
+        input_dict["audio_dock_voice_gate"] = self._audio_dock_voice_gate_active()
         input_dict["model_value"] = "none"
         snapshot["input_array"] = [input_dict.get(field) for field in FIELD_ORDER]
 
@@ -5247,6 +5279,7 @@ class AirTrixxGUI:
         if self.audio_dock_bridge.is_connected:
             self.audio_dock_autoconnect_enabled = False
             self.audio_dock_bridge.disconnect()
+            self._clear_audio_dock_voice_gate()
             self._sync_audio_dock_controls()
             return
 
@@ -5272,6 +5305,7 @@ class AirTrixxGUI:
 
         if self.audio_dock_bridge.connect(None):
             self._sync_audio_dock_controls()
+            self._sync_audio_dock_listening_mode()
             self._schedule_text_update()
         else:
             self.log("Failed to connect to Audio Dock.")
@@ -5298,6 +5332,7 @@ class AirTrixxGUI:
                 self._sync_audio_dock_controls()
                 return
             self._sync_audio_dock_controls()
+            self._sync_audio_dock_listening_mode()
 
         capture_count = self._audio_training_count()
         self.audio_dock_bridge.arm_training_capture(self.audio_training_label_var.get(), capture_count)
@@ -5419,7 +5454,98 @@ class AirTrixxGUI:
         self.audio_dock_last_trigger_var.set(trigger)
         self.audio_dock_latest_transcript_var.set(text)
         self.log(f"Audio Dock Trigger: {trigger} | Transcript: {text}")
+        if self._audio_dock_transcript_requests_game_mode(text):
+            self._activate_profile_with_audio_sync(GTA_VICE_CITY_PROFILE_NAME, reason="Audio Dock transcript")
+        if (
+            text.strip()
+            and trigger.strip().lower() == "voice command"
+            and self.input_mapper.config.active_profile == GTA_VICE_CITY_PROFILE_NAME
+        ):
+            self._audio_dock_voice_gate_until_s = max(
+                self._audio_dock_voice_gate_until_s,
+                time.monotonic() + AUDIO_DOCK_VOICE_GATE_SECONDS,
+            )
         self._schedule_text_update()
+
+    @staticmethod
+    def _audio_dock_transcript_requests_game_mode(text: str) -> bool:
+        normalized = " ".join(text.strip().lower().split())
+        return "game mode" in normalized
+
+    def _clear_audio_dock_voice_gate(self) -> None:
+        self._audio_dock_voice_gate_until_s = 0.0
+        self._audio_dock_thumb_up_seen = {"left": False, "right": False}
+
+    def _audio_dock_voice_gate_active(self, now_s: float | None = None) -> bool:
+        current_s = time.monotonic() if now_s is None else now_s
+        return (
+            self.input_mapper.config.active_profile == GTA_VICE_CITY_PROFILE_NAME
+            and current_s < self._audio_dock_voice_gate_until_s
+        )
+
+    def _update_audio_dock_voice_gate(self, hands: dict[str, dict[str, Any]], now_s: float) -> None:
+        active_profile = self.input_mapper.config.active_profile
+        if active_profile != GTA_VICE_CITY_PROFILE_NAME:
+            if self._audio_dock_voice_gate_until_s or any(self._audio_dock_thumb_up_seen.values()):
+                self._clear_audio_dock_voice_gate()
+            return
+
+        triggered = False
+        for side in ("left", "right"):
+            hand = hands.get(side, {}) if isinstance(hands, dict) else {}
+            if not isinstance(hand, dict):
+                hand = {}
+            thumb_up = bool(hand.get("visible") and hand.get("gesture") == "thumb_up")
+            if thumb_up and not self._audio_dock_thumb_up_seen.get(side, False):
+                triggered = True
+                self._audio_dock_voice_gate_until_s = max(
+                    self._audio_dock_voice_gate_until_s,
+                    now_s + AUDIO_DOCK_VOICE_GATE_SECONDS,
+                )
+                self._audio_dock_last_listening_control = ""
+                self.log(f"Audio Dock voice armed by {side} thumb-up.")
+            self._audio_dock_thumb_up_seen[side] = thumb_up
+
+        if triggered:
+            self._sync_audio_dock_listening_mode(now_s=now_s)
+
+    def _desired_audio_dock_listening_control(self, profile_name: str | None = None, now_s: float | None = None) -> str:
+        active_profile = profile_name or self.input_mapper.config.active_profile
+        if active_profile != GTA_VICE_CITY_PROFILE_NAME:
+            return "mode_clap"
+        return "mode_voice"
+
+    def _sync_audio_dock_listening_mode(self, profile_name: str | None = None, now_s: float | None = None) -> None:
+        if not self.audio_dock_bridge.is_connected:
+            return
+
+        desired_control = self._desired_audio_dock_listening_control(profile_name, now_s)
+        if desired_control == self._audio_dock_last_listening_control:
+            return
+        if self.audio_dock_bridge.send_control(desired_control):
+            self._audio_dock_last_listening_control = desired_control
+
+    def _activate_profile_with_audio_sync(self, profile_name: str, *, reason: str) -> bool:
+        previous_profile = self.input_mapper.config.active_profile
+        if not self.input_mapper.set_active_profile(profile_name):
+            return False
+
+        active_profile = self.input_mapper.config.active_profile
+        if active_profile == GTA_VICE_CITY_PROFILE_NAME and not self.input_mapper.enabled:
+            self.input_mapper.set_enabled(True)
+            self.log("GTA Vice City profile enabled the input mapper for voice cheats.")
+        self.mapping_profile_var.set(active_profile)
+        self.mapping_enabled_var.set(self.input_mapper.enabled)
+        self._schedule_mapping_views_refresh()
+        self._update_mapping_status()
+        self._refresh_mapping_profile_combo()
+        if active_profile != GTA_VICE_CITY_PROFILE_NAME:
+            self._clear_audio_dock_voice_gate()
+        self._sync_audio_dock_listening_mode(active_profile)
+
+        if active_profile != previous_profile:
+            self.log(f"{reason} switched input mapping profile to {active_profile}.")
+        return True
 
     def _sync_audio_dock_controls(self) -> None:
         if hasattr(self, "audio_connect_button") and self.audio_connect_button.winfo_exists():
@@ -5483,10 +5609,7 @@ class AirTrixxGUI:
             self.mapping_profile_var.set(self.input_mapper.config.active_profile)
 
     def on_mapping_profile_changed(self, _event: tk.Event | None = None) -> None:
-        if self.input_mapper.set_active_profile(self.mapping_profile_var.get()):
-            self._schedule_mapping_views_refresh()
-            self._update_mapping_status()
-            self.log(f"Input mapping profile switched to {self.input_mapper.config.active_profile}.")
+        self._activate_profile_with_audio_sync(self.mapping_profile_var.get(), reason="Input mapping profile")
 
     def _schedule_mapping_views_refresh(self) -> None:
         if self._mapping_refresh_after_id is not None:
@@ -5507,12 +5630,9 @@ class AirTrixxGUI:
             name = f"Profile {index}"
         self.input_mapper.release_all()
         self.input_mapper.config.profiles.append(MappingProfile(name=name))
-        self.input_mapper.config.active_profile = name
-        self.mapping_profile_var.set(name)
-        self._refresh_mapping_profile_combo()
+        self._activate_profile_with_audio_sync(name, reason="New input mapping profile")
         self._refresh_mapping_table()
         self._refresh_testing_list()
-        self._update_mapping_status()
 
     def rename_mapping_profile(self) -> None:
         current_name = self.mapping_profile_var.get().strip()
@@ -5539,12 +5659,10 @@ class AirTrixxGUI:
         profile.name = new_name
         if self.input_mapper.config.active_profile == current_name:
             self.input_mapper.config.active_profile = new_name
-        self.mapping_profile_var.set(new_name)
         save_mapping_config(self.input_mapper.config, self.mapping_config_path)
-        self._refresh_mapping_profile_combo()
+        self._activate_profile_with_audio_sync(new_name, reason="Renamed input mapping profile")
         self._refresh_mapping_table()
         self._refresh_testing_list()
-        self._update_mapping_status()
         self.log(f'Renamed input mapping profile "{current_name}" to "{new_name}".')
 
     def delete_mapping_profile(self) -> None:
@@ -5558,12 +5676,10 @@ class AirTrixxGUI:
         if not self.input_mapper.config.remove_profile(name):
             self.log(f'Could not delete input mapping profile "{name}".')
             return
-        self.mapping_profile_var.set(self.input_mapper.config.active_profile)
         save_mapping_config(self.input_mapper.config, self.mapping_config_path)
-        self._refresh_mapping_profile_combo()
+        self._activate_profile_with_audio_sync(self.input_mapper.config.active_profile, reason="Deleted input mapping profile")
         self._refresh_mapping_table()
         self._refresh_testing_list()
-        self._update_mapping_status()
         self.log(f'Deleted input mapping profile "{name}".')
 
     def save_input_mappings(self) -> None:
@@ -5578,11 +5694,9 @@ class AirTrixxGUI:
         self.input_mapper.set_config(config)
         self.mapping_enabled_var.set(self.input_mapper.enabled)
         self.mapping_start_enabled_var.set(config.enabled_on_start)
-        self.mapping_profile_var.set(config.active_profile)
-        self._refresh_mapping_profile_combo()
+        self._activate_profile_with_audio_sync(config.active_profile, reason="Loaded input mappings")
         self._refresh_mapping_table()
         self._refresh_testing_list()
-        self._update_mapping_status()
         self.log(f"Loaded input mappings from {self.mapping_config_path}.")
 
     def import_input_mappings(self) -> None:
@@ -5600,11 +5714,9 @@ class AirTrixxGUI:
         self.input_mapper.set_config(config)
         self.mapping_enabled_var.set(self.input_mapper.enabled)
         self.mapping_start_enabled_var.set(config.enabled_on_start)
-        self.mapping_profile_var.set(config.active_profile)
-        self._refresh_mapping_profile_combo()
+        self._activate_profile_with_audio_sync(config.active_profile, reason="Imported input mappings")
         self._refresh_mapping_table()
         self._refresh_testing_list()
-        self._update_mapping_status()
         self.log(f"Imported input mappings from {selected}.")
 
     def export_input_mappings(self) -> None:
@@ -5756,8 +5868,7 @@ class AirTrixxGUI:
         frame_window = canvas.create_window((0, 0), window=frame, anchor="nw")
         frame.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda event: canvas.itemconfigure(frame_window, width=event.width))
-        self._register_scroll_target(canvas, canvas)
-        self._register_scroll_target(frame, canvas)
+        self._register_scroll_tree(frame, canvas)
 
         name_var = tk.StringVar(value=working.name)
         enabled_var = tk.BooleanVar(value=working.enabled)
@@ -6033,6 +6144,7 @@ class AirTrixxGUI:
                     )
                 else:
                     modifier_frame.grid_remove()
+            self._register_scroll_tree(frame, canvas)
 
         for modifier_index in range(2):
             modifier_enabled_vars[modifier_index].trace_add("write", lambda *_args: refresh_modifier_rows())
@@ -6247,6 +6359,7 @@ class AirTrixxGUI:
         ttk.Button(actions, text="Test Action", command=test_action).grid(row=0, column=1, sticky="e", padx=(0, 6))
         ttk.Button(actions, text="Cancel", command=close_dialog).grid(row=0, column=2, sticky="e", padx=(0, 6))
         ttk.Button(actions, text="Save", command=save_rule, style="Accent.TButton").grid(row=0, column=3, sticky="e")
+        self._register_scroll_tree(actions, canvas)
         dialog.protocol("WM_DELETE_WINDOW", close_dialog)
 
     def _update_mapping_live_views(self) -> None:
@@ -6394,6 +6507,7 @@ class AirTrixxGUI:
         page.rowconfigure(1, weight=1)
         page.columnconfigure(0, weight=1)
         notebook = ttk.Notebook(page)
+        self.logs_notebook = notebook
         notebook.grid(row=1, column=0, sticky="nsew")
         log_frame = ttk.Frame(notebook, padding=6)
         json_frame = ttk.Frame(notebook, padding=6)
@@ -6456,6 +6570,11 @@ class AirTrixxGUI:
     def _register_scroll_target(self, widget: tk.Widget, target: tk.Widget) -> None:
         self._scroll_targets[str(widget)] = target
 
+    def _register_scroll_tree(self, widget: tk.Widget, target: tk.Widget) -> None:
+        self._register_scroll_target(widget, target)
+        for child in widget.winfo_children():
+            self._register_scroll_tree(child, target)
+
     def _on_mousewheel(self, event: tk.Event) -> str | None:
         widget = self.root.winfo_containing(event.x_root, event.y_root)
         while widget is not None:
@@ -6478,10 +6597,13 @@ class AirTrixxGUI:
 
     def open_camera_popup(self) -> None:
         self.camera_popup_dismissed = False
-        self._ensure_camera_popup(lift=True)
+        self.camera_popup_manual = True
+        self._ensure_camera_popup(lift=True, manual=True)
 
-    def _ensure_camera_popup(self, lift: bool = False) -> None:
+    def _ensure_camera_popup(self, lift: bool = False, manual: bool = False) -> None:
         if self.camera_popup is not None and self.camera_popup.winfo_exists():
+            if manual:
+                self.camera_popup_manual = True
             if lift:
                 self._position_camera_popup()
                 self.camera_popup.deiconify()
@@ -6505,11 +6627,13 @@ class AirTrixxGUI:
         self.camera_popup = popup
         self.camera_popup_label = ttk.Label(popup, background="#111827")
         self.camera_popup_label.grid(row=0, column=0, sticky="nsew")
+        self.camera_popup_manual = manual
         self._set_camera_popup_placeholder()
         self._update_preview(force=True)
 
     def close_camera_popup(self) -> None:
         self.camera_popup_dismissed = True
+        self.camera_popup_manual = False
         self._close_camera_popup()
 
     def _on_root_configure(self, event: tk.Event) -> None:
@@ -6556,6 +6680,7 @@ class AirTrixxGUI:
         self.camera_popup = None
         self.camera_popup_label = None
         self._popup_photo = None
+        self.camera_popup_manual = False
 
     def _auto_connect_audio_dock(self) -> None:
         if (
@@ -6566,6 +6691,7 @@ class AirTrixxGUI:
             return
         if self.audio_dock_bridge.connect(None):
             self._sync_audio_dock_controls()
+            self._sync_audio_dock_listening_mode()
             self._schedule_text_update()
 
     def refresh_ports(self) -> None:
@@ -6609,6 +6735,8 @@ class AirTrixxGUI:
             self._serial_connect_generation += 1
             if self.audio_dock_bridge.is_connected:
                 self.audio_dock_bridge.disconnect()
+                self._clear_audio_dock_voice_gate()
+                self._audio_dock_last_listening_control = ""
             self.serial_bridge.disconnect()
             return
         self.serial_autoconnect_enabled = True
@@ -7498,6 +7626,119 @@ class AirTrixxGUI:
         widget = self.root.focus_get()
         return isinstance(widget, (tk.Entry, tk.Text, ttk.Entry, ttk.Combobox, ttk.Spinbox))
 
+    def _focus_debug_name(self) -> str:
+        widget = self.root.focus_get()
+        if widget is None:
+            return "none"
+        try:
+            widget_name = str(widget)
+        except Exception:
+            widget_name = widget.__class__.__name__
+        return f"{widget.__class__.__name__} {widget_name}"
+
+    def _mapper_suppressed_reason(
+        self,
+        text_focus: bool,
+        testing_suppressed: bool,
+        wrist_cursor_suppressed: bool,
+    ) -> str:
+        reasons: list[str] = []
+        if text_focus:
+            reasons.append("text-focus")
+        if self.mapping_recording_shortcut:
+            reasons.append("recording-shortcut")
+        if testing_suppressed:
+            reasons.append("testing-suppressed")
+        if wrist_cursor_suppressed:
+            reasons.append("wrist-cursor-suppressed")
+        return ", ".join(reasons) if reasons else "live"
+
+    def _log_runtime_debug(
+        self,
+        now_s: float,
+        *,
+        tick_ms: float,
+        stage_timings_ms: dict[str, float],
+        hands: dict[str, dict[str, Any]],
+        mapper_suppressed: bool,
+        mapper_reason: str,
+    ) -> None:
+        tracker_stats = self.hand_tracker.get_runtime_stats()
+        mapper_stats = self.input_mapper.debug_snapshot()
+        visible_hands = [side for side, values in hands.items() if values.get("visible")]
+        focus_name = self._focus_debug_name()
+        if focus_name != self._last_focus_debug:
+            self._last_focus_debug = focus_name
+            self.log(f"[debug] Focus changed: {focus_name}")
+        if (
+            self._last_mapper_suppressed_debug is None
+            or mapper_suppressed != self._last_mapper_suppressed_debug
+            or mapper_reason != self._last_mapper_suppressed_reason
+        ):
+            self._last_mapper_suppressed_debug = mapper_suppressed
+            self._last_mapper_suppressed_reason = mapper_reason
+            self.log(
+                f"[debug] Mapper {'suppressed' if mapper_suppressed else 'active'}: "
+                f"{mapper_reason}"
+            )
+
+        slow_stages = [
+            f"{name}={timing:.1f}ms"
+            for name, timing in stage_timings_ms.items()
+            if timing >= RUNTIME_DEBUG_SLOW_STAGE_MS
+        ]
+        stale_markers: list[str] = []
+        frame_age_ms = tracker_stats.get("frame_age_ms")
+        hand_age_ms = tracker_stats.get("hand_age_ms")
+        if isinstance(frame_age_ms, (int, float)) and frame_age_ms >= RUNTIME_DEBUG_STALE_FRAME_MS:
+            stale_markers.append(f"frame_age={frame_age_ms:.1f}ms")
+        if isinstance(hand_age_ms, (int, float)) and hand_age_ms >= RUNTIME_DEBUG_STALE_HAND_MS:
+            stale_markers.append(f"hand_age={hand_age_ms:.1f}ms")
+
+        runtime_signature = "|".join(
+            [
+                str(mapper_stats.get("profile", "")),
+                str(mapper_stats.get("last_status", "")),
+                ",".join(mapper_stats.get("active_rule_names", [])),
+                ",".join(visible_hands),
+                ",".join(stale_markers),
+            ]
+        )
+        should_emit_summary = (
+            now_s - self._last_runtime_debug_log_s >= RUNTIME_DEBUG_LOG_INTERVAL_S
+            or tick_ms >= RUNTIME_DEBUG_SLOW_TICK_MS
+            or bool(slow_stages)
+            or runtime_signature != self._last_runtime_debug_signature
+        )
+        stale_signature = "|".join(stale_markers)
+        should_emit_stale = bool(stale_markers) and stale_signature != self._last_stale_runtime_signature
+
+        if should_emit_summary or should_emit_stale:
+            self._last_runtime_debug_log_s = now_s
+            self._last_runtime_debug_signature = runtime_signature
+            self._last_stale_runtime_signature = stale_signature
+            active_names = mapper_stats.get("active_rule_names", [])
+            active_text = ", ".join(active_names[:4]) if active_names else "-"
+            if len(active_names) > 4:
+                active_text += f" (+{len(active_names) - 4} more)"
+            status_counts = mapper_stats.get("status_counts", {})
+            status_text = ", ".join(f"{key}:{value}" for key, value in sorted(status_counts.items())) or "-"
+            slow_text = ", ".join(slow_stages) if slow_stages else "-"
+            self.log(
+                "[debug] Tick "
+                f"{tick_ms:.1f}ms | stages {slow_text} | "
+                f"hands={visible_hands or ['none']} face={tracker_stats.get('face_visible')} "
+                f"frame_age={self._format_ms(frame_age_ms)} hand_age={self._format_ms(hand_age_ms)} "
+                f"loop={self._format_ms(tracker_stats.get('last_loop_duration_ms'))} "
+                f"capture_gap={self._format_ms(tracker_stats.get('last_capture_gap_ms'))} "
+                f"process_hands={tracker_stats.get('last_process_hands')} "
+                f"skip={tracker_stats.get('tracking_frame_skip')} | "
+                f"mapper={mapper_stats.get('last_status')} active={mapper_stats.get('active_rule_count')} "
+                f"held_keys={mapper_stats.get('held_key_count')} held_buttons={mapper_stats.get('held_button_count')} "
+                f"rules=[{active_text}] statuses=[{status_text}] "
+                f"suppressed={mapper_reason}"
+            )
+
     def _sync_calibration_entries(self, calibration: dict[str, Any]) -> None:
         for key, value in calibration.items():
             if key in self.calibration_vars:
@@ -7758,6 +7999,8 @@ class AirTrixxGUI:
             f"Saved dock geometry session calibration to {self.config.calibration_path} "
             f"(startup user distance {startup_user_distance_mm:.0f} mm)."
         )
+        if not self.camera_popup_manual:
+            self._close_camera_popup()
 
     def _valid_calibration_tof_mm(self, side: str, serial_state: dict[str, Any]) -> float | None:
         devices = serial_state.get("devices", {}) if isinstance(serial_state, dict) else {}
@@ -7859,14 +8102,26 @@ class AirTrixxGUI:
                 pass
 
     def _tick_body(self) -> None:
-        self._drain_log_queue()
-        self._apply_runtime_performance_settings()
+        tick_started = time.perf_counter()
+        stage_timings_ms: dict[str, float] = {}
 
+        stage_started = time.perf_counter()
+        self._drain_log_queue()
+        stage_timings_ms["log_drain"] = (time.perf_counter() - stage_started) * 1000.0
+
+        stage_started = time.perf_counter()
+        self._apply_runtime_performance_settings()
+        stage_timings_ms["runtime_settings"] = (time.perf_counter() - stage_started) * 1000.0
+
+        stage_started = time.perf_counter()
         hands = self.hand_tracker.get_latest_hands()
+        stage_timings_ms["hand_fetch"] = (time.perf_counter() - stage_started) * 1000.0
         if self.serial_bridge.is_connected:
             self._auto_connect_audio_dock()
         elif self.audio_dock_bridge.is_connected:
             self.audio_dock_bridge.disconnect()
+            self._clear_audio_dock_voice_gate()
+            self._audio_dock_last_listening_control = ""
         self._sync_audio_dock_controls()
         serial_state = self._serial_state_with_audio_dock_overlay(self.serial_bridge.get_latest_state())
         self._maybe_update_wrist_cursor_connection_state(serial_state, time.monotonic())
@@ -7885,6 +8140,8 @@ class AirTrixxGUI:
             self._update_wrist_mouse_calibration_capture(now_s)
         if self.wrist_camera_alignment_phase in {"ready", "capturing"}:
             self._update_wrist_camera_alignment_capture(now_s)
+        self._update_audio_dock_voice_gate(hands, now_s)
+        self._sync_audio_dock_listening_mode(now_s=now_s)
         wristband_states = self.serial_bridge.drain_wristband_states()
         if not wristband_states:
             wristband_states = [serial_state]
@@ -7930,21 +8187,30 @@ class AirTrixxGUI:
         self._latest_snapshot["_signal_sequence"] = self._mapping_signal_sequence(self._latest_snapshot)
         if self.wrist_camera_alignment_phase == "capturing":
             self._add_wrist_camera_alignment_sample(self._latest_snapshot, now_s)
+        stage_timings_ms["snapshot_build"] = (time.perf_counter() - stage_started) * 1000.0
+
+        stage_started = time.perf_counter()
         self.keyboard_bridge.tick(now_s=now_s)
+        stage_timings_ms["keyboard_tick"] = (time.perf_counter() - stage_started) * 1000.0
         if self.keyboard_training_timer_active:
             self._update_keyboard_training_timer(now_s)
         testing_suppressed = bool(self.testing_active and self.testing_output_suppressed_var.get())
+        text_focus = self._focus_is_text_input()
+        wrist_cursor_suppressed = self._wrist_cursor_output_suppressed()
         mapper_suppressed = (
-            self._focus_is_text_input()
+            text_focus
             or self.mapping_recording_shortcut
             or testing_suppressed
-            or self._wrist_cursor_output_suppressed()
+            or wrist_cursor_suppressed
         )
+        mapper_reason = self._mapper_suppressed_reason(text_focus, testing_suppressed, wrist_cursor_suppressed)
         try:
+            stage_started = time.perf_counter()
             if self.serial_bridge.is_connected or self.keyboard_bridge.source_ready:
                 self.input_mapper.process(self._latest_snapshot, now_s, suppress_output=mapper_suppressed)
             else:
                 self.input_mapper.release_all()
+            stage_timings_ms["input_mapper"] = (time.perf_counter() - stage_started) * 1000.0
         except Exception as exc:
             self.input_mapper.release_all()
             message = f"Input mapper recovered after error: {type(exc).__name__}: {exc}"
@@ -7952,7 +8218,9 @@ class AirTrixxGUI:
                 self._last_tick_error = message
                 self.log(message)
         try:
+            stage_started = time.perf_counter()
             self._process_testing_snapshot(now_s)
+            stage_timings_ms["testing"] = (time.perf_counter() - stage_started) * 1000.0
         except Exception as exc:
             self.testing_active = False
             message = f"Gesture testing recovered after error: {type(exc).__name__}: {exc}"
@@ -7961,10 +8229,14 @@ class AirTrixxGUI:
                 self.log(message)
         if self.active_page == "Data / Logs":
             self._update_servo_debug_console()
+        stage_started = time.perf_counter()
         self._update_preview()
+        stage_timings_ms["preview"] = (time.perf_counter() - stage_started) * 1000.0
         if self._text_update_after_id is None and now_s - self._last_text_update_s >= 0.2:
             self._last_text_update_s = now_s
+            stage_started = time.perf_counter()
             self._update_text_views()
+            stage_timings_ms["text_views"] = (time.perf_counter() - stage_started) * 1000.0
 
         connect_button_state = (
             ("Connecting...", "disabled")
@@ -7980,6 +8252,15 @@ class AirTrixxGUI:
         if now_s - self._last_status_update_s >= STATUS_UPDATE_INTERVAL_S:
             self._last_status_update_s = now_s
             self._update_status_strip()
+        tick_ms = (time.perf_counter() - tick_started) * 1000.0
+        self._log_runtime_debug(
+            now_s,
+            tick_ms=tick_ms,
+            stage_timings_ms=stage_timings_ms,
+            hands=hands,
+            mapper_suppressed=mapper_suppressed,
+            mapper_reason=mapper_reason,
+        )
 
     def _update_status_strip(self) -> None:
         if self.serial_bridge.is_connected:
@@ -8253,6 +8534,8 @@ class AirTrixxGUI:
         self.log(f"Camera centering finished: {reason}.")
         if self.startup_hand_calibration_pending:
             self.start_hand_calibration(auto=True)
+        elif not self.camera_popup_manual:
+            self._close_camera_popup()
 
     def _lock_camera_bracket_position(self) -> None:
         if not self.serial_bridge.is_connected:
@@ -8286,6 +8569,9 @@ class AirTrixxGUI:
             and not popup_visible
             and (self.camera_centering_active or self.hand_calibration_active)
         )
+        if popup_visible and not self.camera_popup_manual and not (self.camera_centering_active or self.hand_calibration_active):
+            self._close_camera_popup()
+            popup_visible = False
         if not force and not camera_page_visible and not popup_visible and not should_open_popup:
             return
         now = time.monotonic()
@@ -8294,7 +8580,7 @@ class AirTrixxGUI:
             return
         self._last_preview_update_s = now
         if should_open_popup:
-            self._ensure_camera_popup()
+            self._ensure_camera_popup(manual=False)
             popup_visible = (
                 self.camera_popup is not None
                 and self.camera_popup.winfo_exists()
@@ -8311,14 +8597,14 @@ class AirTrixxGUI:
         self._draw_camera_instruction_overlay(image)
         if camera_page_visible:
             preview_image = image.copy()
-            preview_image.thumbnail((960, 540), Image.Resampling.LANCZOS)
+            preview_image.thumbnail((960, 540), Image.Resampling.BILINEAR)
             self._photo = self._photo_image_from_pil(preview_image)
             self.preview_label.configure(image=self._photo)
         if self.camera_popup is not None and self.camera_popup.winfo_exists() and self.camera_popup_label is not None:
             popup_image = image.copy()
             width = max(1, self.camera_popup.winfo_width())
             height = max(1, self.camera_popup.winfo_height())
-            popup_image.thumbnail((width, height), Image.Resampling.LANCZOS)
+            popup_image.thumbnail((width, height), Image.Resampling.BILINEAR)
             self._popup_photo = self._photo_image_from_pil(popup_image)
             self.camera_popup_label.configure(image=self._popup_photo)
         elif self.camera_popup is not None:
@@ -8485,14 +8771,21 @@ class AirTrixxGUI:
             self._update_testing_live_values()
             return
         if page == "Data / Logs":
-            self._update_data_table(serial_state, input_dict)
-            self._set_text(self.json_text, json.dumps(serial_state, indent=2))
-            fused = {
-                "field_order": FIELD_ORDER,
-                "input_array": input_array,
-                "input_dict": input_dict,
-            }
-            self._set_text(self.fused_text, json.dumps(fused, indent=2))
+            selected_log_tab = ""
+            if self.logs_notebook is not None:
+                try:
+                    selected_log_tab = self.logs_notebook.tab(self.logs_notebook.select(), "text")
+                except tk.TclError:
+                    selected_log_tab = ""
+            if selected_log_tab == "Antenna JSON":
+                self._set_text(self.json_text, json.dumps(serial_state, indent=2))
+            elif selected_log_tab == "Fused Snapshot":
+                fused = {
+                    "field_order": FIELD_ORDER,
+                    "input_array": input_array,
+                    "input_dict": input_dict,
+                }
+                self._set_text(self.fused_text, json.dumps(fused, indent=2))
             return
         if page == "Camera & Servo":
             return
@@ -8865,10 +9158,14 @@ class AirTrixxGUI:
     def _snapshot_provider(self) -> dict[str, Any]:
         serial_state = self._serial_state_with_audio_dock_overlay(self.serial_bridge.get_latest_state())
         hand_state = self.hand_tracker.get_latest_hands() if self.camera_enabled else {}
-        rule_output = self.wrist_rule_detector.output(time.monotonic())
+        now_s = time.monotonic()
+        self._update_audio_dock_voice_gate(hand_state, now_s)
+        self._sync_audio_dock_listening_mode(now_s=now_s)
+        rule_output = self.wrist_rule_detector.output(now_s)
         snapshot = self.fusion_state.build_snapshot(
             serial_state,
             hand_state,
+            now_s=now_s,
             model_value="none",
             wrist_rule_value=str(rule_output["value"]),
             wrist_rotate_left_return=bool(rule_output["rotate_left_return"]),
@@ -8966,13 +9263,23 @@ class AirTrixxGUI:
         return calibration
 
     def _drain_log_queue(self) -> None:
+        messages: list[str] = []
         while True:
             try:
                 message = self.log_queue.get_nowait()
             except queue.Empty:
                 break
-            self.log_text.insert("end", message + "\n")
-            self.log_text.see("end")
+            messages.append(message)
+        if not messages:
+            self._last_log_drain_count = 0
+            return
+        started = time.perf_counter()
+        self.log_text.insert("end", "\n".join(messages) + "\n")
+        self.log_text.see("end")
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self._last_log_drain_count = len(messages)
+        if len(messages) > 20 or elapsed_ms >= RUNTIME_DEBUG_LOG_BATCH_WARN_MS:
+            self.log_queue.put(f"[debug] Log drain batch={len(messages)} insert_time={elapsed_ms:.1f}ms")
 
     @staticmethod
     def _set_text(widget: tk.Text, text: str) -> None:

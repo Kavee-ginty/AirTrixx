@@ -27,6 +27,20 @@ LEGACY_AUDIO_PREFIXES = ("AUDIODOCK_AUDIO:", "UDIODOCK_AUDIO:", "DIODOCK_AUDIO:"
 INDEXED_AUDIO_PATTERN = re.compile(
     r"(?:AUDIODOCK_AUDIO_CHUNK|AUDIODOCK_AUDIO)\s*:\s*(\d+)\s*,\s*(\d+)\s*,\s*([0-9A-Fa-f]+)$"
 )
+MODE_CONTROL_ALIASES = {
+    "voice": "mode_voice",
+    "voice_mode": "mode_voice",
+    "modevoice": "mode_voice",
+    "always_listen": "mode_voice",
+    "alwayslisten": "mode_voice",
+    "vice_city": "mode_voice",
+    "vicecity": "mode_voice",
+    "clap": "mode_clap",
+    "clap_mode": "mode_clap",
+    "modeclap": "mode_clap",
+    "double_clap": "mode_clap",
+    "doubleclap": "mode_clap",
+}
 
 
 @dataclass
@@ -136,6 +150,8 @@ class AudioDockBridge:
             return "Double clap"
         if clap_type == 1:
             return "Single clap"
+        if clap_type == 3:
+            return "Voice command"
         if clap_type == 0:
             return "Training sample"
         return f"Trigger {clap_type}"
@@ -296,7 +312,8 @@ class AudioDockBridge:
             "sample": "training_record",
         }
         normalized = aliases.get(normalized, normalized)
-        if normalized not in {"led_test", "speaker_test", "training_record"}:
+        normalized = MODE_CONTROL_ALIASES.get(normalized, normalized)
+        if normalized not in {"led_test", "speaker_test", "training_record", "mode_voice", "mode_clap"}:
             self._log(f"Unsupported control: {control}")
             return False
 
@@ -318,6 +335,8 @@ class AudioDockBridge:
                 "led_test": "LED ring test",
                 "speaker_test": "speaker test",
                 "training_record": "training record",
+                "mode_voice": "voice mode",
+                "mode_clap": "clap mode",
             }
             label = labels[normalized]
             self._log(f"Sent wireless {label} command.")

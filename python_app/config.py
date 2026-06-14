@@ -63,11 +63,11 @@ DEFAULT_CALIBRATION: dict[str, Any] = {
     "tof_depth_alpha": 0.45,
     "use_startup_user_distance": 1,
     "startup_distance_live_weight": 0.35,
-    "tracking_frame_skip": 1,
-    "preview_fps": 10,
+    "tracking_frame_skip": 0,
+    "preview_fps": 6,
     "face_detection_enabled_after_centering": 0,
-    "camera_width": 1280,
-    "camera_height": 720,
+    "camera_width": 424,
+    "camera_height": 240,
     "prediction_latency_ms": 50.0,
     "camera_horizontal_fov_deg": 70.0,
     "camera_vertical_fov_deg": 43.0,
@@ -116,10 +116,10 @@ class AppConfig:
     serial_port: str | None = None
     serial_baud: int = 921600
     camera_index: int = 1
-    camera_width: int = 1280
-    camera_height: int = 720
-    tracking_frame_skip: int = 1
-    preview_fps: int = 10
+    camera_width: int = 424
+    camera_height: int = 240
+    tracking_frame_skip: int = 0
+    preview_fps: int = 6
     face_detection_enabled_after_centering: bool = False
     horizontal_fov_deg: float = 70.0
     vertical_fov_deg: float = 43.0
@@ -188,14 +188,27 @@ def _calibration_int(
 
 
 def _camera_dimensions(calibration: dict[str, Any]) -> tuple[int, int]:
+    width = _calibration_int(calibration, "camera_width", 424, 160, 1920)
+    height = _calibration_int(calibration, "camera_height", 240, 120, 1080)
+    return width, height
+
+
+def _normalize_runtime_calibration(calibration: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(calibration)
     width = _calibration_int(calibration, "camera_width", 1280, 160, 1920)
     height = _calibration_int(calibration, "camera_height", 720, 120, 1080)
+    tracking_frame_skip = _calibration_int(calibration, "tracking_frame_skip", 1, 0, 8)
+    preview_fps = _calibration_int(calibration, "preview_fps", 10, 1, 60)
 
-    # Upgrade the old low-resolution default automatically when a user has not
-    # intentionally changed it yet.
-    if width == 424 and height == 240:
-        return 1280, 720
-    return width, height
+    if (width, height, tracking_frame_skip, preview_fps) in {
+        (1280, 720, 1, 10),
+        (424, 240, 1, 10),
+    }:
+        normalized["camera_width"] = 424
+        normalized["camera_height"] = 240
+        normalized["tracking_frame_skip"] = 0
+        normalized["preview_fps"] = 6
+    return normalized
 
 
 def load_calibration(path: Path = CALIBRATION_PATH) -> dict[str, Any]:
@@ -238,14 +251,20 @@ def load_app_config() -> AppConfig:
     ensure_directories()
     warnings = migrate_legacy_runtime_files(PATHS)
     calibration, calibration_warnings = load_calibration_with_warnings(PATHS.calibration_path)
+    normalized_calibration = _normalize_runtime_calibration(calibration)
+    if normalized_calibration != calibration:
+        calibration = normalized_calibration
+        save_calibration(calibration, PATHS.calibration_path)
+    else:
+        calibration = normalized_calibration
     camera_width, camera_height = _camera_dimensions(calibration)
     startup_warnings = [f"Migrated runtime file: {item}" for item in warnings]
     startup_warnings.extend(calibration_warnings)
     return AppConfig(
         camera_width=camera_width,
         camera_height=camera_height,
-        tracking_frame_skip=_calibration_int(calibration, "tracking_frame_skip", 1, 0, 8),
-        preview_fps=_calibration_int(calibration, "preview_fps", 10, 1, 60),
+        tracking_frame_skip=_calibration_int(calibration, "tracking_frame_skip", 0, 0, 8),
+        preview_fps=_calibration_int(calibration, "preview_fps", 6, 1, 60),
         face_detection_enabled_after_centering=bool(
             _calibration_int(calibration, "face_detection_enabled_after_centering", 0, 0, 1)
         ),

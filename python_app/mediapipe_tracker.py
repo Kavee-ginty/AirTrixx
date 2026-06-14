@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import queue
 import threading
 import time
 from pathlib import Path
@@ -27,8 +28,9 @@ MIN_VISIBLE_FRAME_MEAN = 2.0
 MIN_VISIBLE_FRAME_STD = 4.0
 CAMERA_VALIDATION_FRAMES = 30
 CAMERA_MIN_VISIBLE_VALIDATION_FRAMES = 5
-CAMERA_CAPTURE_FPS = 30
+CAMERA_CAPTURE_FPS = 15
 CAMERA_BUFFER_SIZE = 1
+HAND_PROCESS_TARGET_FPS = 12.0
 HAND_CONNECTIONS = (
     (0, 1),
     (1, 2),
@@ -216,9 +218,17 @@ def _thumb_pinches_finger(
     *,
     pinch_threshold: float = 0.055,
 ) -> bool:
+    finger_tip = landmarks[finger_tip_index]
+    finger_pip = landmarks[finger_pip_index]
     thumb_to_tip = _landmark_distance(landmarks, 4, finger_tip_index)
     thumb_to_pip = _landmark_distance(landmarks, 4, finger_pip_index)
-    return thumb_to_tip <= pinch_threshold and thumb_to_pip < 0.12
+    pip_to_mcp = _landmark_distance(landmarks, finger_pip_index, finger_pip_index - 1)
+    tip_to_mcp = _landmark_distance(landmarks, finger_tip_index, finger_pip_index - 1)
+    finger_ready_for_pinch = (
+        float(finger_tip.y) <= float(finger_pip.y) + 0.01
+        and tip_to_mcp >= pip_to_mcp * 0.9
+    )
+    return thumb_to_tip <= pinch_threshold and thumb_to_pip < 0.12 and finger_ready_for_pinch
 
 
 def classify_hand_gesture(landmarks: Any) -> str:
@@ -245,9 +255,9 @@ def classify_hand_gesture(landmarks: Any) -> str:
         return "gun_gesture"
     if index_up and middle_up and not ring_up and not pinky_up:
         return "peace_sign"
-    if index_up and not index_thumb_pinch and middle_curled and ring_curled and pinky_curled:
+    if index_up and not index_curled and not index_thumb_pinch and middle_curled and ring_curled and pinky_curled:
         return "index_finger_up"
-    if extended_count == 0:
+    if index_curled and middle_curled and ring_curled and pinky_curled:
         return "closed_fist"
     return "unknown"
 
@@ -276,6 +286,13 @@ class HandTracker:
         self._latest_face = _empty_face_state()
         self._selected_face: dict[str, Any] | None = None
         self._latest_frame_rgb: np.ndarray | None = None
+        self._latest_frame_timestamp_s = 0.0
+        self._latest_hand_update_s = 0.0
+        self._last_loop_duration_ms = 0.0
+        self._last_capture_gap_ms = 0.0
+        self._last_process_hands = False
+        self._frames_read = 0
+        self._capture_failures = 0
         self._running_requested = False
         self._restart_generation = 0
 
@@ -376,6 +393,29 @@ class HandTracker:
     def get_latest_face(self) -> dict[str, Any]:
         with self._lock:
             return dict(self._latest_face)
+
+    def get_runtime_stats(self) -> dict[str, Any]:
+        now_s = time.monotonic()
+        with self._lock:
+            hands = {
+                side: dict(values)
+                for side, values in self._latest_hands.items()
+            }
+            face_state = dict(self._latest_face)
+            frame_timestamp_s = self._latest_frame_timestamp_s
+            hand_update_s = self._latest_hand_update_s
+            return {
+                "frame_age_ms": (now_s - frame_timestamp_s) * 1000.0 if frame_timestamp_s > 0.0 else None,
+                "hand_age_ms": (now_s - hand_update_s) * 1000.0 if hand_update_s > 0.0 else None,
+                "last_loop_duration_ms": self._last_loop_duration_ms,
+                "last_capture_gap_ms": self._last_capture_gap_ms,
+                "last_process_hands": self._last_process_hands,
+                "frames_read": self._frames_read,
+                "capture_failures": self._capture_failures,
+                "tracking_frame_skip": self.tracking_frame_skip,
+                "visible_hands": [side for side, values in hands.items() if values.get("visible")],
+                "face_visible": bool(face_state.get("visible")),
+            }
 
     def _load_face_cascade(self) -> Any:
         if cv2 is None:
@@ -658,73 +698,128 @@ class HandTracker:
                 f"(requested {requested_camera_index}, {self.width}x{self.height}, "
                 f"tracking frame skip {self.tracking_frame_skip})."
             )
+            frame_queue: queue.Queue[tuple[Any, float, float]] = queue.Queue(maxsize=1)
+            capture_stop = threading.Event()
+
+            def capture_frames() -> None:
+                last_capture_s = time.monotonic()
+                while not self._stop_event.is_set() and not capture_stop.is_set():
+                    ok, frame_bgr = cap.read()
+                    capture_now_s = time.monotonic()
+                    if not ok:
+                        with self._lock:
+                            self._capture_failures += 1
+                        time.sleep(0.03)
+                        continue
+                    capture_gap_ms = (capture_now_s - last_capture_s) * 1000.0
+                    last_capture_s = capture_now_s
+                    with self._lock:
+                        self._frames_read += 1
+                        self._last_capture_gap_ms = capture_gap_ms
+                    frame_item = (frame_bgr, capture_now_s, capture_gap_ms)
+                    while not self._stop_event.is_set() and not capture_stop.is_set():
+                        try:
+                            frame_queue.put_nowait(frame_item)
+                            break
+                        except queue.Full:
+                            try:
+                                frame_queue.get_nowait()
+                            except queue.Empty:
+                                break
+
+            capture_thread = threading.Thread(target=capture_frames, daemon=True)
+            capture_thread.start()
             frame_index = 0
             last_hand_state = _empty_hand_state()
-            while not self._stop_event.is_set():
-                ok, frame_bgr = cap.read()
-                if not ok:
-                    time.sleep(0.03)
-                    continue
+            last_hand_process_s = 0.0
+            process_interval_s = 1.0 / HAND_PROCESS_TARGET_FPS if HAND_PROCESS_TARGET_FPS > 0.0 else 0.0
+            try:
+                while not self._stop_event.is_set():
+                    try:
+                        frame_bgr, capture_now_s, _capture_gap_ms = frame_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
 
-                frame_skip = max(0, int(self.tracking_frame_skip))
-                process_hands = frame_index % (frame_skip + 1) == 0
-                frame_index += 1
-                if process_hands and mode == "legacy":
-                    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                    state = process_legacy(frame_rgb, frame_bgr, detector)
-                    last_hand_state = state
-                elif process_hands and mode == "tasks":
-                    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                    state = process_tasks(frame_rgb, frame_bgr, detector)
-                    last_hand_state = state
-                else:
-                    state = {side: dict(values) for side, values in last_hand_state.items()}
-                face_state = _empty_face_state()
-
-                if face_cascade is not None and self.face_detection_enabled:
-                    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-                    faces = face_cascade.detectMultiScale(
-                        gray,
-                        scaleFactor=1.1,
-                        minNeighbors=5,
-                        minSize=(60, 60),
+                    loop_started_s = time.monotonic()
+                    frame_skip = max(0, int(self.tracking_frame_skip))
+                    skip_allows_processing = frame_index % (frame_skip + 1) == 0
+                    enough_time_elapsed = (
+                        process_interval_s <= 0.0
+                        or last_hand_process_s <= 0.0
+                        or capture_now_s - last_hand_process_s >= process_interval_s
                     )
-                    if len(faces) > 0:
-                        frame_h, frame_w = frame_bgr.shape[:2]
-                        selected_face, selected_rect = self._select_front_face(faces, frame_w, frame_h)
-                        if selected_face is not None and selected_rect is not None:
-                            face_state = selected_face
-                            sx, sy, sw, sh = selected_rect
-                            for x, y, w, h in faces:
-                                color = (100, 100, 100)
-                                thickness = 1
-                                if (
-                                    int(x) == sx
-                                    and int(y) == sy
-                                    and int(w) == sw
-                                    and int(h) == sh
-                                ):
-                                    color = (60, 220, 120)
-                                    thickness = 2
-                                cv2.rectangle(
-                                    frame_bgr,
-                                    (int(x), int(y)),
-                                    (int(x + w), int(y + h)),
-                                    color,
-                                    thickness,
-                                )
+                    process_hands = skip_allows_processing and enough_time_elapsed
+                    frame_index += 1
+                    if process_hands and mode == "legacy":
+                        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                        state = process_legacy(frame_rgb, frame_bgr, detector)
+                        last_hand_state = state
+                        last_hand_process_s = capture_now_s
+                    elif process_hands and mode == "tasks":
+                        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                        state = process_tasks(frame_rgb, frame_bgr, detector)
+                        last_hand_state = state
+                        last_hand_process_s = capture_now_s
                     else:
-                        self._selected_face = None
-                elif not self.face_detection_enabled:
-                    self._selected_face = None
+                        state = {side: dict(values) for side, values in last_hand_state.items()}
+                    face_state = _empty_face_state()
 
-                annotated_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                if self.mirror_preview:
-                    annotated_rgb = np.ascontiguousarray(np.flip(annotated_rgb, axis=1))
-                with self._lock:
-                    self._latest_hands = state
-                    self._latest_face = face_state
-                    self._latest_frame_rgb = annotated_rgb
+                    if face_cascade is not None and self.face_detection_enabled:
+                        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+                        faces = face_cascade.detectMultiScale(
+                            gray,
+                            scaleFactor=1.1,
+                            minNeighbors=5,
+                            minSize=(60, 60),
+                        )
+                        if len(faces) > 0:
+                            frame_h, frame_w = frame_bgr.shape[:2]
+                            selected_face, selected_rect = self._select_front_face(faces, frame_w, frame_h)
+                            if selected_face is not None and selected_rect is not None:
+                                face_state = selected_face
+                                sx, sy, sw, sh = selected_rect
+                                for x, y, w, h in faces:
+                                    color = (100, 100, 100)
+                                    thickness = 1
+                                    if (
+                                        int(x) == sx
+                                        and int(y) == sy
+                                        and int(w) == sw
+                                        and int(h) == sh
+                                    ):
+                                        color = (60, 220, 120)
+                                        thickness = 2
+                                    cv2.rectangle(
+                                        frame_bgr,
+                                        (int(x), int(y)),
+                                        (int(x + w), int(y + h)),
+                                        color,
+                                        thickness,
+                                    )
+                        else:
+                            self._selected_face = None
+                    elif not self.face_detection_enabled:
+                        self._selected_face = None
+
+                    annotated_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                    if self.mirror_preview:
+                        annotated_rgb = np.ascontiguousarray(np.flip(annotated_rgb, axis=1))
+                    with self._lock:
+                        self._latest_hands = state
+                        self._latest_face = face_state
+                        self._latest_frame_rgb = annotated_rgb
+                        self._latest_frame_timestamp_s = capture_now_s
+                        self._last_loop_duration_ms = (time.monotonic() - loop_started_s) * 1000.0
+                        self._last_process_hands = process_hands
+                        if process_hands:
+                            self._latest_hand_update_s = capture_now_s
+            finally:
+                capture_stop.set()
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                capture_thread.join(timeout=0.5)
 
         try:
             if mode == "legacy":
