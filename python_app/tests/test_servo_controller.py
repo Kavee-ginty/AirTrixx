@@ -67,7 +67,7 @@ class ServoControllerGeometryTests(unittest.TestCase):
         self.assertGreater(compensated_details["ray"][0], plain_details["ray"][0])
         self.assertGreater(compensated_details["yaw_deg"], plain_details["yaw_deg"])
 
-    def test_session_calibration_anchors_neutral_pose_to_center_ticks(self) -> None:
+    def test_session_calibration_falls_back_to_center_ticks_without_auto_aim(self) -> None:
         controller = self.make_controller()
         hands = {"visible": True, "x": 0.62, "y": 0.42, "score": 0.9}
         entry = controller.build_session_calibration_entry("right", hands, 700.0, "tof")
@@ -81,6 +81,27 @@ class ServoControllerGeometryTests(unittest.TestCase):
         self.assertEqual(tilt_tick, 307)
         self.assertAlmostEqual(details["pan_angle_deg"], 0.0, places=3)
         self.assertAlmostEqual(details["tilt_angle_deg"], 0.0, places=3)
+
+    def test_session_calibration_keeps_last_auto_aim_without_changing_servo_centers(self) -> None:
+        controller = self.make_controller()
+        right_hand = {"visible": True, "x": 0.68, "y": 0.35, "score": 0.9}
+        controller.send_for_hands({"right": right_hand}, force=True)
+        aimed = controller.last_auto_bracket_ticks("right")
+        self.assertIsNotNone(aimed)
+
+        entry = controller.build_session_calibration_entry("right", right_hand, 700.0, "tof")
+        calibration = dict(controller.calibration)
+        calibration["session_calibration"] = {"right": entry}
+        controller.update_calibration(calibration)
+
+        pan_tick, tilt_tick, _details = controller._geometry_ticks_for_hand("right", 0.68, 0.35, 700.0)
+
+        self.assertEqual(pan_tick, aimed["pan"])
+        self.assertEqual(tilt_tick, aimed["tilt"])
+        self.assertEqual(entry["anchor_pan_tick"], aimed["pan"])
+        self.assertEqual(entry["anchor_tilt_tick"], aimed["tilt"])
+        self.assertEqual(controller.calibration["r_pan_center"], 307)
+        self.assertEqual(controller.calibration["r_tilt_center"], 307)
 
     def test_startup_user_distance_is_used_without_live_tof(self) -> None:
         controller = self.make_controller(

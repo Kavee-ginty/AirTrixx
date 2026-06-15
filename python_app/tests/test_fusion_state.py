@@ -84,7 +84,8 @@ def hands() -> dict[str, dict[str, object]]:
 
 class FusionStateTests(unittest.TestCase):
     def test_field_order_is_reduced_for_mapping(self) -> None:
-        self.assertEqual(len(FIELD_ORDER), 25)
+        self.assertEqual(len(FIELD_ORDER), 26)
+        self.assertIn("base_z", FIELD_ORDER)
         self.assertIn("wrist_rule_value", FIELD_ORDER)
         for field in (
             "model_value",
@@ -142,6 +143,11 @@ class FusionStateTests(unittest.TestCase):
 
         self.assertAlmostEqual(values["right_hand_y"], 0.8)
         self.assertAlmostEqual(values["left_hand_y"], 0.2)
+
+    def test_base_z_is_exposed_for_mapping(self) -> None:
+        values = FusionState().build_input_dict(serial_state(), hands(), base_z=515.5)
+
+        self.assertEqual(values["base_z"], 515.5)
 
 
 if __name__ == "__main__":

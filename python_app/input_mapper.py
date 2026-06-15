@@ -72,6 +72,15 @@ TEXT_COMMAND_KEYS = {
     "eight": ["8"],
     "nine": ["9"],
 }
+
+
+def _keyboard_text_command_keys(text: Any) -> list[str] | None:
+    normalized = re.sub(r"[^a-z0-9]+", "", str(text or "").strip().lower())
+    if not normalized:
+        return None
+    return TEXT_COMMAND_KEYS.get(normalized)
+
+
 TRANSCRIPT_COMMAND_WORDS = {
     "police",
     "weapons",
@@ -1180,7 +1189,6 @@ def viewer_3d_profile() -> MappingProfile:
                 source="hands.left.gesture",
                 comparator="eq",
                 threshold="closed_fist",
-                conditions=[MappingCondition(source="hands.right.x", comparator="present")],
                 action=MappingAction(type="mouse_hold", button="left"),
             ),
             MappingRule(
@@ -1188,7 +1196,7 @@ def viewer_3d_profile() -> MappingProfile:
                 name="Orbit: follow right hand",
                 source="hands.right.x",
                 comparator="present",
-                conditions=[left_fist],
+                conditions=[copy.deepcopy(left_fist)],
                 action=MappingAction(
                     type="mouse_absolute",
                     continuous=True,
@@ -1212,7 +1220,7 @@ def viewer_3d_profile() -> MappingProfile:
                 name="Pan: follow right hand",
                 source="hands.right.x",
                 comparator="present",
-                conditions=[right_fist],
+                conditions=[copy.deepcopy(right_fist)],
                 action=MappingAction(
                     type="mouse_absolute",
                     continuous=True,
@@ -1363,6 +1371,7 @@ def builtin_mapping_profiles() -> list[MappingProfile]:
         gta_vice_city_profile(),
         viewer_3d_profile(),
         tabs_cursor_scroll_profile(),
+        MappingProfile(name=DEFAULT_PROFILE_NAME),
     ]
 
 
@@ -1380,6 +1389,25 @@ def _is_tabs_cursor_scroll_profile(profile: MappingProfile) -> bool:
         "wrist_scroll_down",
     }
     return required.issubset(rule_ids)
+
+
+def _normalize_tabs_cursor_scroll_profile(profile: MappingProfile) -> bool:
+    changed = False
+    builtin_rules = {rule.id: copy.deepcopy(rule) for rule in tabs_cursor_scroll_profile().mappings}
+    existing_by_id = {rule.id: rule for rule in profile.mappings}
+
+    keyboard_rule_id = "keyboard_type_prediction"
+    builtin_keyboard_rule = builtin_rules[keyboard_rule_id]
+    existing_keyboard_rule = existing_by_id.get(keyboard_rule_id)
+    if existing_keyboard_rule is None:
+        profile.mappings.append(builtin_keyboard_rule)
+        changed = True
+    elif existing_keyboard_rule.to_dict() != builtin_keyboard_rule.to_dict():
+        index = profile.mappings.index(existing_keyboard_rule)
+        profile.mappings[index] = builtin_keyboard_rule
+        changed = True
+
+    return changed
 
 
 def _normalize_gta_vice_city_profile(profile: MappingProfile) -> bool:
@@ -1469,6 +1497,8 @@ def normalize_mapping_config(config: MappingConfig) -> tuple[MappingConfig, bool
                         rule.action.type = "keyboard_tap"
                         rule.action.keys = ["alt", "shift", "tab"]
                         profile_changed = True
+            if _normalize_tabs_cursor_scroll_profile(profile):
+                profile_changed = True
             if profile_changed:
                 changed = True
 
@@ -1491,7 +1521,9 @@ def ensure_builtin_profiles(config: MappingConfig) -> MappingConfig:
 
 
 def default_mapping_config() -> MappingConfig:
-    config, _changed = normalize_mapping_config(MappingConfig(profiles=builtin_mapping_profiles()))
+    config, _changed = normalize_mapping_config(
+        MappingConfig(active_profile=GTA_VICE_CITY_PROFILE_NAME, profiles=builtin_mapping_profiles())
+    )
     return config
 
 
@@ -1888,7 +1920,7 @@ class InputMapper:
         text = str(value or "")
         if not text:
             return
-        command_keys = TEXT_COMMAND_KEYS.get(text.strip().lower())
+        command_keys = _keyboard_text_command_keys(text)
         if command_keys:
             self.backend.tap_keys(command_keys)
             return

@@ -15,6 +15,7 @@ FIELD_ORDER = [
     "left_hand_y",
     "left_hand_z_mm",
     "left_hand_gesture",
+    "base_z",
     "wrist_accel_x",
     "wrist_accel_y",
     "wrist_accel_z",
@@ -56,6 +57,7 @@ class FusionState:
         wrist_rule_value: str | None = None,
         wrist_rotate_left_return: bool = False,
         wrist_rotate_right_return: bool = False,
+        base_z: float | None = None,
     ) -> dict[str, Any]:
         devices = serial_state.get("devices", {}) if isinstance(serial_state, dict) else {}
         wrist = devices.get("wristband", {}) if isinstance(devices, dict) else {}
@@ -81,6 +83,7 @@ class FusionState:
             "left_hand_y": self._camera_y_up(left),
             "left_hand_z_mm": tof.get("left_mm"),
             "left_hand_gesture": left.get("gesture") if left.get("visible") else None,
+            "base_z": base_z,
             "wrist_accel_x": accel.get("x"),
             "wrist_accel_y": accel.get("y"),
             "wrist_accel_z": accel.get("z"),
@@ -117,6 +120,7 @@ class FusionState:
         wrist_rule_value: str | None = None,
         wrist_rotate_left_return: bool = False,
         wrist_rotate_right_return: bool = False,
+        base_z: float | None = None,
     ) -> dict[str, Any]:
         input_dict = self.build_input_dict(
             serial_state,
@@ -126,6 +130,7 @@ class FusionState:
             wrist_rule_value=wrist_rule_value,
             wrist_rotate_left_return=wrist_rotate_left_return,
             wrist_rotate_right_return=wrist_rotate_right_return,
+            base_z=base_z,
         )
         return {
             "field_order": FIELD_ORDER,

@@ -249,8 +249,13 @@ class ServoController:
         base_pan_offset = self._calib_float(f"{prefix}_pan_angle_offset_deg", 0.0)
         base_tilt_offset = self._calib_float(f"{prefix}_tilt_angle_offset_deg", 0.0)
 
-        anchor_pan_tick = self._clamp_tick(round(pan_center))
-        anchor_tilt_tick = self._clamp_tick(round(tilt_center))
+        auto_aim = self._last_auto_bracket_ticks.get(side)
+        if auto_aim:
+            anchor_pan_tick = self._clamp_tick(int(auto_aim["pan"]))
+            anchor_tilt_tick = self._clamp_tick(int(auto_aim["tilt"]))
+        else:
+            anchor_pan_tick = self._clamp_tick(round(pan_center))
+            anchor_tilt_tick = self._clamp_tick(round(tilt_center))
         session_pan_offset = self._angle_offset_for_anchor_tick(
             solution["yaw_deg"],
             anchor_pan_tick,

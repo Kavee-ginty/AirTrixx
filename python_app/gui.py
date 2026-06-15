@@ -7977,6 +7977,7 @@ class AirTrixxGUI:
 
         startup_user_distance_mm = sum(captured_distances) / len(captured_distances) if captured_distances else fallback_distance
         session["user_distance_mm"] = round(startup_user_distance_mm, 1)
+        session["base_z"] = round(startup_user_distance_mm, 1)
         session["user_distance_source"] = "tof" if valid_tof_values else "fallback"
         if valid_tof_values:
             calibration["initial_hand_distance_mm"] = round(sum(valid_tof_values) / len(valid_tof_values), 1)
@@ -8180,6 +8181,7 @@ class AirTrixxGUI:
             wrist_rule_value=str(wrist_rule_output["value"]),
             wrist_rotate_left_return=bool(wrist_rule_output["rotate_left_return"]),
             wrist_rotate_right_return=bool(wrist_rule_output["rotate_right_return"]),
+            base_z=self._calibration_base_z(),
         )
         self._apply_audio_dock_snapshot_fields(self._latest_snapshot)
         self._latest_snapshot["face_state"] = self.hand_tracker.get_latest_face()
@@ -9170,9 +9172,20 @@ class AirTrixxGUI:
             wrist_rule_value=str(rule_output["value"]),
             wrist_rotate_left_return=bool(rule_output["rotate_left_return"]),
             wrist_rotate_right_return=bool(rule_output["rotate_right_return"]),
+            base_z=self._calibration_base_z(),
         )
         self._apply_audio_dock_snapshot_fields(snapshot)
         return snapshot
+
+    def _calibration_base_z(self) -> float | None:
+        session = self.config.calibration.get("session_calibration", {})
+        if not isinstance(session, dict):
+            return None
+        value = session.get("base_z", session.get("user_distance_mm"))
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _mapping_signal_sequence(snapshot: dict[str, Any]) -> tuple[Any, ...]:

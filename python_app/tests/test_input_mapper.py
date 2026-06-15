@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from input_backend import FakeInputBackend
 from input_mapper import (
+    DEFAULT_PROFILE_NAME,
     GESTURE_COOLDOWN_SEC,
     GTA_VICE_CITY_PROFILE_NAME,
     InputMapper,
@@ -710,6 +711,28 @@ class InputMapperRuntimeTests(unittest.TestCase):
         mapper.process(snapshot(right_hand_z_mm=35, right_hand_x=0.25, right_hand_y=0.75), 0.0)
         self.assertEqual(backend.events, [("move_absolute", 479, 809)])
 
+    def test_3d_viewer_orbit_hold_can_start_without_right_hand_presence(self) -> None:
+        mapper, backend = self.mapper_with(viewer_3d_profile().mappings)
+        mapper.process(
+            {
+                "hand_state": {
+                    "left": {"visible": True, "gesture": "closed_fist", "x": 0.25, "y": 0.5},
+                    "right": {"visible": False, "gesture": "none", "x": None, "y": None},
+                }
+            },
+            0.0,
+        )
+        mapper.process(
+            {
+                "hand_state": {
+                    "left": {"visible": True, "gesture": "open_palm", "x": 0.25, "y": 0.5},
+                    "right": {"visible": False, "gesture": "none", "x": None, "y": None},
+                }
+            },
+            0.1,
+        )
+        self.assertEqual(backend.events, [("mouse_down", "left"), ("mouse_up", "left")])
+
     def test_mouse_absolute_can_invert_smooth_and_ignore_jitter(self) -> None:
         rule = MappingRule(
             source="fused.right_hand_z_mm",
@@ -747,6 +770,11 @@ class InputMapperRuntimeTests(unittest.TestCase):
         signals = SignalCatalog.flatten(snapshot(model_value="flick"))
 
         self.assertEqual(signals["fused.model_value"].value, "flick")
+
+    def test_signal_catalog_exposes_base_z(self) -> None:
+        signals = SignalCatalog.flatten({"input_dict": {"base_z": 515.5}})
+
+        self.assertEqual(signals["fused.base_z"].value, 515.5)
 
     def test_signal_catalog_exposes_calibrated_wrist_accel(self) -> None:
         signals = SignalCatalog.flatten(
@@ -839,6 +867,27 @@ class InputMapperRuntimeTests(unittest.TestCase):
             mapper.process({"raw_device_state": {"devices": {"keyboard": {"input": None}}}}, float(index) + 0.01)
         self.assertEqual(backend.events, expected_events)
 
+    def test_keyboard_text_action_normalizes_command_words_before_mapping(self) -> None:
+        rule = MappingRule(
+            source="keyboard.input",
+            comparator="present",
+            action=MappingAction(type="keyboard_text", text_source="keyboard.input", append_space=True),
+        )
+        mapper, backend = self.mapper_with([rule])
+        for index, word in enumerate(["Back Space!", "Caps Lock", "Win?", "space bar"]):
+            mapper.process({"raw_device_state": {"devices": {"keyboard": {"input": word}}}}, float(index))
+            mapper.process({"raw_device_state": {"devices": {"keyboard": {"input": None}}}}, float(index) + 0.01)
+
+        self.assertEqual(
+            backend.events,
+            [
+                ("key_tap", ("ctrl", "backspace")),
+                ("key_tap", ("caps_lock",)),
+                ("key_tap", ("cmd",)),
+                ("key_tap", ("space",)),
+            ],
+        )
+
     def test_signal_catalog_exposes_keyboard_prediction_fields(self) -> None:
         signals = SignalCatalog.flatten(
             {
@@ -865,7 +914,7 @@ class MappingConfigTests(unittest.TestCase):
         config = default_mapping_config()
         self.assertEqual(
             config.profile_names(),
-            [GTA_VICE_CITY_PROFILE_NAME, VIEWER_3D_PROFILE_NAME, TAB_CURSOR_SCROLL_PROFILE_NAME],
+            [GTA_VICE_CITY_PROFILE_NAME, VIEWER_3D_PROFILE_NAME, TAB_CURSOR_SCROLL_PROFILE_NAME, DEFAULT_PROFILE_NAME],
         )
 
     def test_wristband_mouse_cursor_profile_uses_calibrated_accel_follow_rule(self) -> None:
@@ -978,6 +1027,10 @@ class MappingConfigTests(unittest.TestCase):
                 "viewer_zoom_out",
             }.issubset(rule_ids)
         )
+        rules = {rule.id: rule for rule in profile.mappings}
+        self.assertEqual(rules["viewer_orbit_hold"].conditions, [])
+        self.assertEqual(rules["viewer_orbit_follow"].conditions[0].source, "hands.left.gesture")
+        self.assertEqual(rules["viewer_pan_follow"].conditions[0].source, "hands.right.gesture")
 
     def test_wrist_scroll_profile_uses_wrist_rules_for_mouse_scroll(self) -> None:
         rules = {rule.id: rule for rule in wrist_scroll_profile().mappings}
@@ -998,7 +1051,65 @@ class MappingConfigTests(unittest.TestCase):
         self.assertEqual(rules["wrist_scroll_up"].source, "wristband.gyro_x")
         self.assertEqual(rules["wrist_scroll_up"].action.interval_ms, 90)
         self.assertEqual(rules["wrist_scroll_down"].action.scroll_y, -1)
-        self.assertEqual(rules["wrist_cursor_right_click"].source, "fused.left_hand_gesture")
+        self.assertEqual(rules["wrist_cursor_right_click"].source, "hands.left.gesture")
+        self.assertEqual(rules["keyboard_type_prediction"].source, "keyboard.input")
+        self.assertEqual(rules["keyboard_type_prediction"].action.type, "keyboard_text")
+        self.assertTrue(rules["keyboard_type_prediction"].action.append_space)
+
+    def test_normalize_tabs_cursor_scroll_profile_adds_keyboard_typing_mapping(self) -> None:
+        profile = MappingProfile(
+            name=TAB_CURSOR_SCROLL_PROFILE_NAME,
+            mappings=[
+                MappingRule(
+                    id="wrist_tab_cycle_forward",
+                    name="Cycle tabs forward",
+                    source="fused.wrist_rule_value",
+                    comparator="eq",
+                    threshold="rotate_right_return",
+                    conditions=[MappingCondition(source="hands.right.z_mm", comparator="lt", threshold="500")],
+                    action=MappingAction(type="keyboard_tap", keys=["alt", "tab"]),
+                ),
+                MappingRule(
+                    id="wrist_tab_cycle_backward",
+                    name="Cycle tabs backward",
+                    source="fused.wrist_rule_value",
+                    comparator="eq",
+                    threshold="rotate_left_return",
+                    conditions=[MappingCondition(source="hands.right.z_mm", comparator="lt", threshold="500")],
+                    action=MappingAction(type="keyboard_tap", keys=["alt", "shift", "tab"]),
+                ),
+                MappingRule(
+                    id="wrist_cursor_follow_gyro",
+                    name="Follow cursor with wrist gyro",
+                    source="wrist_cursor.enabled",
+                    comparator="truthy",
+                    conditions=[MappingCondition(source="hands.left.gesture", comparator="eq", threshold="open_palm")],
+                    action=MappingAction(type="mouse_move"),
+                ),
+                MappingRule(
+                    id="wrist_scroll_up",
+                    name="Scroll up",
+                    source="wristband.gyro_x",
+                    comparator="lt",
+                    threshold="-4",
+                    action=MappingAction(type="mouse_scroll", interval_ms=90, scroll_y=1),
+                ),
+                MappingRule(
+                    id="wrist_scroll_down",
+                    name="Scroll down",
+                    source="wristband.gyro_x",
+                    comparator="gt",
+                    threshold="8",
+                    action=MappingAction(type="mouse_scroll", interval_ms=90, scroll_y=-1),
+                ),
+            ],
+        )
+
+        normalized, changed = normalize_mapping_config(MappingConfig(profiles=[profile], active_profile=TAB_CURSOR_SCROLL_PROFILE_NAME))
+
+        self.assertTrue(changed)
+        rules = {rule.id: rule for rule in normalized.profiles[0].mappings}
+        self.assertIn("keyboard_type_prediction", rules)
         self.assertEqual(rules["keyboard_type_prediction"].source, "keyboard.input")
         self.assertEqual(rules["keyboard_type_prediction"].action.type, "keyboard_text")
         self.assertTrue(rules["keyboard_type_prediction"].action.append_space)
@@ -1065,7 +1176,10 @@ class MappingConfigTests(unittest.TestCase):
             path.write_text(json.dumps({"version": 1, "profiles": [{"mappings": [{"action": {"type": "bad"}}]}]}))
             loaded, error = load_mapping_config(path)
             self.assertIsNotNone(error)
-            self.assertEqual(loaded.profile_names(), [GTA_VICE_CITY_PROFILE_NAME, VIEWER_3D_PROFILE_NAME, TAB_CURSOR_SCROLL_PROFILE_NAME])
+            self.assertEqual(
+                loaded.profile_names(),
+                [GTA_VICE_CITY_PROFILE_NAME, VIEWER_3D_PROFILE_NAME, TAB_CURSOR_SCROLL_PROFILE_NAME, DEFAULT_PROFILE_NAME],
+            )
 
 
 if __name__ == "__main__":
