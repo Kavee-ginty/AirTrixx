@@ -120,7 +120,7 @@ The Keyboard page uses the Antenna connection. Connect the Antenna COM port in t
 5. For each prompt, press **Record Next**, perform the swipe for that word, and wait for the sample to save.
 6. Click **Train Model** after collecting samples.
 
-The app stores keyboard samples, word lists, and the trained model in `%APPDATA%\AirTrixx\keyboard`. A default mapping named `keyboard_type_prediction` types the detected word from `keyboard.input` when the mapper is armed, using command words like `space`, `return`, `backspace`, `capslock`, `win`, and `zero` through `nine` as key taps.
+The app stores keyboard samples, word lists, and the trained model in `%APPDATA%\AirTrixx\keyboard`. A default mapping named `keyboard_type_prediction` types the detected word from `keyboard.input` when the mapper is armed, using command words like `space`, `return`, `backspace`, `capslock`, `win`, and `zero` through `nine` as key taps. This mapping lives in the `Windows` profile.
 
 ## COM Port Troubleshooting
 

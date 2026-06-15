@@ -1040,7 +1040,7 @@ class MappingConfigTests(unittest.TestCase):
         self.assertEqual(rules["wrist_scroll_down"].threshold, "rotate_left_return")
         self.assertEqual(rules["wrist_scroll_down"].action.scroll_y, -1)
 
-    def test_tabs_cursor_scroll_profile_matches_finalized_mapping(self) -> None:
+    def test_windows_profile_matches_finalized_mapping(self) -> None:
         profile = tabs_cursor_scroll_profile()
         rules = {rule.id: rule for rule in profile.mappings}
         self.assertEqual(len(profile.mappings), 9)
@@ -1056,7 +1056,7 @@ class MappingConfigTests(unittest.TestCase):
         self.assertEqual(rules["keyboard_type_prediction"].action.type, "keyboard_text")
         self.assertTrue(rules["keyboard_type_prediction"].action.append_space)
 
-    def test_normalize_tabs_cursor_scroll_profile_adds_keyboard_typing_mapping(self) -> None:
+    def test_normalize_windows_profile_adds_keyboard_typing_mapping(self) -> None:
         profile = MappingProfile(
             name=TAB_CURSOR_SCROLL_PROFILE_NAME,
             mappings=[
@@ -1113,6 +1113,32 @@ class MappingConfigTests(unittest.TestCase):
         self.assertEqual(rules["keyboard_type_prediction"].source, "keyboard.input")
         self.assertEqual(rules["keyboard_type_prediction"].action.type, "keyboard_text")
         self.assertTrue(rules["keyboard_type_prediction"].action.append_space)
+
+    def test_audio_dock_transcript_command_detects_design_and_windows(self) -> None:
+        signals = SignalCatalog.flatten(
+            {
+                "raw_device_state": {
+                    "devices": {
+                        "audiodock": {
+                            "latest_transcript": "design mode",
+                        }
+                    }
+                }
+            }
+        )
+        self.assertEqual(signals["audiodock.latest_transcript_command"].value, "design mode")
+        signals = SignalCatalog.flatten(
+            {
+                "raw_device_state": {
+                    "devices": {
+                        "audiodock": {
+                            "latest_transcript": "windows please",
+                        }
+                    }
+                }
+            }
+        )
+        self.assertEqual(signals["audiodock.latest_transcript_command"].value, "windows")
 
     def test_remove_profile_falls_back_and_protects_last_profile(self) -> None:
         config = MappingConfig(profiles=[MappingProfile(), wrist_tab_switching_profile()])

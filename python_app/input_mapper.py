@@ -685,7 +685,8 @@ VIEWER_3D_PROFILE_NAME = "3D Viewer"
 WRISTBAND_MOUSE_CURSOR_PROFILE_NAME = "Wristband Mouse Cursor"
 WRIST_CURSOR_PROFILE_NAME = "Wrist Cursor"
 WRIST_SCROLL_PROFILE_NAME = "Wrist Scroll"
-TAB_CURSOR_SCROLL_PROFILE_NAME = "Tabs + Cursor + Scroll"
+TAB_CURSOR_SCROLL_PROFILE_NAME = "Windows"
+LEGACY_TAB_CURSOR_SCROLL_PROFILE_NAME = "Tabs + Cursor + Scroll"
 GTA_RUNTIME_RULES = (
     MappingRule(
         id="gta_enter_peace_runtime",
@@ -1410,6 +1411,13 @@ def _normalize_tabs_cursor_scroll_profile(profile: MappingProfile) -> bool:
     return changed
 
 
+def _audio_dock_transcript_requests_profile(text: str, phrase: str) -> bool:
+    normalized = _normalize_audio_dock_transcript(text)
+    if not normalized:
+        return False
+    return phrase in normalized
+
+
 def _normalize_gta_vice_city_profile(profile: MappingProfile) -> bool:
     changed = False
     builtin_rules = {rule.id: rule for rule in gta_vice_city_profile().mappings}
@@ -1451,7 +1459,7 @@ def normalize_mapping_config(config: MappingConfig) -> tuple[MappingConfig, bool
     for profile in config.profiles:
         profile_changed = False
         profile_name = profile.name
-        if profile_name == "Windows" and _is_tabs_cursor_scroll_profile(profile):
+        if profile_name in {LEGACY_TAB_CURSOR_SCROLL_PROFILE_NAME, "Windows"} and _is_tabs_cursor_scroll_profile(profile):
             profile_name = TAB_CURSOR_SCROLL_PROFILE_NAME
             profile_changed = True
             if config.active_profile == profile.name:
@@ -2357,8 +2365,10 @@ def _audio_dock_transcript_command(text: Any) -> str:
     normalized = _normalize_audio_dock_transcript(text)
     if not normalized:
         return ""
-    if "game mode" in normalized:
-        return "game mode"
+    if "design mode" in normalized:
+        return "design mode"
+    if "windows" in normalized:
+        return "windows"
     tokens = normalized.split()
     for token in tokens:
         token = TRANSCRIPT_COMMAND_ALIASES.get(token, token)

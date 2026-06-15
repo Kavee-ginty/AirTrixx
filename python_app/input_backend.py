@@ -70,6 +70,8 @@ KEY_ALIASES: dict[str, str] = {
     "right_arrow": "right",
     "plus": "+",
     "minus": "-",
+    "plus_sign": "+",
+    "minus_sign": "-",
 }
 
 
@@ -179,6 +181,8 @@ WINDOWS_VK_CODES: dict[str, int] = {
     "cmd": 0x5B,
     "cmd_l": 0x5B,
     "cmd_r": 0x5C,
+    "+": 0xBB,
+    "-": 0xBD,
 }
 
 WINDOWS_EXTENDED_KEYS = {
@@ -254,6 +258,18 @@ class PynputInputBackend:
 
     def tap_keys(self, tokens: list[str], hold_ms: int = 0) -> None:
         normalized = [normalize_key_token(token) for token in tokens if normalize_key_token(token)]
+        if len(normalized) == 1 and normalized[0] == "+":
+            if self._sendinput_keyboard_enabled and self._user32 is not None and _INPUT is not None:
+                plus_spec = self._windows_key_spec("=")
+                shift_spec = self._windows_key_spec("shift")
+                if plus_spec is not None and shift_spec is not None:
+                    self._send_keyboard_spec(shift_spec, key_up=False)
+                    self._send_keyboard_spec(plus_spec, key_up=False)
+                    if hold_ms > 0:
+                        ctypes.windll.kernel32.Sleep(int(hold_ms))
+                    self._send_keyboard_spec(plus_spec, key_up=True)
+                    self._send_keyboard_spec(shift_spec, key_up=True)
+                    return
         key_specs = [self._windows_key_spec(token) for token in normalized]
         if normalized and all(spec is not None for spec in key_specs):
             for spec in key_specs:
@@ -355,7 +371,13 @@ class PynputInputBackend:
         normalized = normalize_key_token(token)
         if not normalized:
             return None
-        if len(normalized) == 1:
+        if normalized == "+":
+            vk_code = 0xBB
+        elif normalized == "-":
+            vk_code = 0xBD
+        elif normalized == "=":
+            vk_code = 0xBB
+        elif len(normalized) == 1:
             vk_code = ord(normalized.upper())
         elif normalized.startswith("f") and normalized[1:].isdigit():
             index = int(normalized[1:])
@@ -370,7 +392,10 @@ class PynputInputBackend:
         scan_code = int(self._user32.MapVirtualKeyW(int(vk_code), 0))
         if scan_code == 0:
             return None
-        return scan_code, normalized in WINDOWS_EXTENDED_KEYS
+        extended = normalized in WINDOWS_EXTENDED_KEYS
+        if normalized == "=":
+            extended = False
+        return scan_code, extended
 
     def _resolve_key(self, token: str) -> Any:
         if not self._modules:

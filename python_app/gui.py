@@ -47,6 +47,7 @@ from input_mapper import (
     MappingRule,
     SignalCatalog,
     GTA_VICE_CITY_PROFILE_NAME,
+    VIEWER_3D_PROFILE_NAME,
     WRIST_CURSOR_PROFILE_NAME,
     WRISTBAND_MOUSE_CURSOR_PROFILE_NAME,
     wrist_cursor_profile,
@@ -5454,8 +5455,24 @@ class AirTrixxGUI:
         self.audio_dock_last_trigger_var.set(trigger)
         self.audio_dock_latest_transcript_var.set(text)
         self.log(f"Audio Dock Trigger: {trigger} | Transcript: {text}")
-        if self._audio_dock_transcript_requests_game_mode(text):
-            self._activate_profile_with_audio_sync(GTA_VICE_CITY_PROFILE_NAME, reason="Audio Dock transcript")
+        if self._audio_dock_transcript_requests_gta_mode(text):
+            self._activate_profile_with_audio_sync(
+                GTA_VICE_CITY_PROFILE_NAME,
+                reason="Audio Dock transcript",
+                preserve_audio_gate=True,
+            )
+        if self._audio_dock_transcript_requests_design_mode(text):
+            self._activate_profile_with_audio_sync(
+                VIEWER_3D_PROFILE_NAME,
+                reason="Audio Dock transcript",
+                preserve_audio_gate=True,
+            )
+        elif self._audio_dock_transcript_requests_windows(text):
+            self._activate_profile_with_audio_sync(
+                "Windows",
+                reason="Audio Dock transcript",
+                preserve_audio_gate=True,
+            )
         if (
             text.strip()
             and trigger.strip().lower() == "voice command"
@@ -5468,9 +5485,22 @@ class AirTrixxGUI:
         self._schedule_text_update()
 
     @staticmethod
-    def _audio_dock_transcript_requests_game_mode(text: str) -> bool:
+    def _audio_dock_transcript_requests_design_mode(text: str) -> bool:
         normalized = " ".join(text.strip().lower().split())
-        return "game mode" in normalized
+        return "design mode" in normalized
+
+    @staticmethod
+    def _audio_dock_transcript_requests_gta_mode(text: str) -> bool:
+        normalized = " ".join(text.strip().lower().split())
+        if "game mode" in normalized:
+            return True
+        tokens = normalized.split()
+        return "game" in tokens
+
+    @staticmethod
+    def _audio_dock_transcript_requests_windows(text: str) -> bool:
+        normalized = " ".join(text.strip().lower().split())
+        return normalized == "windows" or " windows " in f" {normalized} "
 
     def _clear_audio_dock_voice_gate(self) -> None:
         self._audio_dock_voice_gate_until_s = 0.0
@@ -5479,13 +5509,13 @@ class AirTrixxGUI:
     def _audio_dock_voice_gate_active(self, now_s: float | None = None) -> bool:
         current_s = time.monotonic() if now_s is None else now_s
         return (
-            self.input_mapper.config.active_profile == GTA_VICE_CITY_PROFILE_NAME
+            self.input_mapper.config.active_profile in {GTA_VICE_CITY_PROFILE_NAME, VIEWER_3D_PROFILE_NAME}
             and current_s < self._audio_dock_voice_gate_until_s
         )
 
     def _update_audio_dock_voice_gate(self, hands: dict[str, dict[str, Any]], now_s: float) -> None:
         active_profile = self.input_mapper.config.active_profile
-        if active_profile != GTA_VICE_CITY_PROFILE_NAME:
+        if active_profile not in {GTA_VICE_CITY_PROFILE_NAME, VIEWER_3D_PROFILE_NAME}:
             if self._audio_dock_voice_gate_until_s or any(self._audio_dock_thumb_up_seen.values()):
                 self._clear_audio_dock_voice_gate()
             return
@@ -5511,7 +5541,7 @@ class AirTrixxGUI:
 
     def _desired_audio_dock_listening_control(self, profile_name: str | None = None, now_s: float | None = None) -> str:
         active_profile = profile_name or self.input_mapper.config.active_profile
-        if active_profile != GTA_VICE_CITY_PROFILE_NAME:
+        if active_profile not in {GTA_VICE_CITY_PROFILE_NAME, VIEWER_3D_PROFILE_NAME}:
             return "mode_clap"
         return "mode_voice"
 
@@ -5525,7 +5555,13 @@ class AirTrixxGUI:
         if self.audio_dock_bridge.send_control(desired_control):
             self._audio_dock_last_listening_control = desired_control
 
-    def _activate_profile_with_audio_sync(self, profile_name: str, *, reason: str) -> bool:
+    def _activate_profile_with_audio_sync(
+        self,
+        profile_name: str,
+        *,
+        reason: str,
+        preserve_audio_gate: bool = False,
+    ) -> bool:
         previous_profile = self.input_mapper.config.active_profile
         if not self.input_mapper.set_active_profile(profile_name):
             return False
@@ -5539,7 +5575,7 @@ class AirTrixxGUI:
         self._schedule_mapping_views_refresh()
         self._update_mapping_status()
         self._refresh_mapping_profile_combo()
-        if active_profile != GTA_VICE_CITY_PROFILE_NAME:
+        if active_profile != GTA_VICE_CITY_PROFILE_NAME and not preserve_audio_gate:
             self._clear_audio_dock_voice_gate()
         self._sync_audio_dock_listening_mode(active_profile)
 
