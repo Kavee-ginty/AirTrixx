@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -12,8 +13,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app_paths import build_app_paths, user_data_root
 from audio_dock import AudioDockBridge
-from config import DEFAULT_CALIBRATION, load_calibration_with_warnings, save_calibration
+from config import DEFAULT_CALIBRATION, _normalize_runtime_calibration, load_calibration_with_warnings, save_calibration
 from gui import AirTrixxGUI
+from input_mapper import GTA_VICE_CITY_PROFILE_NAME
 
 
 class FakeConnectedSerialBridge:
@@ -25,6 +27,34 @@ class FakeConnectedSerialBridge:
     def send_command(self, command: dict) -> bool:
         self.commands.append(command)
         return True
+
+
+class FakeVar:
+    def __init__(self, value=None) -> None:
+        self.value = value
+
+    def set(self, value) -> None:
+        self.value = value
+
+    def get(self):
+        return self.value
+
+
+class FakeMapper:
+    def __init__(self, active_profile: str = "Default", enabled: bool = False) -> None:
+        self.enabled = enabled
+        self.config = SimpleNamespace(active_profile=active_profile)
+        self.enabled_calls: list[bool] = []
+        self.active_profile_calls: list[str] = []
+
+    def set_active_profile(self, profile_name: str) -> bool:
+        self.active_profile_calls.append(profile_name)
+        self.config.active_profile = profile_name
+        return True
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        self.enabled_calls.append(self.enabled)
 
 
 class ImmediateThread:
@@ -89,6 +119,24 @@ class ConfigTests(unittest.TestCase):
         self.assertIn('"cam_pan_center": 123', text)
         self.assertNotIn("unknown", text)
 
+    def test_runtime_calibration_migrates_old_heavy_camera_defaults(self) -> None:
+        calibration = dict(DEFAULT_CALIBRATION)
+        calibration.update(
+            {
+                "camera_width": 1280,
+                "camera_height": 720,
+                "tracking_frame_skip": 1,
+                "preview_fps": 10,
+            }
+        )
+
+        normalized = _normalize_runtime_calibration(calibration)
+
+        self.assertEqual(normalized["camera_width"], 424)
+        self.assertEqual(normalized["camera_height"], 240)
+        self.assertEqual(normalized["tracking_frame_skip"], 0)
+        self.assertEqual(normalized["preview_fps"], 6)
+
 
 class AudioDockSettingsTests(unittest.TestCase):
     def test_audio_dock_prefers_saved_deepgram_key(self) -> None:
@@ -146,6 +194,15 @@ class AudioDockSettingsTests(unittest.TestCase):
 
         self.assertEqual(serial_bridge.commands, [{"cmd": "audiodock", "control": "training_record", "count": 10}])
 
+    def test_audio_dock_sends_voice_mode_control(self) -> None:
+        serial_bridge = FakeConnectedSerialBridge()
+        bridge = AudioDockBridge(serial_bridge=serial_bridge)
+        bridge.is_connected = True
+
+        self.assertTrue(bridge.send_control("vice_city"))
+
+        self.assertEqual(serial_bridge.commands, [{"cmd": "audiodock", "control": "mode_voice"}])
+
     def test_audio_dock_indexed_chunks_assemble_in_order(self) -> None:
         serial_bridge = FakeConnectedSerialBridge()
         transcripts: list[tuple[str, str]] = []
@@ -178,6 +235,35 @@ class AudioDockSettingsTests(unittest.TestCase):
         self.assertEqual(bridge.last_audio_data, b"RIFFdata")
         self.assertEqual(bridge.latest_transcript, "ordered")
 
+    def test_gta_profile_activation_arms_mapper_for_voice_cheats(self) -> None:
+        logs: list[str] = []
+        calls: list[object] = []
+        gui = SimpleNamespace(
+            input_mapper=FakeMapper(enabled=False),
+            mapping_profile_var=FakeVar("Default"),
+            mapping_enabled_var=FakeVar(False),
+            _schedule_mapping_views_refresh=lambda: calls.append("refresh"),
+            _update_mapping_status=lambda: calls.append("status"),
+            _refresh_mapping_profile_combo=lambda: calls.append("combo"),
+            _clear_audio_dock_voice_gate=lambda: calls.append("clear"),
+            _sync_audio_dock_listening_mode=lambda profile_name=None, now_s=None: calls.append((profile_name, now_s)),
+            log=logs.append,
+        )
+
+        result = AirTrixxGUI._activate_profile_with_audio_sync(
+            gui,
+            GTA_VICE_CITY_PROFILE_NAME,
+            reason="Audio Dock transcript",
+        )
+
+        self.assertTrue(result)
+        self.assertTrue(gui.input_mapper.enabled)
+        self.assertEqual(gui.mapping_enabled_var.value, True)
+        self.assertEqual(gui.mapping_profile_var.value, GTA_VICE_CITY_PROFILE_NAME)
+        self.assertIn("GTA Vice City profile enabled the input mapper for voice cheats.", logs)
+        self.assertTrue(any(call[0] == GTA_VICE_CITY_PROFILE_NAME for call in calls if isinstance(call, tuple)))
+        self.assertNotIn("clear", calls)
+
     def test_audio_dock_legacy_chunk_parsing_still_works(self) -> None:
         serial_bridge = FakeConnectedSerialBridge()
         bridge = AudioDockBridge(serial_bridge=serial_bridge)
@@ -207,6 +293,53 @@ class AudioDockSettingsTests(unittest.TestCase):
         self.assertEqual(bridge.latest_transcript, "")
         self.assertEqual(bridge.last_trigger, "Single clap")
         self.assertEqual(transcripts[-1], ("Single clap", ""))
+
+    def test_audio_dock_voice_trigger_label(self) -> None:
+        self.assertEqual(AudioDockBridge._trigger_label_for_type(3), "Voice command")
+
+    def test_audio_dock_thumb_up_arms_voice_gate(self) -> None:
+        gui = AirTrixxGUI.__new__(AirTrixxGUI)
+        gui.input_mapper = SimpleNamespace(config=SimpleNamespace(active_profile="GTA Vice City"))
+        gui._audio_dock_voice_gate_until_s = 0.0
+        gui._audio_dock_thumb_up_seen = {"left": False, "right": False}
+        gui._audio_dock_last_listening_control = ""
+        gui.audio_dock_bridge = SimpleNamespace(is_connected=False)
+        gui.log = lambda *_args, **_kwargs: None
+        gui._clear_audio_dock_voice_gate = AirTrixxGUI._clear_audio_dock_voice_gate.__get__(gui, AirTrixxGUI)
+        gui._sync_audio_dock_listening_mode = lambda *args, **kwargs: None
+
+        gui._update_audio_dock_voice_gate({"right": {"visible": True, "gesture": "thumb_up"}}, 10.0)
+
+        self.assertTrue(gui._audio_dock_voice_gate_active(10.1))
+        self.assertEqual(gui._audio_dock_voice_gate_until_s, 22.0)
+
+    def test_audio_dock_transcript_requests_game_mode(self) -> None:
+        self.assertTrue(AirTrixxGUI._audio_dock_transcript_requests_game_mode("please switch to game mode"))
+        self.assertTrue(AirTrixxGUI._audio_dock_transcript_requests_game_mode("game mode"))
+        self.assertFalse(AirTrixxGUI._audio_dock_transcript_requests_game_mode("game over"))
+
+    def test_voice_command_transcript_reopens_gta_voice_gate(self) -> None:
+        gui = AirTrixxGUI.__new__(AirTrixxGUI)
+        gui.audio_dock_last_trigger_var = FakeVar("-")
+        gui.audio_dock_latest_transcript_var = FakeVar("-")
+        gui.input_mapper = SimpleNamespace(config=SimpleNamespace(active_profile=GTA_VICE_CITY_PROFILE_NAME))
+        gui._audio_dock_voice_gate_until_s = 0.0
+        gui.log = lambda *_args, **_kwargs: None
+        gui._activate_profile_with_audio_sync = lambda *_args, **_kwargs: True
+        gui._schedule_text_update = lambda: None
+
+        with patch("gui.time.monotonic", return_value=100.0):
+            gui._set_audio_dock_transcript("Voice command", "health")
+
+        self.assertEqual(gui._audio_dock_voice_gate_until_s, 112.0)
+
+    def test_audio_dock_gta_profile_stays_in_voice_mode(self) -> None:
+        gui = AirTrixxGUI.__new__(AirTrixxGUI)
+        gui.input_mapper = SimpleNamespace(config=SimpleNamespace(active_profile="GTA Vice City"))
+        gui._audio_dock_voice_gate_active = lambda *args, **kwargs: False
+
+        self.assertEqual(gui._desired_audio_dock_listening_control("GTA Vice City"), "mode_voice")
+        self.assertEqual(gui._desired_audio_dock_listening_control("Default"), "mode_clap")
 
     def test_audio_dock_stale_transcript_result_is_ignored(self) -> None:
         serial_bridge = FakeConnectedSerialBridge()

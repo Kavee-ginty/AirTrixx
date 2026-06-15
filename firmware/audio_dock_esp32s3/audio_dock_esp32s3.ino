@@ -60,6 +60,10 @@
 #define CLAP_PEAK_EVENT_GAP_SAMPLES ((SAMPLE_RATE * CLAP_PEAK_EVENT_GAP_MS) / 1000)
 #define CLAP_REARM_DELAY_MS 2000
 #define CLAP_INFERENCE_TIMEOUT_MS 4000
+#define VOICE_AUDIO_PEAK_THRESHOLD 1800
+#define VOICE_AUDIO_PEAK_EVENT_THRESHOLD 2
+#define VOICE_AUDIO_MEAN_ABS_THRESHOLD 320.0f
+#define VOICE_REARM_DELAY_MS 500
 #define PRINT_CLAP_SCORES true
 #define AUDIO_DOCK_CHUNK_DELAY_MS 10
 #define WAV_HEADER_BYTES 44
@@ -113,6 +117,11 @@ static const uint8_t AUDIO_DOCK_LEDS_PER_SEGMENT = LED_RING_COUNT / AUDIO_DOCK_R
 static const uint32_t AUDIO_DOCK_HEARTBEAT_MS = 2000;
 static const uint32_t AUDIO_DOCK_RING_REFRESH_MS = 100;
 
+enum AudioDockListeningMode {
+  AUDIO_DOCK_MODE_CLAP,
+  AUDIO_DOCK_MODE_VOICE
+};
+
 bool i2sReady = false;
 bool speakerReady = false;
 bool sdReady = false;
@@ -121,6 +130,9 @@ uint16_t audioDockSequence = 0;
 uint8_t pendingTriggerType = 0;
 uint32_t recordedWavBytes = 0;
 static uint32_t lastAudioDockHeartbeatMs = 0;
+static AudioDockListeningMode currentListeningMode = AUDIO_DOCK_MODE_CLAP;
+static bool voiceCommandArmed = false;
+static const uint8_t AUDIO_DOCK_TRIGGER_VOICE = 3;
 
 // -------------------- Edge Impulse Inferencing Variables --------------------
 typedef struct {
@@ -166,6 +178,9 @@ void pumpAudioDockHeartbeat();
 void pumpAudioDockBatteryStatus();
 bool consumeTrainingRecordRequest();
 bool consumeTrainingBatchRequest(uint8_t *count);
+void setAudioDockListeningMode(AudioDockListeningMode mode);
+void analyzeVoiceWindow(uint32_t *peakOut, uint16_t *peakEventsOut, float *meanAbsOut);
+bool voiceActivityDetected(uint32_t peak, uint16_t peakEvents, float meanAbs);
 
 // State machine states
 enum AudioDockState {
@@ -299,6 +314,80 @@ void ringShowSuccess() {
 
 void ringShowError() {
   ringFill(64, 0, 0);
+}
+
+void setAudioDockListeningMode(AudioDockListeningMode mode) {
+  nextClapArmMs = 0;
+  if (mode == AUDIO_DOCK_MODE_VOICE) {
+    bool rearmed = !voiceCommandArmed;
+    currentListeningMode = AUDIO_DOCK_MODE_VOICE;
+    voiceCommandArmed = true;
+    if (!rearmed) {
+      return;
+    }
+    displayLCDStatus("Vice City Mode", "Thumb up to talk");
+    Serial.println("AUDIO_DOCK_MODE:VOICE");
+  } else {
+    if (currentListeningMode == AUDIO_DOCK_MODE_CLAP && !voiceCommandArmed) {
+      return;
+    }
+    currentListeningMode = AUDIO_DOCK_MODE_CLAP;
+    voiceCommandArmed = false;
+    displayLCDStatus("Clap Mode", "Double clap");
+    Serial.println("AUDIO_DOCK_MODE:CLAP");
+  }
+}
+
+void analyzeVoiceWindow(uint32_t *peakOut, uint16_t *peakEventsOut, float *meanAbsOut) {
+  uint32_t peak = 0;
+  uint16_t peakEvents = 0;
+  uint32_t lastPeakSample = 0;
+  bool havePeakEvent = false;
+  uint64_t absSum = 0;
+
+  if (inference.buffer == nullptr || inference.n_samples == 0) {
+    if (peakOut != nullptr) {
+      *peakOut = 0;
+    }
+    if (peakEventsOut != nullptr) {
+      *peakEventsOut = 0;
+    }
+    if (meanAbsOut != nullptr) {
+      *meanAbsOut = 0.0f;
+    }
+    return;
+  }
+
+  for (uint32_t i = 0; i < inference.n_samples; i++) {
+    int32_t sample = inference.buffer[i];
+    uint32_t magnitude = sample < 0 ? (uint32_t)(-sample) : (uint32_t)sample;
+    absSum += magnitude;
+    if (magnitude > peak) {
+      peak = magnitude;
+    }
+    if (magnitude >= VOICE_AUDIO_PEAK_THRESHOLD &&
+        (!havePeakEvent || i - lastPeakSample >= CLAP_PEAK_EVENT_GAP_SAMPLES)) {
+      peakEvents++;
+      lastPeakSample = i;
+      havePeakEvent = true;
+    }
+  }
+
+  if (peakOut != nullptr) {
+    *peakOut = peak;
+  }
+  if (peakEventsOut != nullptr) {
+    *peakEventsOut = peakEvents;
+  }
+  if (meanAbsOut != nullptr) {
+    *meanAbsOut = static_cast<float>(absSum) / static_cast<float>(inference.n_samples);
+  }
+}
+
+bool voiceActivityDetected(uint32_t peak, uint16_t peakEvents, float meanAbs) {
+  return peak >= VOICE_AUDIO_PEAK_THRESHOLD &&
+         peakEvents >= VOICE_AUDIO_PEAK_EVENT_THRESHOLD &&
+         meanAbs >= VOICE_AUDIO_MEAN_ABS_THRESHOLD;
 }
 
 void runLedRingSelfTest() {
@@ -1132,6 +1221,26 @@ void handleIncomingPacket(const uint8_t *data, int len) {
       displayLCDStatus("System Ready", "Clap to speak!");
       return;
     }
+    if (incoming == "__CMD:MODEVOICE__" || incoming == "__CMD:VOICE__" ||
+        incoming == "__CMD:ALWAYSLISTEN__" || incoming == "__CMD:VICECITY__") {
+      if (lastRemoteCommandText == incoming && millis() - lastRemoteCommandMs < 1500) {
+        return;
+      }
+      lastRemoteCommandText = incoming;
+      lastRemoteCommandMs = millis();
+      setAudioDockListeningMode(AUDIO_DOCK_MODE_VOICE);
+      return;
+    }
+    if (incoming == "__CMD:MODECLAP__" || incoming == "__CMD:CLAP__" ||
+        incoming == "__CMD:DOUBLECLAP__") {
+      if (lastRemoteCommandText == incoming && millis() - lastRemoteCommandMs < 1500) {
+        return;
+      }
+      lastRemoteCommandText = incoming;
+      lastRemoteCommandMs = millis();
+      setAudioDockListeningMode(AUDIO_DOCK_MODE_CLAP);
+      return;
+    }
     if (incoming == "__CMD:TRAINING_RECORD__") {
       if (lastRemoteCommandText == incoming && millis() - lastRemoteCommandMs < 1500) {
         return;
@@ -1202,15 +1311,29 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
 #endif
 
 bool sendEspNowToAntenna(const uint8_t *data, size_t len, uint8_t retries = 10) {
+  const uint8_t *targets[] = {ANTENNA_MAC_PLACEHOLDER, ESPNOW_BROADCAST_MAC};
+  const char *targetNames[] = {"antenna", "broadcast"};
   esp_err_t result = ESP_FAIL;
-  for (uint8_t attempt = 0; attempt <= retries; attempt++) {
-    result = esp_now_send(ANTENNA_MAC_PLACEHOLDER, data, len);
-    if (result == ESP_OK) {
-      return true;
+
+  for (uint8_t targetIndex = 0; targetIndex < 2; targetIndex++) {
+    for (uint8_t attempt = 0; attempt <= retries; attempt++) {
+      result = esp_now_send(targets[targetIndex], data, len);
+      if (result == ESP_OK) {
+        if (targetIndex > 0) {
+          Serial.printf("ESP-NOW send fallback=%s len=%u attempts=%u\n",
+                        targetNames[targetIndex],
+                        (unsigned int)len,
+                        (unsigned int)(attempt + 1));
+        }
+        return true;
+      }
+      delay(5);
     }
-    delay(5);
   }
-  Serial.printf("ESP-NOW send failed: %d\n", result);
+  Serial.printf("ESP-NOW send failed: err=%d len=%u retries=%u\n",
+                result,
+                (unsigned int)len,
+                (unsigned int)retries);
   return false;
 }
 
@@ -1323,7 +1446,7 @@ bool sendAudioDockChunk(const uint8_t *data, uint16_t len, uint32_t chunkIndex) 
   return sendEspNowToAntenna(reinterpret_cast<const uint8_t *>(&chunkPacket), sizeof(chunkPacket), 30);
 }
 
-bool recordAndStreamWavToAntenna(uint8_t triggerType, uint32_t *wavBytes) {
+bool recordAndStreamWavToAntenna(uint8_t triggerType, uint32_t *wavBytes, uint16_t preRollMs) {
   if (!i2sReady) {
     lastRecordError = "I2S not ready";
     Serial.println("Cannot record: I2S mic is not ready.");
@@ -1334,7 +1457,9 @@ bool recordAndStreamWavToAntenna(uint8_t triggerType, uint32_t *wavBytes) {
   *wavBytes = AUDIO_TOTAL_BYTES;
   displayLCDStatus("Get ready", "Recording soon");
   ringFlash(0, 64, 0, 2, 120, 80);
-  delay(SPEAK_DELAY_MS);
+  if (preRollMs > 0) {
+    delay(preRollMs);
+  }
 
   if (!sendAudioDockTrigger(triggerType, AUDIO_TOTAL_BYTES)) {
     lastRecordError = "Trigger failed";
@@ -1492,12 +1617,17 @@ void handleLocalSerialCommand(String command) {
     runLedRingSelfTest();
   } else if (command == "SPEAKERTEST" || command == "SPKTEST" || command == "S") {
     runSpeakerSelfTest();
+  } else if (command == "VOICE" || command == "VICECITY" || command == "ALWAYSLISTEN" ||
+             command == "MODEVOICE") {
+    setAudioDockListeningMode(AUDIO_DOCK_MODE_VOICE);
+  } else if (command == "CLAP" || command == "DOUBLECLAP" || command == "MODECLAP") {
+    setAudioDockListeningMode(AUDIO_DOCK_MODE_CLAP);
   } else if (command == "HELP" || command == "H") {
-    Serial.println("Audio Dock commands: LEDTEST, SPEAKERTEST");
+    Serial.println("Audio Dock commands: LEDTEST, SPEAKERTEST, VOICE, CLAP");
   } else if (command.length() > 0) {
     Serial.print("Unknown command: ");
     Serial.println(command);
-    Serial.println("Use LEDTEST or SPEAKERTEST.");
+    Serial.println("Use LEDTEST, SPEAKERTEST, VOICE or CLAP.");
   }
 }
 
@@ -1569,7 +1699,11 @@ void setup() {
   addEspNowPeer(ANTENNA_MAC_PLACEHOLDER);
   addEspNowPeer(ESPNOW_BROADCAST_MAC);
 
-  displayLCDStatus("System Ready", "Clap to speak!");
+  if (currentListeningMode == AUDIO_DOCK_MODE_VOICE) {
+    displayLCDStatus("System Ready", "Thumb up to talk");
+  } else {
+    displayLCDStatus("System Ready", "Clap to speak!");
+  }
   currentState = STATE_WAIT_CLAP;
 }
 
@@ -1615,9 +1749,28 @@ void loop() {
       char macLcd[18];
       snprintf(macLcd, sizeof(macLcd), "MAC:%02X%02X%02X%02X%02X%02X",
                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-      displayLCDStatus("Clap to speak!", macLcd);
+      bool voiceMode = currentListeningMode == AUDIO_DOCK_MODE_VOICE;
+      if (voiceMode) {
+        displayLCDStatus("Vice City Mode", "Voice ready");
+      } else {
+        displayLCDStatus("Clap to speak!", macLcd);
+      }
       ringShowIdleStatus(0);
-      
+      if (voiceMode && voiceCommandArmed) {
+        pendingTriggerType = AUDIO_DOCK_TRIGGER_VOICE;
+        displayLCDStatus("Voice command", "Recording...");
+        ringFlash(0, 64, 0, 2, 120, 80);
+        delay(250);
+        voiceCommandArmed = false;
+        currentState = STATE_RECORDING;
+        break;
+      }
+      if (voiceMode && !voiceCommandArmed) {
+        displayLCDStatus("Vice City Mode", "Thumb up to talk");
+        delay(100);
+        break;
+      }
+
       if (!microphone_inference_start(EI_CLASSIFIER_RAW_SAMPLE_COUNT)) {
         displayLCDStatus("Inference Err", "Memory failed");
         ringShowError();
@@ -1655,102 +1808,104 @@ void loop() {
           break;
         }
 
-        signal_t signal;
-        signal.total_length = EI_CLASSIFIER_RAW_SAMPLE_COUNT;
-        signal.get_data = &microphone_audio_signal_get_data;
-        ei_impulse_result_t result = { 0 };
+        {
+          signal_t signal;
+          signal.total_length = EI_CLASSIFIER_RAW_SAMPLE_COUNT;
+          signal.get_data = &microphone_audio_signal_get_data;
+          ei_impulse_result_t result = { 0 };
 
-        EI_IMPULSE_ERROR r = run_classifier(&signal, &result, debug_nn);
-        if (r != EI_IMPULSE_OK) {
-          microphone_inference_end();
-          if (!microphone_inference_start(EI_CLASSIFIER_RAW_SAMPLE_COUNT)) {
-            detectorFault = true;
-            break;
+          EI_IMPULSE_ERROR r = run_classifier(&signal, &result, debug_nn);
+          if (r != EI_IMPULSE_OK) {
+            microphone_inference_end();
+            if (!microphone_inference_start(EI_CLASSIFIER_RAW_SAMPLE_COUNT)) {
+              detectorFault = true;
+              break;
+            }
+            continue;
           }
-          continue;
-        }
 
-        float singleClapScore = 0.0f;
-        float doubleClapScore = 0.0f;
-        float noiseScore = 0.0f;
-        float bestScore = -1.0f;
-        String bestLabel = "";
-
-        if (PRINT_CLAP_SCORES) {
-          Serial.print("CLAP_SCORES");
-        }
-
-        for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
-          String label = String(result.classification[ix].label);
-          float val = result.classification[ix].value;
+          float singleClapScore = 0.0f;
+          float doubleClapScore = 0.0f;
+          float noiseScore = 0.0f;
+          float bestScore = -1.0f;
+          String bestLabel = "";
 
           if (PRINT_CLAP_SCORES) {
-            Serial.printf(" %s=%.2f", label.c_str(), val);
+            Serial.print("CLAP_SCORES");
           }
 
-          if (val > bestScore) {
-            bestScore = val;
-            bestLabel = label;
+          for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+            String label = String(result.classification[ix].label);
+            float val = result.classification[ix].value;
+
+            if (PRINT_CLAP_SCORES) {
+              Serial.printf(" %s=%.2f", label.c_str(), val);
+            }
+
+            if (val > bestScore) {
+              bestScore = val;
+              bestLabel = label;
+            }
+
+            if (label.equalsIgnoreCase("Single clap")) {
+              singleClapScore = val;
+            } else if (label.equalsIgnoreCase("Double clap")) {
+              doubleClapScore = val;
+            } else if (label.equalsIgnoreCase("Noice") || label.equalsIgnoreCase("Noise")) {
+              noiseScore = val;
+            } else if (val > noiseScore) {
+              noiseScore = val;
+            }
           }
 
-          if (label.equalsIgnoreCase("Single clap")) {
-            singleClapScore = val;
-          } else if (label.equalsIgnoreCase("Double clap")) {
-            doubleClapScore = val;
-          } else if (label.equalsIgnoreCase("Noice") || label.equalsIgnoreCase("Noise")) {
-            noiseScore = val;
-          } else if (val > noiseScore) {
-            noiseScore = val;
+          uint32_t peak = lastInferencePeak;
+          uint16_t peakEvents = lastInferencePeakEvents;
+          bool bestIsSingleClap = bestLabel.equalsIgnoreCase("Single clap");
+          bool bestIsDoubleClap = bestLabel.equalsIgnoreCase("Double clap");
+          float triggerScore = doubleClapScore > singleClapScore ? doubleClapScore : singleClapScore;
+          bool clapStrong = triggerScore >= CLAP_LABEL_THRESHOLD;
+          bool clapBeatsNoise = triggerScore >= noiseScore + CLAP_NOISE_MARGIN;
+          bool peakIsAudible = peak >= CLAP_AUDIO_PEAK_THRESHOLD;
+          bool enoughPeakEvents = bestIsDoubleClap ? peakEvents >= 2 : peakEvents >= 1;
+          bool multiPeakClap = triggerScore >= CLAP_SECONDARY_THRESHOLD &&
+                               peakEvents >= 2 &&
+                               peak >= 8000;
+          bool directDoubleClap = doubleClapScore >= CLAP_LABEL_THRESHOLD &&
+                                  peakIsAudible &&
+                                  peakEvents >= 2;
+          bool modelClap = (bestIsSingleClap || bestIsDoubleClap) &&
+                           clapStrong &&
+                           clapBeatsNoise &&
+                           peakIsAudible &&
+                           enoughPeakEvents;
+          bool clapAccepted = directDoubleClap || modelClap || multiPeakClap;
+
+          if (PRINT_CLAP_SCORES) {
+            Serial.printf(" best=%s %.2f peak=%lu peak_events=%u clap_ok=%u direct_double=%u noise_margin=%u multipk=%u\n",
+                          bestLabel.c_str(),
+                          bestScore,
+                          (unsigned long)peak,
+                          (unsigned int)peakEvents,
+                          (unsigned int)clapAccepted,
+                          (unsigned int)directDoubleClap,
+                          (unsigned int)clapBeatsNoise,
+                          (unsigned int)multiPeakClap);
           }
-        }
 
-        uint32_t peak = lastInferencePeak;
-        uint16_t peakEvents = lastInferencePeakEvents;
-        bool bestIsSingleClap = bestLabel.equalsIgnoreCase("Single clap");
-        bool bestIsDoubleClap = bestLabel.equalsIgnoreCase("Double clap");
-        float triggerScore = doubleClapScore > singleClapScore ? doubleClapScore : singleClapScore;
-        bool clapStrong = triggerScore >= CLAP_LABEL_THRESHOLD;
-        bool clapBeatsNoise = triggerScore >= noiseScore + CLAP_NOISE_MARGIN;
-        bool peakIsAudible = peak >= CLAP_AUDIO_PEAK_THRESHOLD;
-        bool enoughPeakEvents = bestIsDoubleClap ? peakEvents >= 2 : peakEvents >= 1;
-        bool multiPeakClap = triggerScore >= CLAP_SECONDARY_THRESHOLD &&
-                             peakEvents >= 2 &&
-                             peak >= 8000;
-        bool directDoubleClap = doubleClapScore >= CLAP_LABEL_THRESHOLD &&
-                                peakIsAudible &&
-                                peakEvents >= 2;
-        bool modelClap = (bestIsSingleClap || bestIsDoubleClap) &&
-                         clapStrong &&
-                         clapBeatsNoise &&
-                         peakIsAudible &&
-                         enoughPeakEvents;
-        bool clapAccepted = directDoubleClap || modelClap || multiPeakClap;
-
-        if (PRINT_CLAP_SCORES) {
-          Serial.printf(" best=%s %.2f peak=%lu peak_events=%u clap_ok=%u direct_double=%u noise_margin=%u multipk=%u\n",
-                        bestLabel.c_str(),
-                        bestScore,
-                        (unsigned long)peak,
-                        (unsigned int)peakEvents,
-                        (unsigned int)clapAccepted,
-                        (unsigned int)directDoubleClap,
-                        (unsigned int)clapBeatsNoise,
-                        (unsigned int)multiPeakClap);
-        }
-
-        if (clapAccepted) {
-          triggerType = doubleClapScore > singleClapScore ? 2 : 1;
-          const char *triggerLabel = triggerType == 2 ? "Double clap" : "Single clap";
-          Serial.printf("Triggered! Detected: %s score=%.2f single=%.2f double=%.2f noise=%.2f peak=%lu peak_events=%u multipk=%u\n",
-                        triggerLabel,
-                        triggerScore,
-                        singleClapScore,
-                        doubleClapScore,
-                        noiseScore,
-                        (unsigned long)peak,
-                        (unsigned int)peakEvents,
-                        (unsigned int)multiPeakClap);
-          clapDetected = true;
+          if (clapAccepted) {
+            triggerType = doubleClapScore > singleClapScore ? 2 : 1;
+            const char *triggerLabel = triggerType == 2 ? "Double clap" : "Single clap";
+            Serial.printf("Triggered! Detected: %s score=%.2f single=%.2f double=%.2f noise=%.2f peak=%lu peak_events=%u multipk=%u\n",
+                          triggerLabel,
+                          triggerScore,
+                          singleClapScore,
+                          doubleClapScore,
+                          noiseScore,
+                          (unsigned long)peak,
+                          (unsigned int)peakEvents,
+                          (unsigned int)multiPeakClap);
+            clapDetected = true;
+          }
         }
 
         if (!clapDetected) {
@@ -1779,16 +1934,20 @@ void loop() {
       }
 
       if (detectorFault || !clapDetected) {
-        displayLCDStatus("Mic restarting", "Clap again");
+        displayLCDStatus("Mic restarting", voiceMode ? "Say again" : "Clap again");
         ringShowError();
-        nextClapArmMs = millis() + 500;
+        nextClapArmMs = millis() + (voiceMode ? VOICE_REARM_DELAY_MS : 500);
         currentState = STATE_WAIT_CLAP;
         delay(500);
         break;
       }
 
-      // Clap detected! Stop model classification
-      displayLCDStatus("Clap Detected!", "Speak now...");
+      // Trigger detected! Stop model classification.
+      if (voiceMode) {
+        displayLCDStatus("Voice command", "Recording...");
+      } else {
+        displayLCDStatus("Clap Detected!", "Speak now...");
+      }
       ringFlash(0, 64, 0, 2, 120, 80);
       delay(250);
 
@@ -1798,8 +1957,11 @@ void loop() {
     }
 
     case STATE_RECORDING: {
+      bool voiceTrigger = pendingTriggerType == AUDIO_DOCK_TRIGGER_VOICE;
       if (pendingTriggerType == 0) {
         displayLCDStatus("Training sample", "Listening...");
+      } else if (voiceTrigger) {
+        displayLCDStatus("Voice command", "Listening...");
       } else {
         displayLCDStatus("Record+Send", "Listening...");
       }
@@ -1814,8 +1976,27 @@ void loop() {
       }
 
       uint32_t wavSize = 0;
-      bool recordedOk = recordWavToSD(&wavSize);
-      
+      bool recordedOk = false;
+      if (voiceTrigger) {
+        recordedOk = recordWavToSD(&wavSize);
+        resetMicI2SDriver();
+        if (!recordedOk) {
+          String errorLine = lastRecordError.length() > 0 ? lastRecordError : "Failed saving";
+          displayLCDStatus("Record Error", errorLine.substring(0, 16));
+          ringShowError();
+          delay(2000);
+          nextClapArmMs = millis() + VOICE_REARM_DELAY_MS;
+          currentState = STATE_WAIT_CLAP;
+          break;
+        }
+
+        recordedWavBytes = wavSize;
+        currentState = STATE_STREAMING;
+        break;
+      }
+
+      recordedOk = recordWavToSD(&wavSize);
+
       // Uninstall microphone I2S driver before returning to clap inference.
       resetMicI2SDriver();
 

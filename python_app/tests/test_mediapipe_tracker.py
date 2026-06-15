@@ -99,6 +99,17 @@ class MediaPipeGestureClassificationTests(unittest.TestCase):
 
         self.assertEqual(classify_hand_gesture(landmarks), "index_finger_up")
 
+    def test_closed_fist_does_not_turn_into_pinch_when_thumb_crosses_index(self) -> None:
+        landmarks = make_landmarks()
+        curl_finger(landmarks, 8, 6, 0.45)
+        curl_finger(landmarks, 12, 10, 0.5)
+        curl_finger(landmarks, 16, 14, 0.55)
+        curl_finger(landmarks, 20, 18, 0.6)
+        landmarks[3] = SimpleNamespace(x=0.41, y=0.60)
+        landmarks[4] = SimpleNamespace(x=0.44, y=0.66)
+
+        self.assertEqual(classify_hand_gesture(landmarks), "closed_fist")
+
 
 if __name__ == "__main__":
     unittest.main()

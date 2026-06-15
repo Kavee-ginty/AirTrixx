@@ -28,6 +28,7 @@ from input_mapper import (
     default_mapping_config,
     evaluate_condition,
     load_mapping_config,
+    normalize_mapping_config,
     save_mapping_config,
     gta_vice_city_profile,
     viewer_3d_profile,
@@ -70,6 +71,31 @@ def hand_snapshot(
     }
 
 
+def voice_snapshot(transcript: str, *, voice_gate: bool) -> dict[str, object]:
+    return {
+        "input_dict": {"audio_dock_voice_gate": voice_gate},
+        "raw_device_state": {
+            "devices": {
+                "audiodock": {
+                    "latest_transcript": transcript,
+                    "input": transcript,
+                }
+            }
+        },
+    }
+
+
+def drive_voice_cheat(mapper: InputMapper, transcript: str, cheat: str, start_s: float) -> float:
+    mapper.process(voice_snapshot(transcript, voice_gate=False), start_s)
+    now_s = start_s + 0.01
+    active_snapshot = voice_snapshot(transcript, voice_gate=True)
+    mapper.process(active_snapshot, now_s)
+    for _character in cheat[1:]:
+        now_s += 0.251
+        mapper.process(active_snapshot, now_s)
+    return now_s + 0.01
+
+
 class InputMapperConditionTests(unittest.TestCase):
     def test_numeric_hysteresis_for_less_than(self) -> None:
         rule = MappingRule(comparator="lt", threshold=100, hysteresis=10)
@@ -105,6 +131,142 @@ class InputMapperRuntimeTests(unittest.TestCase):
         mapper.process(snapshot(a=1), 0.1)
         self.assertEqual(backend.events, [("key_tap", ("space",))])
 
+    def test_gta_voice_cheats_require_voice_gate(self) -> None:
+        mapper, backend = self.mapper_with(gta_vice_city_profile().mappings)
+        now_s = drive_voice_cheat(mapper, "police", "leavemealone", 0.0)
+        now_s = drive_voice_cheat(mapper, "weapons", "nuttertools", now_s)
+        now_s = drive_voice_cheat(mapper, "tank", "panzer", now_s)
+        drive_voice_cheat(mapper, "health", "aspirine", now_s)
+
+        self.assertEqual(
+            backend.events,
+            [("key_tap", (character,)) for character in "leavemealonenuttertoolspanzeraspirine"],
+        )
+
+    def test_gta_voice_cheats_do_not_fire_without_gate(self) -> None:
+        mapper, backend = self.mapper_with(gta_vice_city_profile().mappings)
+        mapper.process(voice_snapshot("police", voice_gate=False), 0.0)
+        mapper.process(voice_snapshot("weapons", voice_gate=False), 0.1)
+
+        self.assertEqual(backend.events, [])
+
+    def test_gta_voice_cheats_match_normalized_transcript_commands(self) -> None:
+        mapper, backend = self.mapper_with(gta_vice_city_profile().mappings)
+        now_s = drive_voice_cheat(mapper, "Police, please", "leavemealone", 0.0)
+        now_s = drive_voice_cheat(mapper, "the weapons cheat", "nuttertools", now_s)
+        now_s = drive_voice_cheat(mapper, "tank!", "panzer", now_s)
+        drive_voice_cheat(mapper, "health?", "aspirine", now_s)
+
+        self.assertEqual(
+            backend.events,
+            [("key_tap", (character,)) for character in "leavemealonenuttertoolspanzeraspirine"],
+        )
+
+    def test_gta_tank_cheat_accepts_common_transcript_variants(self) -> None:
+        mapper, backend = self.mapper_with(gta_vice_city_profile().mappings)
+        now_s = drive_voice_cheat(mapper, "tank", "panzer", 0.0)
+        now_s = drive_voice_cheat(mapper, "thank", "panzer", now_s)
+        drive_voice_cheat(mapper, "bank", "panzer", now_s)
+
+        self.assertEqual(
+            backend.events,
+            [("key_tap", (character,)) for character in "panzerpanzerpanzer"],
+        )
+
+    def test_gta_health_cheat_accepts_common_transcript_variants(self) -> None:
+        mapper, backend = self.mapper_with(gta_vice_city_profile().mappings)
+        now_s = drive_voice_cheat(mapper, "health", "aspirine", 0.0)
+        now_s = drive_voice_cheat(mapper, "help", "aspirine", now_s)
+        drive_voice_cheat(mapper, "hello", "aspirine", now_s)
+
+        self.assertEqual(
+            backend.events,
+            [("key_tap", (character,)) for character in "aspirineaspirineaspirine"],
+        )
+
+    def test_gta_gun_gesture_holds_left_mouse(self) -> None:
+        mapper, backend = self.mapper_with(gta_vice_city_profile().mappings)
+        active_snapshot = {
+            "hand_state": {
+                "right": {"visible": True, "gesture": "gun_gesture"},
+                "left": {"visible": False, "gesture": "none"},
+            }
+        }
+        mapper.process(active_snapshot, 0.0)
+        mapper.process(active_snapshot, 0.07)
+        mapper.process(
+            {
+                "hand_state": {
+                    "right": {"visible": True, "gesture": "open_palm"},
+                    "left": {"visible": False, "gesture": "none"},
+                }
+            },
+            0.2,
+        )
+        mapper.process(
+            {
+                "hand_state": {
+                    "right": {"visible": True, "gesture": "open_palm"},
+                    "left": {"visible": False, "gesture": "none"},
+                }
+            },
+            0.27,
+        )
+
+        self.assertEqual(backend.events, [("mouse_down", "left"), ("mouse_up", "left")])
+
+    def test_gta_left_peace_sign_taps_enter_via_runtime_overlay(self) -> None:
+        mapper, backend = self.mapper_with(gta_vice_city_profile().mappings)
+        mapper.process(
+            {
+                "hand_state": {
+                    "left": {"visible": True, "gesture": "peace_sign"},
+                    "right": {"visible": False, "gesture": "none"},
+                }
+            },
+            0.0,
+        )
+        mapper.process(
+            {
+                "hand_state": {
+                    "left": {"visible": True, "gesture": "peace_sign"},
+                    "right": {"visible": False, "gesture": "none"},
+                }
+            },
+            0.09,
+        )
+
+        self.assertEqual(backend.events, [("key_tap", ("enter",), 250)])
+
+    def test_keyboard_sequence_taps_one_key_per_interval(self) -> None:
+        rule = MappingRule(
+            source="fused.a",
+            comparator="truthy",
+            action=MappingAction(
+                type="keyboard_sequence",
+                text="abc",
+                append_space=False,
+                interval_ms=250,
+            ),
+        )
+        mapper, backend = self.mapper_with([rule])
+
+        mapper.process(snapshot(a=True), 0.0)
+        mapper.process(snapshot(a=True), 0.249)
+        mapper.process(snapshot(a=True), 0.250)
+        mapper.process(snapshot(a=True), 0.499)
+        mapper.process(snapshot(a=True), 0.500)
+        mapper.process(snapshot(a=True), 0.750)
+
+        self.assertEqual(
+            backend.events,
+            [
+                ("key_tap", ("a",)),
+                ("key_tap", ("b",)),
+                ("key_tap", ("c",)),
+            ],
+        )
+
     def test_versioned_snapshot_reuses_flattened_signal_catalog(self) -> None:
         rule = MappingRule(
             source="fused.a",
@@ -117,6 +279,75 @@ class InputMapperRuntimeTests(unittest.TestCase):
             mapper.process(versioned, 0.0)
             mapper.process(versioned, 0.1)
         self.assertEqual(flatten.call_count, 1)
+
+    def test_normalize_mapping_config_migrates_legacy_windows_profile(self) -> None:
+        profile = MappingProfile(
+            name="Windows",
+            mappings=[
+                MappingRule(
+                    id="wrist_tab_cycle_forward",
+                    source="fused.wrist_rule_value",
+                    comparator="eq",
+                    threshold="rotate_right_return",
+                    conditions=[
+                        MappingCondition(
+                            source="hands.right.z_mm",
+                            comparator="lt",
+                            threshold="500",
+                            output_keys=["alt"],
+                        )
+                    ],
+                    action=MappingAction(type="keyboard_tap", keys=["tab"]),
+                ),
+                MappingRule(
+                    id="wrist_tab_cycle_backward",
+                    source="fused.wrist_rule_value",
+                    comparator="eq",
+                    threshold="rotate_left_return",
+                    conditions=[
+                        MappingCondition(
+                            source="hands.right.z_mm",
+                            comparator="lt",
+                            threshold="500",
+                            output_keys=["alt"],
+                        )
+                    ],
+                    action=MappingAction(type="keyboard_tap", keys=["shift", "tab"]),
+                ),
+                MappingRule(
+                    id="wrist_cursor_follow_gyro",
+                    source="wrist_cursor.enabled",
+                    comparator="truthy",
+                    conditions=[MappingCondition(source="hands.left.gesture", comparator="eq", threshold="open_palm")],
+                    action=MappingAction(type="mouse_move"),
+                ),
+                MappingRule(
+                    id="wrist_scroll_up",
+                    source="wristband.gyro_x",
+                    comparator="lt",
+                    threshold="-4",
+                    action=MappingAction(type="mouse_scroll", scroll_y=1),
+                ),
+                MappingRule(
+                    id="wrist_scroll_down",
+                    source="wristband.gyro_x",
+                    comparator="gt",
+                    threshold="8",
+                    action=MappingAction(type="mouse_scroll", scroll_y=-1),
+                ),
+            ],
+        )
+        config = MappingConfig(active_profile="Windows", profiles=[profile, wristband_mouse_cursor_profile()])
+
+        normalized, changed = normalize_mapping_config(config)
+
+        self.assertTrue(changed)
+        self.assertEqual(normalized.active_profile, TAB_CURSOR_SCROLL_PROFILE_NAME)
+        self.assertEqual(normalized.profiles[0].name, TAB_CURSOR_SCROLL_PROFILE_NAME)
+        self.assertEqual(normalized.profiles[0].mappings[0].action.keys, ["alt", "tab"])
+        self.assertEqual(normalized.profiles[0].mappings[0].conditions[0].output_keys, [])
+        self.assertEqual(normalized.profiles[0].mappings[1].action.keys, ["alt", "shift", "tab"])
+        self.assertEqual(normalized.profiles[0].mappings[1].conditions[0].output_keys, [])
 
     def test_hold_releases_on_missing_signal(self) -> None:
         rule = MappingRule(
@@ -685,9 +916,53 @@ class MappingConfigTests(unittest.TestCase):
 
     def test_gta_profile_uses_wrist_rules_for_weapon_swaps(self) -> None:
         rules = {rule.id: rule for rule in gta_vice_city_profile().mappings}
+        self.assertEqual(rules["gta_follow_cursor_wrist_gyro"].name, "Follow cursor with wrist gyro")
+        self.assertEqual(rules["gta_follow_cursor_wrist_gyro"].source, "wrist_cursor.enabled")
+        self.assertEqual(rules["gta_follow_cursor_wrist_gyro"].action.type, "mouse_move")
+        self.assertEqual(rules["gta_follow_cursor_wrist_gyro"].action.speed_x_source, "wristband.gyro_z")
+        self.assertEqual(rules["gta_follow_cursor_wrist_gyro"].action.speed_y_source, "wristband.gyro_x")
         self.assertEqual(rules["gta_swap_weapon_next"].source, "fused.wrist_rule_value")
         self.assertEqual(rules["gta_swap_weapon_next"].threshold, "rotate_right_return")
         self.assertEqual(rules["gta_swap_weapon_previous"].threshold, "rotate_left_return")
+
+    def test_normalize_mapping_config_adds_missing_gta_follow_cursor_rule(self) -> None:
+        profile = MappingProfile(
+            name=GTA_VICE_CITY_PROFILE_NAME,
+            mappings=[
+                MappingRule(
+                    id="gta_run_forward",
+                    name="Run forward",
+                    source="hands.right.z_mm",
+                    comparator="lt",
+                    threshold=430,
+                    action=MappingAction(type="keyboard_hold", keys=["w", "space"]),
+                )
+            ],
+        )
+        config = MappingConfig(profiles=[profile], active_profile=GTA_VICE_CITY_PROFILE_NAME)
+
+        normalized, changed = normalize_mapping_config(config)
+
+        self.assertTrue(changed)
+        self.assertEqual([rule.id for rule in normalized.profiles[0].mappings][:2], ["gta_follow_cursor_wrist_gyro", "gta_run_forward"])
+        rules = {rule.id: rule for rule in normalized.profiles[0].mappings}
+        self.assertEqual(rules["gta_fire_hold"].action.type, "mouse_hold")
+        self.assertEqual(rules["gta_fire_hold"].source, "hands.right.gesture")
+        self.assertEqual(rules["gta_fire_hold"].threshold, "gun_gesture")
+        for rule_id in ("gta_cheat_police", "gta_cheat_weapons", "gta_cheat_tank", "gta_cheat_health"):
+            self.assertEqual(rules[rule_id].action.type, "keyboard_sequence")
+            self.assertEqual(rules[rule_id].action.interval_ms, 250)
+
+    def test_runtime_gta_enter_rule_is_not_saved_into_config(self) -> None:
+        config = default_mapping_config()
+        profile = next(profile for profile in config.profiles if profile.name == GTA_VICE_CITY_PROFILE_NAME)
+        self.assertNotIn("gta_enter_peace_runtime", {rule.id for rule in profile.mappings})
+
+        mapper = InputMapper(FakeInputBackend(), config)
+        runtime_rule_ids = {rule.id for rule in mapper.active_rules()}
+
+        self.assertIn("gta_enter_peace_runtime", runtime_rule_ids)
+        self.assertNotIn("gta_enter_peace_runtime", {rule.id for rule in profile.mappings})
 
     def test_3d_viewer_profile_has_orbit_pan_pointer_and_zoom(self) -> None:
         profile = viewer_3d_profile()
@@ -718,6 +993,8 @@ class MappingConfigTests(unittest.TestCase):
         self.assertEqual(len(profile.mappings), 9)
         self.assertEqual(rules["wrist_cursor_follow_gyro"].action.speed_x, -30.0)
         self.assertEqual(rules["wrist_cursor_follow_gyro"].action.speed_y, -30.0)
+        self.assertEqual(rules["wrist_tab_cycle_forward"].conditions[0].source, "hands.right.z_mm")
+        self.assertEqual(rules["wrist_cursor_left_click"].source, "hands.right.gesture")
         self.assertEqual(rules["wrist_scroll_up"].source, "wristband.gyro_x")
         self.assertEqual(rules["wrist_scroll_up"].action.interval_ms, 90)
         self.assertEqual(rules["wrist_scroll_down"].action.scroll_y, -1)
