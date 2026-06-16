@@ -71,7 +71,10 @@ def user_data_root(app_name: str = APP_NAME) -> Path:
 
 
 def build_app_paths(app_name: str = APP_NAME) -> AppPaths:
-    user_data_dir = user_data_root(app_name)
+    return build_app_paths_for_root(user_data_root(app_name))
+
+
+def build_app_paths_for_root(user_data_dir: Path) -> AppPaths:
     config_dir = user_data_dir / "config"
     logs_dir = user_data_dir / "logs"
     temp_dir = user_data_dir / "temp"

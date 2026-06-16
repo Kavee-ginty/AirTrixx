@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" role="img" aria-label="AirTrixx">
+  <rect width="64" height="64" rx="16" fill="#16A34A"/>
+  <path
+    d="M20 44L32 16L44 44H38.2L35.6 36.8H28.4L25.8 44H20Z"
+    fill="#FFFFFF"
+  />
+  <path d="M29.2 31.2H34.8L32 24.4L29.2 31.2Z" fill="#16A34A"/>
+  <path
+    d="M47 28C47 24.1 44.5 20.8 41 19.2"
+    stroke="#FFFFFF"
+    stroke-width="2.4"
+    stroke-linecap="round"
+    opacity="0.95"
+  />
+  <path
+    d="M50 28C50 22.5 46.4 17.9 41 15.6"
+    stroke="#FFFFFF"
+    stroke-width="2.4"
+    stroke-linecap="round"
+    opacity="0.75"
+  />
+  <circle cx="41" cy="28" r="2.2" fill="#FFFFFF"/>
+</svg>

@@ -10,6 +10,7 @@ python_app/**/*.pyc
 # Local user calibration and captured data
 python_app/config/calibration.json
 python_app/config/input_mappings.json
+.airtrixx-appwrite.env
 #python_app/data/
 !python_app/data/.gitkeep
 
@@ -39,3 +40,6 @@ Thumbs.db
 # textBuilds
 dist-dashboard-battery/
 dist-ui-refresh/
+
+.venv-*/
+.venv

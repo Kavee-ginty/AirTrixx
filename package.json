@@ -1,0 +1,11 @@
+{
+  "private": true,
+  "scripts": {
+    "build:css": "tailwindcss -i ./python_app/web/src/styles.css -o ./python_app/web/static/app.css",
+    "watch:css": "tailwindcss -i ./python_app/web/src/styles.css -o ./python_app/web/static/app.css --watch"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.1.0",
+    "tailwindcss": "^4.1.0"
+  }
+}

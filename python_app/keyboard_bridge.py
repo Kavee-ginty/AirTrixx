@@ -45,6 +45,7 @@ LogCallback = Callable[[str], None]
 StatusCallback = Callable[[str], None]
 PredictionCallback = Callable[[str, float, list[tuple[str, float]]], None]
 TrainingCallback = Callable[[dict[str, Any]], None]
+ChangeCallback = Callable[[str], None]
 
 COMMAND_WORDS = ("space", "return", "backspace", "capslock")
 WORD_PATTERN = re.compile(r"[a-z]+")
@@ -103,6 +104,7 @@ class KeyboardBridge:
         on_status: StatusCallback | None = None,
         on_prediction: PredictionCallback | None = None,
         on_training: TrainingCallback | None = None,
+        on_data_changed: ChangeCallback | None = None,
     ) -> None:
         self.dataset_path = dataset_path
         self.model_path = model_path
@@ -112,6 +114,7 @@ class KeyboardBridge:
         self.on_status = on_status
         self.on_prediction = on_prediction
         self.on_training = on_training
+        self.on_data_changed = on_data_changed
 
         self._serial = None
         self._serial_lock = threading.RLock()
@@ -151,6 +154,19 @@ class KeyboardBridge:
 
         self._ensure_starter_model()
         self.reload_model()
+
+    def set_paths(self, *, dataset_path: Path, model_path: Path, words_path: Path) -> None:
+        with self._training_lock:
+            self._training_session = None
+            self._training_capture = None
+            self._training_status = "Idle"
+        self.dataset_path = dataset_path
+        self.model_path = model_path
+        self.words_path = words_path
+        self._live_capture = None
+        self._ensure_starter_model()
+        self.reload_model()
+        self._emit_training()
 
     @staticmethod
     def available_ports() -> list[dict[str, str]]:
@@ -333,6 +349,7 @@ class KeyboardBridge:
             self._training_status = f"Ready: {len(cleaned)} words x {repetitions} samples"
         self._emit_training()
         self._log(f"Keyboard training plan: {len(cleaned)} word(s), {repetitions} sample(s) each.")
+        self._emit_data_changed("keyboard words")
         return True
 
     def arm_next_training_sample(self) -> bool:
@@ -703,6 +720,7 @@ class KeyboardBridge:
                     total = 1
                 self._training_status = f"Saved {capture.sample_id} ({completed}/{total})."
             self._log(f"Saved {len(capture.rows)} keyboard frames for {capture.sample_id}.")
+            self._emit_data_changed("keyboard dataset")
         elif status == "start_timeout":
             with self._training_lock:
                 self._training_status = f"No finger detected for {capture.sample_id}; arm it again."
@@ -739,6 +757,7 @@ class KeyboardBridge:
             f"Model trained: {len(result['labels'])} word(s), accuracy {result['accuracy'] * 100:.1f}%."
         )
         self._emit_training()
+        self._emit_data_changed("keyboard model")
 
     def _emit_training(self) -> None:
         if not self.on_training:
@@ -755,6 +774,10 @@ class KeyboardBridge:
                 "model_path": str(self.model_path),
             }
         self.on_training(payload)
+
+    def _emit_data_changed(self, reason: str) -> None:
+        if self.on_data_changed:
+            self.on_data_changed(reason)
 
     def _active_detect_limits(self) -> list[float]:
         if self.detect_limits:

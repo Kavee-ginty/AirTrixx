@@ -147,6 +147,30 @@ Runtime config, mappings, logs, and temporary audio files are stored outside the
 
 Keyboard training data and the locally retrained model are stored under the same user data root in `keyboard`. The app installs the bundled starter model on first launch, then replaces it when you train new words from the Keyboard page. The default `Tabs + Cursor + Scroll` profile also types detected keyboard words and treats words like `space`, `return`, `backspace`, `capslock`, `win`, and `zero` through `nine` as commands.
 
+## Appwrite Login And Cloud Sync
+
+AirTrixx uses Appwrite email/password accounts for the embedded web login. Per-user mappings, calibration, and keyboard training artifacts sync through Appwrite Databases and Storage after login.
+
+Configure the Appwrite CLI for the project:
+
+```bash
+appwrite login
+appwrite client --endpoint "https://cloud.appwrite.io/v1" --project-id "your-project-id"
+```
+
+The app reads `APPWRITE_ENDPOINT` and `APPWRITE_PROJECT_ID` when set, otherwise it falls back to `appwrite client --debug`.
+
+Create the database, collections, storage bucket, and first admin account using the configured Appwrite CLI session:
+
+```bash
+export AIRTRIXX_ADMIN_EMAIL="admin@example.com"
+export AIRTRIXX_ADMIN_PASSWORD="choose-a-password"
+export AIRTRIXX_ADMIN_NAME="AirTrixx Admin"
+python tools/appwrite_bootstrap.py
+```
+
+Optional IDs can be overridden with `AIRTRIXX_APPWRITE_DATABASE_ID`, `AIRTRIXX_APPWRITE_PROFILES_COLLECTION_ID`, `AIRTRIXX_APPWRITE_SYNC_COLLECTION_ID`, and `AIRTRIXX_APPWRITE_BUCKET_ID`. The configured CLI user/key must be allowed to manage databases, storage buckets, and users for the target project.
+
 ## Package The App
 
 macOS Apple Silicon DMG:

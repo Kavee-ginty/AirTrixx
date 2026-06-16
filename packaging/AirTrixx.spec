@@ -58,10 +58,13 @@ binaries += _collect_binaries("cv2")
 hiddenimports += _collect_submodules("pynput")
 hiddenimports += _collect_submodules("pynput.keyboard")
 hiddenimports += _collect_submodules("pynput.mouse")
+hiddenimports += _collect_submodules("webview")
+hiddenimports += _collect_submodules("keyring")
 
 for source, target in (
     (PROJECT_ROOT / "docs", "docs"),
     (PROJECT_ROOT / "firmware", "firmware"),
+    (PYTHON_APP / "web", "python_app/web"),
     (PYTHON_APP / "data" / "keyboard", "python_app/data/keyboard"),
 ):
     if source.exists():
