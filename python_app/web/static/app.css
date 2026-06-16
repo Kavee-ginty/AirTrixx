@@ -606,6 +606,13 @@ textarea {
   background: var(--accent-hover);
 }
 
+.btn.is-on {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #ffffff;
+  box-shadow: 0 0 0 3px var(--focus-ring);
+}
+
 .btn-muted,
 .btn-outline {
   background: var(--panel);
@@ -750,6 +757,16 @@ textarea {
 
 .topbar-icon-btn:hover {
   background: var(--panel-soft);
+}
+
+.topbar-icon-btn.is-on {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.topbar-icon-btn.is-on:hover {
+  background: var(--accent-soft);
+  color: var(--accent-hover);
 }
 
 .user-chip {
@@ -1134,26 +1151,82 @@ textarea {
   text-align: center;
 }
 
+.mapping-import-input {
+  position: fixed;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.mapping-import-status {
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  background: var(--panel-soft);
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.mapping-editor-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  background: rgba(0, 0, 0, 0.42);
+}
+
 .mapping-editor-panel {
   margin: 0;
+  width: min(560px, 100%);
+  max-height: calc(100vh - 56px);
+  overflow: auto;
   padding: var(--space-5);
   border: 1px solid var(--accent);
   border-radius: var(--radius-sm);
   background: var(--panel);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.22);
+}
+
+.mapping-editor-titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
 }
 
 .mapping-editor-title {
-  margin: 0 0 var(--space-4);
+  margin: 0;
   color: var(--text);
   font-size: 16px;
   font-weight: 600;
+}
+
+.mapping-editor-close {
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  background: var(--panel-soft);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.mapping-editor-close:hover {
+  border-color: var(--line-strong);
+  color: var(--text);
 }
 
 .mapping-editor-fields {
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
-  max-width: 420px;
 }
 
 .mapping-editor-fields .field {

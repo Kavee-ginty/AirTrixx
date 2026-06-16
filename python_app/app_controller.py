@@ -20,7 +20,15 @@ from auth_service import AppwriteAuthService, AuthenticatedUser
 from config import AppConfig, load_calibration_with_warnings, save_calibration
 from fusion_state import FIELD_ORDER, FusionState
 from input_backend import PynputInputBackend
-from input_mapper import InputMapper, MappingRule, SignalCatalog, load_mapping_config, save_mapping_config
+from input_mapper import (
+    InputMapper,
+    MappingConfig,
+    MappingRule,
+    SignalCatalog,
+    load_mapping_config,
+    normalize_mapping_config,
+    save_mapping_config,
+)
 from keyboard_bridge import KeyboardBridge
 from mediapipe_tracker import HandTracker
 from serial_bridge import SerialBridge
@@ -378,6 +386,8 @@ class AirTrixxController:
             self.log("Input mappings saved.")
             self._queue_cloud_sync("mapping saved")
             return True
+        if action == "mapping.import_json":
+            return self._import_mapping_json(payload)
         if action == "mapping.rule.upsert":
             changed = self._upsert_mapping_rule(payload.get("rule") or {})
             if changed:
@@ -770,6 +780,7 @@ class AirTrixxController:
             "mapping.toggle",
             "mapping.set_profile",
             "mapping.save",
+            "mapping.import_json",
             "mapping.rule.upsert",
             "mapping.rule.delete",
             "mapping.rule.toggle",
@@ -911,6 +922,21 @@ class AirTrixxController:
             "profiles": config.profile_names(),
             "sources": sorted(sources),
             "rules": rules,
+        }
+
+    def _import_mapping_json(self, payload: dict[str, Any]) -> dict[str, Any]:
+        name = str(payload.get("name") or "input_mappings.json").strip() or "input_mappings.json"
+        text = str(payload.get("text") or "")
+        if not text.strip():
+            raise ValueError("Selected mapping file is empty.")
+        data = json.loads(text)
+        config, _changed = normalize_mapping_config(MappingConfig.from_dict(data))
+        self.input_mapper.set_config(config)
+        self.log(f"Imported input mappings from {name}. Click Save to persist them to this user profile.")
+        return {
+            "activeProfile": config.active_profile,
+            "profiles": config.profile_names(),
+            "ruleCount": len(config.active().mappings),
         }
 
     def _upsert_mapping_rule(self, rule_data: dict[str, Any]) -> bool:

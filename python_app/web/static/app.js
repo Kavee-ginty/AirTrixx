@@ -49,6 +49,7 @@ const state = {
   loginError: null,
   sidebarCollapsed: false,
   mappingEditor: null,
+  mappingImportStatus: "",
 };
 
 const MAPPING_COMPARATORS = ["lt", "lte", "gt", "gte", "eq", "neq", "present", "truthy", "falsey", "between"];
@@ -183,6 +184,19 @@ const api = {
   },
 };
 
+function mappingRuleSummaryFromRaw(rule) {
+  return {
+    id: rule.id,
+    enabled: rule.enabled !== false,
+    name: rule.name || "Mapping",
+    source: rule.source || "",
+    condition: rule.comparator || "truthy",
+    action: rule.action?.type || "keyboard_tap",
+    status: "idle",
+    rule,
+  };
+}
+
 async function mockApi(method, ...args) {
   if (method === "dispatch") {
     const [action, payload] = args;
@@ -219,20 +233,28 @@ async function mockApi(method, ...args) {
     if (action === "mapping.toggle") mockState.mappings.enabled = !mockState.mappings.enabled;
     if (action === "mapping.set_profile") mockState.mappings.activeProfile = payload.profile || mockState.mappings.activeProfile;
     if (action === "mapping.save") mockState.mappings.status = "Saved";
+    if (action === "mapping.import_json") {
+      try {
+        const imported = JSON.parse(payload?.text || "{}");
+        if (Number(imported.version) !== 1 || !Array.isArray(imported.profiles)) {
+          throw new Error("Selected file is not an AirTrixx mapping JSON file.");
+        }
+        const profileNames = imported.profiles.map((profile) => profile.name || "Default");
+        const activeProfile = profileNames.includes(imported.active_profile) ? imported.active_profile : profileNames[0] || "Default";
+        const active = imported.profiles.find((profile) => (profile.name || "Default") === activeProfile) || imported.profiles[0] || {};
+        mockState.mappings.activeProfile = activeProfile;
+        mockState.mappings.profiles = profileNames.length ? profileNames : ["Default"];
+        mockState.mappings.rules = (active.mappings || []).map(mappingRuleSummaryFromRaw);
+        mockState.mappings.status = `Imported ${payload?.name || "mapping JSON"}`;
+      } catch (error) {
+        return { ok: false, error: error.message || String(error) };
+      }
+    }
     if (action === "mapping.rule.upsert") {
       const rule = payload.rule || {};
       const rules = mockState.mappings.rules || [];
       const index = rules.findIndex((item) => item.id === rule.id);
-      const summary = {
-        id: rule.id,
-        enabled: rule.enabled !== false,
-        name: rule.name || "Mapping",
-        source: rule.source || "",
-        condition: rule.comparator || "truthy",
-        action: rule.action?.type || "keyboard_tap",
-        status: "idle",
-        rule,
-      };
+      const summary = mappingRuleSummaryFromRaw(rule);
       if (index >= 0) rules[index] = summary;
       else rules.push(summary);
       mockState.mappings.rules = rules;
@@ -636,16 +658,18 @@ function renderTopbar() {
   const actions = document.querySelector(".topbar-actions");
   actions.replaceChildren();
 
-  const makeIcon = (label, iconKey, onClick) => {
-    const node = el("button", "topbar-icon-btn");
+  const makeIcon = (label, iconKey, onClick, options = {}) => {
+    const node = el("button", `topbar-icon-btn ${options.active ? "is-on" : ""}`.trim());
     node.type = "button";
     node.title = label;
     node.setAttribute("aria-label", label);
+    if (options.pressed !== undefined) node.setAttribute("aria-pressed", options.pressed ? "true" : "false");
     node.innerHTML = topbarIcons[iconKey] || "";
     node.addEventListener("click", onClick);
     return node;
   };
 
+  const mappings = state.data?.mappings || {};
   actions.append(
     makeIcon("Offers", "gift", () => {}),
     makeIcon("Notifications", "bell", () => {}),
@@ -659,7 +683,12 @@ function renderTopbar() {
       }
     }),
     makeIcon("Camera", "camera", () => dispatch("camera.toggle_power")),
-    makeIcon("Mapper", "mapper", () => dispatch("mapping.toggle")),
+    makeIcon(
+      mappings.enabled ? "Mapper armed" : "Mapper disabled",
+      "mapper",
+      () => dispatch("mapping.toggle"),
+      { active: Boolean(mappings.enabled), pressed: Boolean(mappings.enabled) },
+    ),
   );
 
   const user = el("div", "user-chip");
@@ -1347,6 +1376,28 @@ function saveMappingEditor(draft) {
   return dispatch("mapping.rule.upsert", { rule: mappingRulePayloadFromDraft(draft) });
 }
 
+async function importMappingFile(file) {
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const response = await api.call("dispatch", "mapping.import_json", {
+      name: file.name || "input_mappings.json",
+      text,
+    });
+    if (response && response.ok === false) {
+      throw new Error(response.error || "Could not import mapping JSON.");
+    }
+    const result = response?.result || {};
+    state.mappingEditor = null;
+    state.mappingImportStatus = `Imported ${file.name || "mapping JSON"} (${result.ruleCount ?? 0} rule(s)). Click Save to persist.`;
+  } catch (error) {
+    console.error(error);
+    state.mappingImportStatus = error.message || "Could not import mapping JSON.";
+  } finally {
+    await refreshState();
+  }
+}
+
 function mappingPageSubtitle(mappings) {
   const rules = mappings.rules || [];
   const enabledCount = rules.filter((rule) => rule.enabled).length;
@@ -1539,8 +1590,22 @@ function buildMappingEditor(editorState) {
   const draft = editorState.draft;
   const mappings = state.data?.mappings || {};
   const sources = [...new Set([...(mappings.sources || []), draft.source].filter(Boolean))].sort();
+  const overlay = el("div", "mapping-editor-modal");
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) closeMappingEditor();
+  });
   const panel = el("section", "mapping-editor-panel");
-  panel.append(el("h3", "mapping-editor-title", editorState.isNew ? "New rule" : "Edit rule"));
+  panel.setAttribute("role", "dialog");
+  panel.setAttribute("aria-modal", "true");
+  panel.setAttribute("aria-labelledby", "mapping-editor-title");
+  const titlebar = el("div", "mapping-editor-titlebar");
+  const title = el("h3", "mapping-editor-title", editorState.isNew ? "New rule" : "Edit rule");
+  title.id = "mapping-editor-title";
+  const close = el("button", "mapping-editor-close", "Close");
+  close.type = "button";
+  close.addEventListener("click", closeMappingEditor);
+  titlebar.append(title, close);
+  panel.append(titlebar);
 
   const fields = el("div", "mapping-editor-fields");
   fields.append(
@@ -1608,19 +1673,39 @@ function buildMappingEditor(editorState) {
   cancel.addEventListener("click", closeMappingEditor);
   actions.append(save, cancel);
   panel.append(actions);
-  return panel;
+  overlay.append(panel);
+  return overlay;
+}
+
+function updateMappingControls(mappings) {
+  const armed = Boolean(mappings.enabled);
+  const toggle = document.querySelector("#mapping-toggle-btn");
+  if (!toggle) return;
+  toggle.textContent = armed ? "Disable" : "Arm";
+  toggle.title = armed ? "Mapper is armed. Click to disable." : "Mapper is disabled. Click to arm.";
+  toggle.setAttribute("aria-label", toggle.title);
+  toggle.setAttribute("aria-pressed", armed ? "true" : "false");
+  toggle.classList.toggle("is-on", armed);
 }
 
 function updateMappingsPage(root, { rebuildEditor = false } = {}) {
   const mappings = state.data?.mappings || {};
   const signals = state.data?.signals || [];
+  updateMappingControls(mappings);
   const subtitle = root.querySelector(".page-subtitle");
   if (subtitle) subtitle.textContent = mappingPageSubtitle(mappings);
+  const importStatusSlot = root.querySelector("#mapping-import-status-slot");
+  if (importStatusSlot) {
+    importStatusSlot.replaceChildren();
+    if (state.mappingImportStatus) {
+      importStatusSlot.append(el("div", "mapping-import-status", state.mappingImportStatus));
+    }
+  }
   root.querySelector("#mapping-profiles-slot")?.replaceChildren(mappingProfileBar(mappings));
   root.querySelector("#mapping-rules-slot")?.replaceChildren(mappingRulesPanel(mappings, signals));
   const editorSlot = root.querySelector("#mapping-editor-slot");
   if (!editorSlot) return;
-  if (state.mappingEditor && (rebuildEditor || !editorSlot.querySelector(".mapping-editor-panel"))) {
+  if (state.mappingEditor && (rebuildEditor || !editorSlot.querySelector(".mapping-editor-modal"))) {
     editorSlot.replaceChildren(buildMappingEditor(state.mappingEditor));
   } else if (!state.mappingEditor) {
     editorSlot.replaceChildren();
@@ -1631,19 +1716,37 @@ function renderMappings(root) {
   const mappings = state.data?.mappings || {};
   root.dataset.page = "Mappings";
   root.replaceChildren();
+  const importInput = el("input", "mapping-import-input");
+  importInput.id = "mapping-import-input";
+  importInput.type = "file";
+  importInput.accept = ".json,application/json";
+  importInput.addEventListener("change", () => {
+    const file = importInput.files && importInput.files[0];
+    importMappingFile(file);
+    importInput.value = "";
+  });
+  const importButton = el("button", "btn btn-outline", "Import JSON");
+  importButton.type = "button";
+  importButton.addEventListener("click", () => importInput.click());
+  const toggleButton = toolbarButton(mappings.enabled ? "Disable" : "Arm", "mapping.toggle", {}, "btn btn-primary");
+  toggleButton.id = "mapping-toggle-btn";
   root.append(
     pageHeader("Mappings", mappingPageSubtitle(mappings), [
-      toolbarButton(mappings.enabled ? "Disable" : "Arm", "mapping.toggle", {}, "btn btn-primary"),
+      toggleButton,
+      importButton,
       toolbarButton("Save", "mapping.save"),
     ]),
   );
+  root.append(importInput);
+  const importStatusSlot = el("div");
+  importStatusSlot.id = "mapping-import-status-slot";
   const profilesSlot = el("div");
   profilesSlot.id = "mapping-profiles-slot";
   const editorSlot = el("div");
   editorSlot.id = "mapping-editor-slot";
   const rulesSlot = el("div");
   rulesSlot.id = "mapping-rules-slot";
-  root.append(profilesSlot, editorSlot, rulesSlot);
+  root.append(importStatusSlot, profilesSlot, editorSlot, rulesSlot);
   updateMappingsPage(root, { rebuildEditor: true });
 }
 
@@ -1869,6 +1972,9 @@ async function dispatch(action, payload = {}) {
     if (response && response.ok === false) {
       throw new Error(response.error || "Action failed.");
     }
+    if (action === "mapping.save") {
+      state.mappingImportStatus = "Mappings saved.";
+    }
   } catch (error) {
     console.error(error);
   } finally {
@@ -1947,6 +2053,12 @@ document.addEventListener("click", (event) => {
   if (!node) return;
   const action = node.dataset.action;
   if (action) dispatch(action);
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && state.mappingEditor) {
+    closeMappingEditor();
+  }
 });
 
 window.addEventListener("beforeunload", () => {
