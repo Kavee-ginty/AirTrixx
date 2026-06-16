@@ -1115,9 +1115,16 @@ class AirTrixxGUI:
         fan_box.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(0, 10))
         fan_box.columnconfigure(0, weight=1)
         self.fan_status_var = tk.StringVar(value="Fans: waiting for controller.")
+        self.fan_auto_temp_var = tk.StringVar(value="")
         self.fan_button = ttk.Button(fan_box, text="Turn Fans On", command=self.toggle_fans, style="Accent.TButton")
         self.fan_button.grid(row=0, column=0, sticky="ew")
-        ttk.Label(fan_box, textvariable=self.fan_status_var, wraplength=420).grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        auto_row = ttk.Frame(fan_box)
+        auto_row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        auto_row.columnconfigure(1, weight=1)
+        ttk.Label(auto_row, text="Auto fan on at").grid(row=0, column=0, sticky="w")
+        ttk.Entry(auto_row, textvariable=self.fan_auto_temp_var, width=10).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(auto_row, text="C").grid(row=0, column=2, sticky="w", padx=(4, 0))
+        ttk.Label(fan_box, textvariable=self.fan_status_var, wraplength=420).grid(row=2, column=0, sticky="ew", pady=(8, 0))
 
         camera_box = ttk.LabelFrame(body, text="Camera", padding=10)
         camera_box.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(0, 10))
@@ -7304,6 +7311,15 @@ class AirTrixxGUI:
         fans = devices.get("fans", {}) if isinstance(devices, dict) else {}
         return fans if isinstance(fans, dict) else {}
 
+    def _fan_auto_threshold_c(self) -> float | None:
+        raw_value = self.fan_auto_temp_var.get().strip()
+        if not raw_value:
+            return None
+        try:
+            return float(raw_value)
+        except ValueError:
+            return None
+
     def _update_fan_controls(self) -> None:
         fans = self._fan_device_state()
         status = fans.get("status", "not_connected")
@@ -7313,6 +7329,14 @@ class AirTrixxGUI:
         temp_2 = self._format_table_value(temps.get("sensor_2_c"))
         battery_level = self._format_table_value(fans.get("battery_level"))
         battery_voltage = self._format_table_value(fans.get("battery_voltage"))
+        threshold_c = self._fan_auto_threshold_c()
+        temp_values = [value for value in (temps.get("sensor_1_c"), temps.get("sensor_2_c")) if isinstance(value, (int, float))]
+        max_temp_c = max(temp_values) if temp_values else None
+
+        if threshold_c is not None and max_temp_c is not None and max_temp_c >= threshold_c and not self.fans_requested_on:
+            self.toggle_fans()
+            fans = self._fan_device_state()
+            fan_on = fans.get("fan_on")
 
         if isinstance(fan_on, bool):
             self.fans_requested_on = fan_on
