@@ -49,6 +49,7 @@ const state = {
   loginError: null,
   sidebarCollapsed: false,
   mappingEditor: null,
+  mappingKeyCapture: null,
   mappingImportStatus: "",
 };
 
@@ -62,6 +63,8 @@ const MAPPING_ACTION_TYPES = [
   "mouse_scroll",
 ];
 const MAPPING_MOUSE_BUTTONS = ["left", "right", "middle"];
+const MAPPING_KEY_DISPLAY_ALIASES = { "+": "plus", "-": "minus", ",": "comma" };
+const MAPPING_KEY_VALUE_ALIASES = { plus: "+", minus: "-", comma: "," };
 
 const THEME_STORAGE_KEY = "airtrixx-theme";
 const APP_ICON = "./static/images/airtrixx-icon.svg";
@@ -203,8 +206,9 @@ async function mockApi(method, ...args) {
     if (action === "auth.login") {
       const email = String(payload?.email || payload?.username || "").toLowerCase();
       const password = String(payload?.password || "");
-      const admin = email.startsWith("admin@") && password.length > 0;
-      const client = Boolean(email && password);
+      const username = email.includes("@") ? email.split("@", 1)[0] : email;
+      const admin = username === "admin" && password === "admin123";
+      const client = username === "client" && password === "client123";
       if (admin || client) {
         mockState.auth = {
           authenticated: true,
@@ -265,6 +269,32 @@ async function mockApi(method, ...args) {
     if (action === "mapping.rule.toggle") {
       const rule = (mockState.mappings.rules || []).find((item) => item.id === payload.id);
       if (rule) rule.enabled = payload.enabled !== undefined ? Boolean(payload.enabled) : !rule.enabled;
+    }
+    if (action === "testing.select") {
+      mockState.testing.selectedId = payload.id || "";
+      mockState.testing.mode = "selected";
+      mockState.testing.active = true;
+      mockState.testing.status = "Selected test armed.";
+      mockState.testing.detected = "Detected: waiting";
+      mockState.testing.history.unshift(`[${new Date().toLocaleTimeString()}] Armed selected test.`);
+    }
+    if (action === "testing.set_mode" || action === "testing.start") {
+      mockState.testing.mode = payload.mode === "all" ? "all" : "selected";
+      mockState.testing.active = true;
+      mockState.testing.status = mockState.testing.mode === "all" ? "All-in-one test armed." : "Selected test armed.";
+      mockState.testing.detected = "Detected: waiting";
+    }
+    if (action === "testing.set_suppress") {
+      mockState.testing.outputSuppressed = payload.enabled !== false;
+    }
+    if (action === "testing.stop") {
+      mockState.testing.active = false;
+      mockState.testing.status = "Testing stopped.";
+      mockState.testing.detected = "Detected: -";
+      mockState.testing.history.unshift(`[${new Date().toLocaleTimeString()}] Stopped gesture testing.`);
+    }
+    if (action === "testing.refresh") {
+      mockState.testing.status = "Testing list refreshed.";
     }
     if (action === "camera.toggle_power") mockState.camera.enabled = !mockState.camera.enabled;
     if (action === "serial.connect") mockState.serial.connected = true;
@@ -372,6 +402,46 @@ const mockState = {
         },
       },
     ],
+  },
+  testing: {
+    active: false,
+    mode: "selected",
+    outputSuppressed: true,
+    selectedId: "raw:right_open_palm",
+    selectedName: "Right hand open palm",
+    status: "Select a gesture to arm an individual test.",
+    detected: "Detected: -",
+    entries: [
+      {
+        id: "raw:right_open_palm",
+        name: "Right hand open palm",
+        type: "Camera",
+        trigger: "hands.right.gesture eq open_palm",
+        status: "-",
+      },
+      {
+        id: "raw:right_fist",
+        name: "Right hand fist",
+        type: "Camera",
+        trigger: "hands.right.gesture eq closed_fist",
+        status: "-",
+      },
+      {
+        id: "mapping:wrist-click",
+        name: "Wrist click",
+        type: "Mapping",
+        trigger: "wristband.gesture present -> tap space",
+        status: "-",
+      },
+    ],
+    liveValues: [
+      { label: "L gesture", value: "none" },
+      { label: "R gesture", value: "none" },
+      { label: "L z", value: "- mm" },
+      { label: "R z", value: "- mm" },
+      { label: "Model", value: "none" },
+    ],
+    history: [],
   },
   signals: [
     { id: "wristband.gesture", group: "Wristband", label: "Gesture", value: "none" },
@@ -1305,15 +1375,151 @@ function mappingRuleId() {
   return `rule-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function displayMappingKeyToken(token) {
+  const value = String(token || "").trim();
+  return MAPPING_KEY_DISPLAY_ALIASES[value] || value;
+}
+
+function valueMappingKeyToken(token) {
+  const value = String(token || "").trim().toLowerCase();
+  return MAPPING_KEY_VALUE_ALIASES[value] || value;
+}
+
 function keysToText(keys) {
-  return Array.isArray(keys) ? keys.filter(Boolean).join(" + ") : "";
+  return Array.isArray(keys) ? keys.filter(Boolean).map(displayMappingKeyToken).join(" + ") : "";
 }
 
 function keysFromText(text) {
   return String(text || "")
     .split(/[+,\s]+/)
-    .map((part) => part.trim().toLowerCase())
+    .map((part) => valueMappingKeyToken(part))
     .filter(Boolean);
+}
+
+function isMappingModifierToken(token) {
+  return ["cmd", "ctrl", "alt", "shift"].includes(token);
+}
+
+function mappingModifierTokens(event) {
+  const tokens = [];
+  if (event.metaKey) tokens.push("cmd");
+  if (event.ctrlKey) tokens.push("ctrl");
+  if (event.altKey) tokens.push("alt");
+  if (event.shiftKey) tokens.push("shift");
+  return tokens;
+}
+
+function dedupeMappingKeyTokens(tokens) {
+  const seen = new Set();
+  return tokens.filter((token) => {
+    if (!token || seen.has(token)) return false;
+    seen.add(token);
+    return true;
+  });
+}
+
+function browserKeyToken(event) {
+  const key = event.key || "";
+  const code = event.code || "";
+  const namedKeys = {
+    Meta: "cmd",
+    OS: "cmd",
+    Control: "ctrl",
+    Alt: "alt",
+    Option: "alt",
+    Shift: "shift",
+    Escape: "esc",
+    Esc: "esc",
+    Enter: "enter",
+    Return: "enter",
+    " ": "space",
+    Spacebar: "space",
+    Tab: "tab",
+    Backspace: "backspace",
+    Delete: "delete",
+    Insert: "insert",
+    Home: "home",
+    End: "end",
+    PageUp: "page_up",
+    PageDown: "page_down",
+    ArrowUp: "up",
+    ArrowDown: "down",
+    ArrowLeft: "left",
+    ArrowRight: "right",
+    CapsLock: "caps_lock",
+  };
+  const codeKeys = {
+    Space: "space",
+    NumpadEnter: "enter",
+    NumpadAdd: "plus",
+    NumpadSubtract: "minus",
+    NumpadMultiply: "*",
+    NumpadDivide: "/",
+    NumpadDecimal: ".",
+  };
+  if (namedKeys[key]) return namedKeys[key];
+  if (/^F\d{1,2}$/i.test(key)) return key.toLowerCase();
+  if (key.length === 1) {
+    const value = key.toLowerCase();
+    if (value === "+") return "plus";
+    if (value === "-") return "minus";
+    if (value === ",") return "comma";
+    return value;
+  }
+  if (codeKeys[code]) return codeKeys[code];
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3).toLowerCase();
+  if (/^Digit\d$/.test(code)) return code.slice(5);
+  if (/^Numpad\d$/.test(code)) return code.slice(6);
+  return String(key || code)
+    .replace(/\s+/g, "_")
+    .replace(/-/g, "_")
+    .toLowerCase();
+}
+
+function stopMappingKeyCapture(message = "") {
+  const capture = state.mappingKeyCapture;
+  if (!capture) return;
+  capture.button?.classList.remove("is-capturing");
+  if (capture.button) capture.button.textContent = "Capture";
+  if (capture.hint) capture.hint.textContent = message;
+  state.mappingKeyCapture = null;
+}
+
+function startMappingKeyCapture(input, button, hint, getSelectedModifiers = null) {
+  stopMappingKeyCapture();
+  state.mappingKeyCapture = { input, button, hint, getSelectedModifiers };
+  button.classList.add("is-capturing");
+  button.textContent = "Press keys";
+  const selected = typeof getSelectedModifiers === "function" ? getSelectedModifiers() : [];
+  if (hint) hint.textContent = selected.length ? `${selected.join(" + ")} + ...` : "Waiting for key press...";
+  try {
+    input.focus({ preventScroll: true });
+    input.select();
+  } catch {
+    input.focus();
+  }
+}
+
+function applyCapturedMappingKey(event) {
+  const capture = state.mappingKeyCapture;
+  if (!capture) return false;
+  event.preventDefault();
+  event.stopPropagation();
+  const token = browserKeyToken(event);
+  const selectedModifiers = typeof capture.getSelectedModifiers === "function" ? capture.getSelectedModifiers() : [];
+  const modifiers = dedupeMappingKeyTokens([...selectedModifiers, ...mappingModifierTokens(event)]);
+  if (!token) return true;
+  if (isMappingModifierToken(token)) {
+    const preview = dedupeMappingKeyTokens([...modifiers, token]);
+    if (capture.hint) capture.hint.textContent = preview.length ? `${preview.join(" + ")} + ...` : "Waiting for key press...";
+    return true;
+  }
+  const tokens = dedupeMappingKeyTokens([...modifiers, token]);
+  const text = tokens.join(" + ");
+  capture.input.value = text;
+  capture.input.dispatchEvent(new Event("input", { bubbles: true }));
+  stopMappingKeyCapture(`Captured ${text}.`);
+  return true;
 }
 
 function mappingDraftFromRule(ruleData) {
@@ -1362,16 +1568,19 @@ function mappingRulePayloadFromDraft(draft) {
 }
 
 function openMappingEditor(ruleData, isNew = false) {
+  stopMappingKeyCapture();
   state.mappingEditor = { isNew, draft: mappingDraftFromRule(ruleData) };
   renderPage();
 }
 
 function closeMappingEditor() {
+  stopMappingKeyCapture();
   state.mappingEditor = null;
   renderPage();
 }
 
 function saveMappingEditor(draft) {
+  stopMappingKeyCapture();
   state.mappingEditor = null;
   return dispatch("mapping.rule.upsert", { rule: mappingRulePayloadFromDraft(draft) });
 }
@@ -1388,6 +1597,7 @@ async function importMappingFile(file) {
       throw new Error(response.error || "Could not import mapping JSON.");
     }
     const result = response?.result || {};
+    stopMappingKeyCapture();
     state.mappingEditor = null;
     state.mappingImportStatus = `Imported ${file.name || "mapping JSON"} (${result.ruleCount ?? 0} rule(s)). Click Save to persist.`;
   } catch (error) {
@@ -1421,6 +1631,7 @@ function mappingProfileBar(mappings) {
     tab.type = "button";
     tab.disabled = active;
     tab.addEventListener("click", () => {
+      stopMappingKeyCapture();
       state.mappingEditor = null;
       dispatch("mapping.set_profile", { profile });
     });
@@ -1570,6 +1781,64 @@ function mappingInputField(label, id, value, type = "text") {
   return field;
 }
 
+function mappingKeyCaptureField(label, id, value) {
+  const field = el("div", "field");
+  field.append(el("label", "", label));
+  const selectedModifiers = new Set();
+  keysFromText(value).filter(isMappingModifierToken).forEach((token) => selectedModifiers.add(token));
+  const getSelectedModifiers = () => ["cmd", "ctrl", "alt", "shift"].filter((token) => selectedModifiers.has(token));
+  const row = el("div", "mapping-key-capture-row");
+  const input = el("input");
+  input.id = id;
+  input.type = "text";
+  input.autocomplete = "off";
+  input.spellcheck = false;
+  input.value = value ?? "";
+  const modifierBar = el("div", "mapping-modifier-toggles");
+  [
+    ["cmd", "Cmd"],
+    ["ctrl", "Ctrl"],
+    ["alt", "Alt"],
+    ["shift", "Shift"],
+  ].forEach(([token, text]) => {
+    const modifier = el("button", "mapping-modifier-btn", text);
+    modifier.type = "button";
+    const active = selectedModifiers.has(token);
+    modifier.classList.toggle("is-selected", active);
+    modifier.setAttribute("aria-pressed", active ? "true" : "false");
+    modifier.addEventListener("click", () => {
+      if (selectedModifiers.has(token)) selectedModifiers.delete(token);
+      else selectedModifiers.add(token);
+      const selected = selectedModifiers.has(token);
+      modifier.classList.toggle("is-selected", selected);
+      modifier.setAttribute("aria-pressed", selected ? "true" : "false");
+      const selectedTokens = getSelectedModifiers();
+      if (state.mappingKeyCapture?.input === input) {
+        hint.textContent = selectedTokens.length ? `${selectedTokens.join(" + ")} + ...` : "Waiting for key press...";
+        input.focus();
+      } else {
+        hint.textContent = selectedTokens.length ? `${selectedTokens.join(" + ")} selected` : "";
+      }
+    });
+    modifierBar.append(modifier);
+  });
+  const capture = el("button", "btn btn-outline mapping-capture-btn", "Capture");
+  capture.type = "button";
+  capture.title = "Capture from keyboard";
+  const hint = el("p", "mapping-key-hint", "");
+  hint.setAttribute("aria-live", "polite");
+  capture.addEventListener("click", () => {
+    if (state.mappingKeyCapture?.input === input) {
+      stopMappingKeyCapture("Capture cancelled.");
+    } else {
+      startMappingKeyCapture(input, capture, hint, getSelectedModifiers);
+    }
+  });
+  row.append(input, capture);
+  field.append(row, modifierBar, hint);
+  return field;
+}
+
 function mappingEditorNeedsThreshold(comparator) {
   return !["truthy", "falsey", "present"].includes(comparator);
 }
@@ -1635,7 +1904,7 @@ function buildMappingEditor(editorState) {
     ),
   );
   if (mappingEditorNeedsKeys(draft.actionType)) {
-    fields.append(mappingInputField("Keys", "mapping-keys", draft.keysText));
+    fields.append(mappingKeyCaptureField("Keys", "mapping-keys", draft.keysText));
   }
   if (mappingEditorNeedsText(draft.actionType)) {
     fields.append(mappingInputField("Text", "mapping-text", draft.text));
@@ -1897,6 +2166,134 @@ function renderSettings(root) {
   root.append(settingsPanel("Application", appRows));
 }
 
+function testingSubtitle(testing) {
+  const entries = testing.entries || [];
+  const passCount = entries.filter((entry) => entry.status === "PASS").length;
+  const parts = [
+    testing.active ? "Armed" : "Stopped",
+    testing.mode === "all" ? "All in one" : "Selected gesture",
+    `${entries.length} gesture${entries.length === 1 ? "" : "s"}`,
+    `${passCount} pass`,
+  ];
+  if (testing.outputSuppressed !== false) parts.push("outputs suppressed");
+  return parts.join(" · ");
+}
+
+function testingModeButton(label, mode, testing) {
+  const active = (testing.mode || "selected") === mode;
+  const node = el("button", `btn ${active ? "btn-primary" : "btn-outline"} testing-mode-button`, label);
+  node.type = "button";
+  node.setAttribute("aria-pressed", active ? "true" : "false");
+  node.addEventListener("click", () => dispatch("testing.set_mode", { mode }));
+  return node;
+}
+
+function testingControls(testing) {
+  const panel = el("section", "testing-controls");
+  const modeGroup = el("div", "testing-mode-group");
+  modeGroup.append(
+    testingModeButton("Selected gesture", "selected", testing),
+    testingModeButton("All in one", "all", testing),
+  );
+  const suppress = el("label", "testing-check");
+  const checkbox = el("input");
+  checkbox.type = "checkbox";
+  checkbox.checked = testing.outputSuppressed !== false;
+  checkbox.addEventListener("change", () => dispatch("testing.set_suppress", { enabled: checkbox.checked }));
+  suppress.append(checkbox, el("span", "", "Suppress mapped outputs"));
+  const actions = el("div", "testing-actions");
+  const start = el("button", "btn btn-primary", "Start");
+  start.type = "button";
+  start.addEventListener("click", () => dispatch("testing.start", { mode: testing.mode || "selected" }));
+  const stop = el("button", "btn btn-outline", "Stop");
+  stop.type = "button";
+  stop.addEventListener("click", () => dispatch("testing.stop"));
+  const refresh = el("button", "btn btn-outline", "Refresh List");
+  refresh.type = "button";
+  refresh.addEventListener("click", () => dispatch("testing.refresh"));
+  actions.append(start, stop, refresh);
+  panel.append(modeGroup, suppress, actions);
+  return panel;
+}
+
+function testingEntryRow(entry, testing) {
+  const selected = entry.id === testing.selectedId;
+  const row = el("button", `testing-entry-row ${selected ? "is-selected" : ""}`.trim());
+  row.type = "button";
+  row.addEventListener("click", () => dispatch("testing.select", { id: entry.id }));
+  const info = el("div", "testing-entry-info");
+  info.append(
+    el("span", "testing-entry-name", entry.name || entry.id),
+    el("span", "testing-entry-trigger", entry.trigger || "-"),
+  );
+  const meta = el("div", "testing-entry-meta");
+  meta.append(
+    el("span", "testing-entry-type", entry.type || "-"),
+    statusPill(entry.status || "-", entry.status === "PASS" ? "ok" : "warn"),
+  );
+  row.append(info, meta);
+  return row;
+}
+
+function testingEntriesPanel(testing) {
+  const body = el("div", "testing-entry-list");
+  const entries = testing.entries || [];
+  if (!entries.length) {
+    body.append(el("div", "mapping-empty", "No gestures are available to test."));
+  } else {
+    entries.forEach((entry) => body.append(testingEntryRow(entry, testing)));
+  }
+  return card("Available Gestures", body, "", "testing-list-card");
+}
+
+function testingResultLine(label, value) {
+  const row = el("div", "testing-result-line");
+  row.append(el("span", "", label), el("strong", "", value || "-"));
+  return row;
+}
+
+function testingResultsPanel(testing) {
+  const body = el("div", "testing-result-body");
+  body.append(
+    testingResultLine("Mode", testing.status || "-"),
+    testingResultLine("Selected", testing.selectedName || (testing.mode === "all" ? "all in one" : "-")),
+    testingResultLine("Detected", testing.detected || "Detected: -"),
+  );
+  const live = el("div", "testing-live-grid");
+  (testing.liveValues || []).forEach((item) => {
+    const chip = el("div", "testing-live-chip");
+    chip.append(el("span", "", item.label || "-"), el("strong", "", formatDisplayValue(item.value)));
+    live.append(chip);
+  });
+  body.append(el("h4", "testing-subtitle", "Signals"), live);
+  const history = el("div", "log-list testing-history");
+  const lines = testing.history || [];
+  if (!lines.length) history.append(el("span", "muted", "No recognition history yet."));
+  else lines.forEach((line) => history.append(el("span", "", line)));
+  body.append(el("h4", "testing-subtitle", "History"), history);
+  return card("Recognition Result", body, "", "testing-result-card");
+}
+
+function updateTestingPage(root) {
+  const testing = state.data?.testing || {};
+  const subtitle = root.querySelector(".page-subtitle");
+  if (subtitle) subtitle.textContent = testingSubtitle(testing);
+  const slot = root.querySelector("#testing-body-slot");
+  if (!slot) return;
+  const layout = el("div", "testing-layout");
+  layout.append(testingEntriesPanel(testing), testingResultsPanel(testing));
+  slot.replaceChildren(testingControls(testing), layout);
+}
+
+function renderTesting(root) {
+  const testing = state.data?.testing || {};
+  const bodySlot = el("div", "testing-body-slot");
+  bodySlot.id = "testing-body-slot";
+  root.dataset.page = "Testing";
+  root.replaceChildren(pageHeader("Testing", testingSubtitle(testing), []), bodySlot);
+  updateTestingPage(root);
+}
+
 function renderGeneric(root, title) {
   const signals = (state.data?.signals || []).filter((signal) => signal.group.toLowerCase().includes(title.split(" ")[0].toLowerCase()));
   root.append(pageHeader(title, "", []));
@@ -1942,11 +2339,17 @@ function renderPage() {
     return;
   }
 
+  if (page === "Testing" && previousPage === "Testing") {
+    updateTestingPage(root);
+    return;
+  }
+
   if (previousPage === "Dashboard" && page !== "Dashboard") {
     destroyDashboardCharts();
   }
 
   if (previousPage === "Mappings" && page !== "Mappings") {
+    stopMappingKeyCapture();
     state.mappingEditor = null;
   }
 
@@ -1957,6 +2360,7 @@ function renderPage() {
     else if (page === "Signals") renderSignals(root);
     else if (page === "Keyboard") renderKeyboard(root);
     else if (page === "Mappings") renderMappings(root);
+    else if (page === "Testing") renderTesting(root);
     else if (page === "Settings") renderSettings(root);
     else if (page === "Camera & Servo") renderCamera(root);
     else if (page === "Data / Logs") renderRaw(root);
@@ -2056,6 +2460,7 @@ document.addEventListener("click", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
+  if (applyCapturedMappingKey(event)) return;
   if (event.key === "Escape" && state.mappingEditor) {
     closeMappingEditor();
   }

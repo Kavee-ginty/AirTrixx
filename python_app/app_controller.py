@@ -19,10 +19,13 @@ from appwrite_rest import AppwriteCredential, AppwriteError, AppwriteRestClient
 from auth_service import AppwriteAuthService, AuthenticatedUser
 from config import AppConfig, load_calibration_with_warnings, save_calibration
 from fusion_state import FIELD_ORDER, FusionState
-from input_backend import PynputInputBackend
+from input_backend import FakeInputBackend, PynputInputBackend
 from input_mapper import (
     InputMapper,
+    MappingAction,
+    MappingCondition,
     MappingConfig,
+    MappingProfile,
     MappingRule,
     SignalCatalog,
     load_mapping_config,
@@ -34,6 +37,7 @@ from mediapipe_tracker import HandTracker
 from serial_bridge import SerialBridge
 from servo_controller import ServoController
 from sync_service import AppwriteSyncService, SyncResult
+from wristband_model import load_labels, sanitize_label
 from wrist_rule_detector import WristReturnRuleDetector
 
 
@@ -164,6 +168,19 @@ class AirTrixxController:
         if self.input_backend.error:
             self.log(self.input_backend.error)
 
+        self.testing_backend = FakeInputBackend()
+        self.testing_mapper = InputMapper(self.testing_backend)
+        self.testing_active = False
+        self.testing_mode = "selected"
+        self.testing_output_suppressed = True
+        self.testing_selected_id = ""
+        self.testing_status = "Select a gesture to arm an individual test."
+        self.testing_detected = "Detected: -"
+        self.testing_last_label = ""
+        self.testing_last_seen_s = 0.0
+        self.testing_entry_statuses: dict[str, str] = {}
+        self.testing_history: deque[str] = deque(maxlen=120)
+
         self.wrist_rule_detector = WristReturnRuleDetector()
         for warning in self.config.startup_warnings:
             self.log(warning)
@@ -275,10 +292,12 @@ class AirTrixxController:
         if self.keyboard_training_timer_active:
             self._update_keyboard_training_timer(now_s)
         self.keyboard_bridge.tick(now_s=now_s)
+        testing_suppressed = bool(self.testing_active and self.testing_output_suppressed)
         if self.serial_bridge.is_connected or self.keyboard_bridge.source_ready:
-            self.input_mapper.process(snapshot, now_s, suppress_output=False)
+            self.input_mapper.process(snapshot, now_s, suppress_output=testing_suppressed)
         else:
             self.input_mapper.release_all()
+        self._process_testing_snapshot(snapshot, now_s)
 
         with self._state_lock:
             self._latest_serial_state = serial_state
@@ -405,6 +424,8 @@ class AirTrixxController:
             if changed:
                 self._queue_cloud_sync("mapping rule toggled")
             return changed
+        if action.startswith("testing."):
+            return self._dispatch_testing(action, payload)
         if action == "sync.now":
             return self._sync_now("manual sync").__dict__
         if action == "logs.clear":
@@ -528,6 +549,7 @@ class AirTrixxController:
             "fans": fan_state,
             "keyboard": keyboard_state,
             "mappings": mapping_state,
+            "testing": self._testing_state(snapshot),
             "signals": signals,
             "analytics": self._analytics(device_cards, fan_state, mapping_state, signals),
             "raw": {
@@ -923,6 +945,346 @@ class AirTrixxController:
             "sources": sorted(sources),
             "rules": rules,
         }
+
+    def _testing_raw_rule(
+        self,
+        entry_id: str,
+        name: str,
+        group: str,
+        source: str,
+        comparator: str,
+        threshold: Any = True,
+        *,
+        low: Any = 0.0,
+        high: Any = 1.0,
+        hysteresis: float = 0.0,
+        debounce_ms: int = 80,
+        conditions: list[MappingCondition] | None = None,
+    ) -> dict[str, Any]:
+        rule = MappingRule(
+            id=entry_id,
+            name=name,
+            enabled=True,
+            source=source,
+            comparator=comparator,
+            threshold=threshold,
+            low=low,
+            high=high,
+            hysteresis=hysteresis,
+            debounce_ms=debounce_ms,
+            conditions=conditions or [],
+            recognition_label=name,
+            action=MappingAction(type="keyboard_tap", keys=[]),
+        )
+        return {
+            "id": entry_id,
+            "name": name,
+            "type": group,
+            "trigger": f"{source} {rule.condition_summary()}",
+            "rule": rule,
+        }
+
+    def _testing_model_labels(self) -> list[str]:
+        try:
+            return load_labels(self.config.wristband_labels_path)
+        except Exception as exc:
+            self.log(f"Could not read wristband model labels for testing: {exc}")
+            return []
+
+    def _testing_available_entries(self) -> list[dict[str, Any]]:
+        entries = [
+            self._testing_raw_rule("raw:right_open_palm", "Right hand open palm", "Camera", "hands.right.gesture", "eq", "open_palm"),
+            self._testing_raw_rule("raw:right_fist", "Right hand fist", "Camera", "hands.right.gesture", "eq", "closed_fist"),
+            self._testing_raw_rule("raw:left_open_palm", "Left hand open palm", "Camera", "hands.left.gesture", "eq", "open_palm"),
+            self._testing_raw_rule("raw:left_fist", "Left hand fist", "Camera", "hands.left.gesture", "eq", "closed_fist"),
+            self._testing_raw_rule(
+                "raw:both_open_palms",
+                "Both hands open palms",
+                "Camera",
+                "hands.left.gesture",
+                "eq",
+                "open_palm",
+                conditions=[MappingCondition(source="hands.right.gesture", comparator="eq", threshold="open_palm")],
+            ),
+            self._testing_raw_rule(
+                "raw:both_fists",
+                "Both hands fists",
+                "Camera",
+                "hands.left.gesture",
+                "eq",
+                "closed_fist",
+                conditions=[MappingCondition(source="hands.right.gesture", comparator="eq", threshold="closed_fist")],
+            ),
+            self._testing_raw_rule(
+                "raw:right_hand_close",
+                "Right hand close to ToF",
+                "ToF",
+                "hands.right.z_mm",
+                "between",
+                low=30,
+                high=400,
+                hysteresis=8,
+                debounce_ms=80,
+            ),
+            self._testing_raw_rule(
+                "raw:right_hand_closer_50mm",
+                "Right hand getting closer by 5 cm",
+                "ToF movement",
+                "hands.right.z_mm",
+                "delta_decrease",
+                50,
+                debounce_ms=0,
+            ),
+            self._testing_raw_rule(
+                "raw:right_hand_further_50mm",
+                "Right hand getting further by 5 cm",
+                "ToF movement",
+                "hands.right.z_mm",
+                "delta_increase",
+                50,
+                debounce_ms=0,
+            ),
+            self._testing_raw_rule(
+                "raw:left_hand_close",
+                "Left hand close to ToF",
+                "ToF",
+                "hands.left.z_mm",
+                "between",
+                low=30,
+                high=400,
+                hysteresis=8,
+                debounce_ms=80,
+            ),
+            self._testing_raw_rule(
+                "raw:left_hand_closer_50mm",
+                "Left hand getting closer by 5 cm",
+                "ToF movement",
+                "hands.left.z_mm",
+                "delta_decrease",
+                50,
+                debounce_ms=0,
+            ),
+            self._testing_raw_rule(
+                "raw:left_hand_further_50mm",
+                "Left hand getting further by 5 cm",
+                "ToF movement",
+                "hands.left.z_mm",
+                "delta_increase",
+                50,
+                debounce_ms=0,
+            ),
+        ]
+
+        model_labels = self._testing_model_labels() or ["rotate_right", "rotate_left", "flick", "wrist_circle"]
+        seen_model_labels: set[str] = set()
+        for label in model_labels:
+            raw_label = str(label).strip()
+            clean_label = sanitize_label(raw_label)
+            if not raw_label or raw_label.lower() == "none" or raw_label.lower() in seen_model_labels:
+                continue
+            seen_model_labels.add(raw_label.lower())
+            entries.append(
+                self._testing_raw_rule(
+                    f"raw:model_{clean_label}",
+                    f"Wristband model: {raw_label}",
+                    "Wristband",
+                    "fused.model_value",
+                    "eq",
+                    raw_label,
+                    debounce_ms=120,
+                )
+            )
+
+        for rule in self.input_mapper.active_rules():
+            if not rule.enabled or not rule.source:
+                continue
+            test_rule = copy.deepcopy(rule)
+            test_rule.id = f"mapping:{rule.id}"
+            test_rule.recognition_label = rule.name
+            test_rule.action = MappingAction(type="keyboard_tap", keys=[])
+            entries.append(
+                {
+                    "id": test_rule.id,
+                    "name": rule.name,
+                    "type": "Mapping",
+                    "trigger": f"{rule.source} {rule.condition_summary()} -> {rule.action.summary()}",
+                    "rule": test_rule,
+                }
+            )
+        return entries
+
+    def _testing_entry_by_id(self, entry_id: str) -> dict[str, Any] | None:
+        for entry in self._testing_available_entries():
+            if entry.get("id") == entry_id:
+                return entry
+        return None
+
+    def _testing_entries_for_mode(self) -> list[dict[str, Any]]:
+        entries = self._testing_available_entries()
+        if self.testing_mode == "all":
+            return entries
+        entry = next((item for item in entries if item.get("id") == self.testing_selected_id), None)
+        return [entry] if entry is not None else []
+
+    def _testing_live_values(self, snapshot: dict[str, Any]) -> list[dict[str, str]]:
+        signals = SignalCatalog.flatten(snapshot)
+
+        def value(signal_id: str) -> str:
+            signal = signals.get(signal_id)
+            return signal.display_value if signal else "-"
+
+        return [
+            {"label": "L gesture", "value": value("hands.left.gesture")},
+            {"label": "R gesture", "value": value("hands.right.gesture")},
+            {"label": "L z", "value": f"{value('hands.left.z_mm')} mm"},
+            {"label": "R z", "value": f"{value('hands.right.z_mm')} mm"},
+            {"label": "Model", "value": value("fused.model_value")},
+            {"label": "Pitch", "value": value("fused.wrist_pitch")},
+            {"label": "Roll", "value": value("fused.wrist_roll")},
+            {"label": "Acc X", "value": value("fused.wrist_accel_x")},
+            {"label": "Gyro X", "value": value("fused.wrist_gyro_x")},
+        ]
+
+    def _testing_state(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        entries = self._testing_available_entries()
+        entry_ids = {entry["id"] for entry in entries}
+        self.testing_entry_statuses = {
+            entry_id: status
+            for entry_id, status in self.testing_entry_statuses.items()
+            if entry_id in entry_ids
+        }
+        if self.testing_selected_id and self.testing_selected_id not in entry_ids:
+            self.testing_selected_id = ""
+        selected_entry = next((entry for entry in entries if entry["id"] == self.testing_selected_id), None)
+        return {
+            "active": self.testing_active,
+            "mode": self.testing_mode,
+            "outputSuppressed": self.testing_output_suppressed,
+            "selectedId": self.testing_selected_id,
+            "selectedName": selected_entry["name"] if selected_entry else "",
+            "status": self.testing_status,
+            "detected": self.testing_detected,
+            "entries": [
+                {
+                    "id": entry["id"],
+                    "name": entry["name"],
+                    "type": entry["type"],
+                    "trigger": entry["trigger"],
+                    "status": self.testing_entry_statuses.get(entry["id"], "-"),
+                }
+                for entry in entries
+            ],
+            "liveValues": self._testing_live_values(snapshot),
+            "history": list(self.testing_history)[-80:],
+        }
+
+    def _append_testing_history(self, message: str) -> None:
+        timestamp = time.strftime("%H:%M:%S")
+        self.testing_history.append(f"[{timestamp}] {message}")
+
+    def _reset_testing_mapper(self, entries: list[dict[str, Any]]) -> None:
+        rules = [copy.deepcopy(entry["rule"]) for entry in entries]
+        config = MappingConfig(
+            enabled_on_start=True,
+            active_profile="Testing",
+            profiles=[MappingProfile(name="Testing", mappings=rules)],
+        )
+        self.testing_backend = FakeInputBackend()
+        self.testing_mapper = InputMapper(self.testing_backend, config)
+        self.testing_mapper.set_enabled(True)
+        self.testing_last_label = ""
+        self.testing_last_seen_s = 0.0
+        for entry in self._testing_available_entries():
+            self.testing_entry_statuses[entry["id"]] = "-"
+
+    def _start_testing(self) -> bool:
+        if self.testing_mode == "all":
+            return self._start_all_testing()
+        return self._start_selected_testing()
+
+    def _start_selected_testing(self) -> bool:
+        entries = self._testing_available_entries()
+        if not self.testing_selected_id and entries:
+            self.testing_selected_id = entries[0]["id"]
+        selected = [entry for entry in entries if entry["id"] == self.testing_selected_id]
+        if not selected:
+            self.testing_status = "Select a gesture from the list first."
+            return False
+        self.testing_active = True
+        self.testing_mode = "selected"
+        self._reset_testing_mapper(selected)
+        self.testing_detected = "Detected: waiting"
+        self.testing_status = "Selected test armed."
+        self._append_testing_history(f"Armed selected test: {selected[0]['name']}")
+        return True
+
+    def _start_all_testing(self) -> bool:
+        entries = self._testing_available_entries()
+        if not entries:
+            self.testing_status = "No gestures are available to test."
+            return False
+        self.testing_active = True
+        self.testing_mode = "all"
+        self._reset_testing_mapper(entries)
+        self.testing_detected = "Detected: waiting"
+        self.testing_status = "All-in-one test armed."
+        self._append_testing_history("Armed all-in-one gesture test.")
+        return True
+
+    def _stop_testing(self) -> bool:
+        self.testing_active = False
+        self.testing_mapper.release_all()
+        self.testing_status = "Testing stopped."
+        self.testing_detected = "Detected: -"
+        self._append_testing_history("Stopped gesture testing.")
+        return True
+
+    def _dispatch_testing(self, action: str, payload: dict[str, Any]) -> Any:
+        if action == "testing.select":
+            self.testing_selected_id = str(payload.get("id") or "")
+            self.testing_mode = "selected"
+            return self._start_selected_testing()
+        if action == "testing.set_mode":
+            mode = str(payload.get("mode") or "selected")
+            self.testing_mode = "all" if mode == "all" else "selected"
+            return self._start_testing()
+        if action == "testing.set_suppress":
+            self.testing_output_suppressed = bool(payload.get("enabled", True))
+            return self.testing_output_suppressed
+        if action == "testing.start":
+            mode = str(payload.get("mode") or self.testing_mode)
+            self.testing_mode = "all" if mode == "all" else "selected"
+            return self._start_testing()
+        if action == "testing.stop":
+            return self._stop_testing()
+        if action == "testing.refresh":
+            entries = self._testing_available_entries()
+            self.testing_entry_statuses = {
+                entry["id"]: self.testing_entry_statuses.get(entry["id"], "-")
+                for entry in entries
+            }
+            self.testing_status = "Testing list refreshed."
+            return True
+        return False
+
+    def _process_testing_snapshot(self, snapshot: dict[str, Any], now_s: float) -> None:
+        if not self.testing_active:
+            return
+        self.testing_mapper.process(snapshot, now_s)
+        label = self.testing_mapper.last_recognition(max_age_s=0.25, now_s=now_s)
+        if not label:
+            return
+        if label == self.testing_last_label and now_s - self.testing_last_seen_s < 0.25:
+            return
+        self.testing_last_label = label
+        self.testing_last_seen_s = now_s
+        self.testing_detected = f"Detected: {label}"
+        self.testing_status = "PASS: gesture recognised."
+        for entry in self._testing_available_entries():
+            if entry["name"] == label:
+                self.testing_entry_statuses[entry["id"]] = "PASS"
+                break
+        self._append_testing_history(f"Recognised: {label}")
 
     def _import_mapping_json(self, payload: dict[str, Any]) -> dict[str, Any]:
         name = str(payload.get("name") or "input_mappings.json").strip() or "input_mappings.json"
